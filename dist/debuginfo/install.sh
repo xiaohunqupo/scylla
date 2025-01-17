@@ -4,7 +4,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 set -e
@@ -21,7 +21,7 @@ Usage: install.sh [options]
 Options:
   --root /path/to/root     alternative install root (default /)
   --prefix /prefix         directory prefix (default /usr)
-  --nonroot                install Scylla without required root priviledge
+  --nonroot                install Scylla without required root privilege
   --help                   this helpful message
 EOF
     exit 1

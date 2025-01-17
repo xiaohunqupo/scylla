@@ -7,19 +7,21 @@ Security
    security-checklist
    authentication
    runtime-authentication
+   create-superuser
    gen-cqlsh-file
    Reset Authenticator Password </troubleshooting/password-reset>
    enable-authorization
    authorization
+   certificate-authentication
    rbac-usecase
    auditing
    client-node-encryption
    node-node-encryption
    generate-certificate
+   saslauthd
    encryption-at-rest
    ldap-authentication
    ldap-authorization
-      
 
 .. panel-box::
   :title: Security
@@ -36,13 +38,13 @@ Security
 
   * :doc:`Enable Authentication </operating-scylla/security/authentication/>`
   * :doc:`Enable and Disable Authentication Without Downtime </operating-scylla/security/runtime-authentication/>`
+  * :doc:`Creating a Custom Superuser </operating-scylla/security/create-superuser/>`
   * :doc:`Generate a cqlshrc File <gen-cqlsh-file>`
   * :doc:`Enable Authorization</operating-scylla/security/enable-authorization/>`
   * :doc:`Role Based Access Control (RBAC) </operating-scylla/security/rbac-usecase/>`
   * :doc:`Grant Authorization CQL Reference </operating-scylla/security/authorization/>`
   * :doc:`Reset Authenticator Password </troubleshooting/password-reset/>`
-  * :doc:`LDAP Authentication <ldap-authentication>`
-  * :doc:`LDAP Authorization (Role Management) </operating-scylla/security/ldap-authorization>`
+  * :doc:`Certificate Based Authentication </operating-scylla/security/certificate-authentication/>`
 
 .. panel-box::
   :title: Encryption
@@ -54,4 +56,4 @@ Security
   * :doc:`Generating a self-signed Certificate Chain Using openssl </operating-scylla/security/generate-certificate/>`
   * :doc:`Encryption at Rest </operating-scylla/security/encryption-at-rest>`
 
-Also check out the `Security Features lesson <https://university.scylladb.com/courses/scylla-operations/lessons/security-features/topic/security-features/>`_ on Scylla University.
+Also check out the `Security Features lesson <https://university.scylladb.com/courses/scylla-operations/lessons/security-features/topic/security-features/>`_ on ScyllaDB University.

@@ -3,20 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <boost/intrusive/set.hpp>
 #include <optional>
 #include "utils/hashing.hh"
 #include "keys.hh"
 #include "mutation/tombstone.hh"
 #include "clustering_bounds_comparator.hh"
 #include "mutation/position_in_partition.hh"
-
-namespace bi = boost::intrusive;
 
 /**
  * Represents a ranged deletion operation. Can be empty.
@@ -102,7 +99,6 @@ public:
         rt2 = std::move(rt1);
         rt1 = std::move(tmp);
     }
-    friend std::ostream& operator<<(std::ostream& out, const range_tombstone& rt);
 
     static bool is_single_clustering_row_tombstone(const schema& s, const clustering_key_prefix& start,
         bound_kind start_kind, const clustering_key_prefix& end, bound_kind end_kind)
@@ -225,7 +221,7 @@ struct appending_hash<range_tombstone>  {
 // follow the ordering used by the mutation readers.
 //
 // Unless the accumulator is in the reverse mode, after apply(rt) or
-// tombstone_for_row(ck) are called there are followng restrictions for
+// tombstone_for_row(ck) are called there are following restrictions for
 // subsequent calls:
 //  - apply(rt1) can be invoked only if rt.start_bound() < rt1.start_bound()
 //    and ck < rt1.start_bound()
@@ -285,4 +281,17 @@ public:
     void apply(range_tombstone rt);
 
     void clear();
+};
+
+template<>
+struct fmt::formatter<range_tombstone> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const range_tombstone& rt, FormatContext& ctx) const {
+        if (rt) {
+            return fmt::format_to(ctx.out(), "{{range_tombstone: start={}, end={}, {}}}",
+                                  rt.position(), rt.end_position(), rt.tomb);
+        } else {
+            return fmt::format_to(ctx.out(), "{{range_tombstone: none}}");
+        }
+    }
 };

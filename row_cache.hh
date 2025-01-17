@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -19,9 +19,7 @@
 #include "utils/phased_barrier.hh"
 #include "utils/histogram.hh"
 #include "mutation/partition_version.hh"
-#include "tracing/trace_state.hh"
 #include <seastar/core/metrics_registration.hh>
-#include "mutation/mutation_cleaner.hh"
 #include "utils/double-decker.hh"
 #include "db/cache_tracker.hh"
 #include "readers/empty_v2.hh"
@@ -31,16 +29,18 @@ namespace bi = boost::intrusive;
 
 class row_cache;
 class cache_tracker;
-class flat_mutation_reader_v2;
+class mutation_reader;
 
 namespace replica {
 class memtable_entry;
 }
 
+namespace tracing { class trace_state_ptr; }
+
 namespace cache {
 
 class autoupdating_underlying_reader;
-class cache_flat_mutation_reader;
+class cache_mutation_reader;
 class read_context;
 class lsa_manager;
 
@@ -50,7 +50,6 @@ class lsa_manager;
 //
 // TODO: Make memtables use this format too.
 class cache_entry {
-    schema_ptr _schema;
     dht::decorated_key _key;
     partition_entry _pe;
     // True when we know that there is nothing between this entry and the previous one in cache
@@ -63,8 +62,8 @@ class cache_entry {
     } _flags{};
     friend class size_calculator;
 
-    flat_mutation_reader_v2 do_read(row_cache&, cache::read_context& ctx);
-    flat_mutation_reader_v2 do_read(row_cache&, std::unique_ptr<cache::read_context> unique_ctx);
+    mutation_reader do_read(row_cache&, cache::read_context& ctx);
+    mutation_reader do_read(row_cache&, std::unique_ptr<cache::read_context> unique_ctx);
 public:
     friend class row_cache;
     friend class cache_tracker;
@@ -86,9 +85,8 @@ public:
     }
 
     cache_entry(schema_ptr s, const dht::decorated_key& key, const mutation_partition& p)
-        : _schema(std::move(s))
-        , _key(key)
-        , _pe(partition_entry::make_evictable(*_schema, mutation_partition(*_schema, p)))
+        : _key(key)
+        , _pe(partition_entry::make_evictable(*s, mutation_partition(*s, p)))
     { }
 
     cache_entry(schema_ptr s, dht::decorated_key&& key, mutation_partition&& p)
@@ -99,8 +97,7 @@ public:
     // It is assumed that pe is fully continuous
     // pe must be evictable.
     cache_entry(evictable_tag, schema_ptr s, dht::decorated_key&& key, partition_entry&& pe) noexcept
-        : _schema(std::move(s))
-        , _key(std::move(key))
+        : _key(std::move(key))
         , _pe(std::move(pe))
     { }
 
@@ -130,18 +127,15 @@ public:
 
     const partition_entry& partition() const noexcept { return _pe; }
     partition_entry& partition() { return _pe; }
-    const schema_ptr& schema() const noexcept { return _schema; }
-    schema_ptr& schema() noexcept { return _schema; }
-    flat_mutation_reader_v2 read(row_cache&, cache::read_context&);
-    flat_mutation_reader_v2 read(row_cache&, std::unique_ptr<cache::read_context>);
-    flat_mutation_reader_v2 read(row_cache&, cache::read_context&, utils::phased_barrier::phase_type);
-    flat_mutation_reader_v2 read(row_cache&, std::unique_ptr<cache::read_context>, utils::phased_barrier::phase_type);
+    const schema_ptr& schema() const noexcept { return _pe.get_schema(); }
+    mutation_reader read(row_cache&, cache::read_context&);
+    mutation_reader read(row_cache&, std::unique_ptr<cache::read_context>);
+    mutation_reader read(row_cache&, cache::read_context&, utils::phased_barrier::phase_type);
+    mutation_reader read(row_cache&, std::unique_ptr<cache::read_context>, utils::phased_barrier::phase_type);
     bool continuous() const noexcept { return _flags._continuous; }
     void set_continuous(bool value) noexcept { _flags._continuous = value; }
 
     bool is_dummy_entry() const noexcept { return _flags._dummy_entry; }
-
-    friend std::ostream& operator<<(std::ostream&, cache_entry&);
 };
 
 //
@@ -166,7 +160,7 @@ public:
     friend class cache::autoupdating_underlying_reader;
     friend class single_partition_populating_reader;
     friend class cache_entry;
-    friend class cache::cache_flat_mutation_reader;
+    friend class cache::cache_mutation_reader;
     friend class cache::lsa_manager;
     friend class cache::read_context;
     friend class partition_range_cursor;
@@ -179,9 +173,19 @@ public:
     class external_updater_impl {
     public:
         virtual ~external_updater_impl() {}
+        // Prepare may return an exceptional future
+        // and the error is propagated to the row_cache::update caller.
+        // Hence, it must provide strong exception safety guarantees.
+        //
+        // Typically, `prepare` creates only temporary state
+        // to be atomically applied by `execute`, or, alternatively
+        // it must undo any side-effects on failure.
         virtual future<> prepare() { return make_ready_future<>(); }
         // FIXME: make execute() noexcept, that will require every updater to make execution exception safe,
         // also change function signature.
+        // See https://github.com/scylladb/scylladb/issues/15576
+        //
+        // For now, scylla aborts on any exception from `execute` 
         virtual void execute() = 0;
     };
 
@@ -257,8 +261,8 @@ private:
     logalloc::allocating_section _update_section;
     logalloc::allocating_section _populate_section;
     logalloc::allocating_section _read_section;
-    flat_mutation_reader_v2 create_underlying_reader(cache::read_context&, mutation_source&, const dht::partition_range&);
-    flat_mutation_reader_v2 make_scanning_reader(const dht::partition_range&, std::unique_ptr<cache::read_context>);
+    mutation_reader create_underlying_reader(cache::read_context&, mutation_source&, const dht::partition_range&);
+    mutation_reader make_scanning_reader(const dht::partition_range&, std::unique_ptr<cache::read_context>);
     void on_partition_hit();
     void on_partition_miss();
     void on_row_hit();
@@ -268,6 +272,7 @@ private:
     void upgrade_entry(cache_entry&);
     void invalidate_locked(const dht::decorated_key&);
     void clear_now() noexcept;
+    void clear_on_destruction() noexcept;
 
     struct previous_entry_pointer {
         std::optional<dht::decorated_key> _key;
@@ -325,13 +330,15 @@ private:
     //
     snapshot_and_phase snapshot_of(dht::ring_position_view pos);
 
+    static thread_local preemption_source default_preemption_source;
+
     // Merges the memtable into cache with configurable logic for handling memtable entries.
     // The Updater gets invoked for every entry in the memtable with a lower bound iterator
     // into _partitions (cache_i), and the memtable entry.
     // It is invoked inside allocating section and in the context of cache's allocator.
     // All memtable entries will be removed.
     template <typename Updater>
-    future<> do_update(external_updater, replica::memtable& m, Updater func);
+    future<> do_update(external_updater, replica::memtable& m, Updater func, preemption_source&);
 
     // Clears given memtable invalidating any affected cache elements.
     void invalidate_sync(replica::memtable&) noexcept;
@@ -361,34 +368,45 @@ public:
     // User needs to ensure that the row_cache object stays alive
     // as long as the reader is used.
     // The range must not wrap around.
-    flat_mutation_reader_v2 make_reader(schema_ptr s,
+
+    mutation_reader make_reader(schema_ptr s,
                                      reader_permit permit,
                                      const dht::partition_range& range,
                                      const query::partition_slice& slice,
-                                     const io_priority_class& pc = default_priority_class(),
                                      tracing::trace_state_ptr trace_state = nullptr,
                                      streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
-                                     mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no) {
-        if (auto reader_opt = make_reader_opt(s, permit, range, slice, pc, std::move(trace_state), fwd, fwd_mr)) {
+                                     mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no,
+                                     const tombstone_gc_state* gc_state = nullptr) {
+        if (auto reader_opt = make_reader_opt(s, permit, range, slice, gc_state, std::move(trace_state), fwd, fwd_mr)) {
             return std::move(*reader_opt);
         }
         [[unlikely]] return make_empty_flat_reader_v2(std::move(s), std::move(permit));
     }
     // Same as make_reader, but returns an empty optional instead of a no-op reader when there is nothing to
     // read. This is an optimization.
-    flat_mutation_reader_v2_opt make_reader_opt(schema_ptr,
+    mutation_reader_opt make_reader_opt(schema_ptr,
                                      reader_permit permit,
                                      const dht::partition_range&,
                                      const query::partition_slice&,
-                                     const io_priority_class& = default_priority_class(),
+                                     const tombstone_gc_state*,
                                      tracing::trace_state_ptr trace_state = nullptr,
                                      streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                      mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no);
 
-    flat_mutation_reader_v2 make_reader(schema_ptr s, reader_permit permit, const dht::partition_range& range = query::full_partition_range) {
+    mutation_reader make_reader(schema_ptr s,
+                                    reader_permit permit,
+                                    const dht::partition_range& range = query::full_partition_range,
+                                    const tombstone_gc_state* gc_state = nullptr) {
         auto& full_slice = s->full_slice();
-        return make_reader(std::move(s), std::move(permit), range, full_slice);
+        return make_reader(std::move(s), std::move(permit), range, full_slice, nullptr,
+                streamed_mutation::forwarding::no, mutation_reader::forwarding::no, gc_state);
     }
+
+    // Only reads what is in the cache, doesn't populate.
+    // Supports reading singular ranges only, for now.
+    // Does not support reading in reverse.
+    mutation_reader make_nonpopulating_reader(schema_ptr s, reader_permit permit, const dht::partition_range& range,
+            const query::partition_slice& slice, tracing::trace_state_ptr ts);
 
     const stats& stats() const { return _stats; }
 public:
@@ -405,7 +423,7 @@ public:
     // has just been flushed to the underlying data source.
     // The memtable can be queried during the process, but must not be written.
     // After the update is complete, memtable is empty.
-    future<> update(external_updater, replica::memtable&);
+    future<> update(external_updater, replica::memtable&, preemption_source& preempt = default_preemption_source);
 
     // Like update(), synchronizes cache with an incremental change to the underlying
     // mutation source, but instead of inserting and merging data, invalidates affected ranges.
@@ -503,3 +521,7 @@ public:
 };
 
 }
+
+template <> struct fmt::formatter<cache_entry> : fmt::formatter<string_view> {
+    auto format(const cache_entry&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

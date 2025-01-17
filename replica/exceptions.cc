@@ -3,16 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <concepts>
-#include <sstream>
 #include <stdexcept>
 #include <type_traits>
 
 #include "replica/exceptions.hh"
-#include "utils/exceptions.hh"
 
 
 namespace replica {
@@ -22,6 +19,10 @@ exception_variant try_encode_replica_exception(std::exception_ptr eptr) {
         std::rethrow_exception(std::move(eptr));
     } catch (rate_limit_exception&) {
         return rate_limit_exception();
+    } catch (const stale_topology_exception& e) {
+        return e;
+    } catch (abort_requested_exception&) {
+        return abort_requested_exception();
     } catch (...) {
         return no_exception{};
     }

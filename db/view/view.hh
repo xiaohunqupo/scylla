@@ -3,27 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "dht/i_partitioner.hh"
 #include "gc_clock.hh"
 #include "query-request.hh"
 #include "schema/schema_fwd.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "mutation/frozen_mutation.hh"
+#include "data_dictionary/data_dictionary.hh"
+#include "locator/abstract_replication_strategy.hh"
 
 class frozen_mutation_and_schema;
 
 namespace replica {
 struct cf_stats;
-}
-
-namespace service {
-struct allow_hints_tag;
-using allow_hints = bool_class<allow_hints_tag>;
 }
 
 namespace db {
@@ -111,7 +107,7 @@ public:
         return _row.is_live(s, column_kind(), base_tombstone, now);
     }
 
-    column_kind column_kind() const {
+    ::column_kind column_kind() const {
         return _key.has_value()
                 ? column_kind::regular_column : column_kind::static_column;
     }
@@ -129,7 +125,7 @@ public:
  * @return false if we can guarantee that inserting an update for specified key
  * won't affect the view in any way, true otherwise.
  */
-bool partition_key_matches(const schema& base, const view_info& view, const dht::decorated_key& key);
+bool partition_key_matches(data_dictionary::database, const schema& base, const view_info& view, const dht::decorated_key& key);
 
 /**
  * Whether the view might be affected by the provided update.
@@ -144,7 +140,7 @@ bool partition_key_matches(const schema& base, const view_info& view, const dht:
  * @return false if we can guarantee that inserting update for key
  * won't affect the view in any way, true otherwise.
  */
-bool may_be_affected_by(const schema& base, const view_info& view, const dht::decorated_key& key, const rows_entry& update);
+bool may_be_affected_by(data_dictionary::database, const schema& base, const view_info& view, const dht::decorated_key& key, const rows_entry& update);
 
 /**
  * Whether a given base row matches the view filter (and thus if the view should have a corresponding entry).
@@ -163,9 +159,9 @@ bool may_be_affected_by(const schema& base, const view_info& view, const dht::de
  * @param now the current time in seconds (to decide what is live and what isn't).
  * @return whether the base row matches the view filter.
  */
-bool matches_view_filter(const schema& base, const view_info& view, const partition_key& key, const clustering_or_static_row& update, gc_clock::time_point now);
+bool matches_view_filter(data_dictionary::database, const schema& base, const view_info& view, const partition_key& key, const clustering_or_static_row& update, gc_clock::time_point now);
 
-bool clustering_prefix_matches(const schema& base, const partition_key& key, const clustering_key_prefix& ck);
+bool clustering_prefix_matches(data_dictionary::database, const schema& base, const partition_key& key, const clustering_key_prefix& ck);
 
 /*
  * When a base-table update modifies a value in a materialized view's key
@@ -213,21 +209,27 @@ class view_updates final {
     schema_ptr _base;
     base_info_ptr _base_info;
     std::unordered_map<partition_key, mutation_partition, partition_key::hashing, partition_key::equality> _updates;
-    mutable size_t _op_count = 0;
+    size_t _op_count = 0;
 public:
     explicit view_updates(view_and_base vab)
             : _view(std::move(vab.view))
             , _view_info(*_view->view_info())
             , _base(vab.base->base_schema())
             , _base_info(vab.base)
-            , _updates(8, partition_key::hashing(*_view), partition_key::equality(*_view)) {
+            , _updates(8, partition_key::hashing(*_view), partition_key::equality(*_view))
+    {
     }
 
     future<> move_to(utils::chunked_vector<frozen_mutation_and_schema>& mutations);
 
-    void generate_update(const partition_key& base_key, const clustering_or_static_row& update, const std::optional<clustering_or_static_row>& existing, gc_clock::time_point now);
+    void generate_update(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const std::optional<clustering_or_static_row>& existing, gc_clock::time_point now);
+    bool generate_partition_tombstone_update(data_dictionary::database db, const partition_key& base_key, tombstone partition_tomb);
 
     size_t op_count() const;
+
+    bool is_partition_key_permutation_of_base_partition_key() const;
+
+    std::optional<partition_key> construct_view_partition_key_from_base(const partition_key& base_pk);
 
 private:
     mutation_partition& partition_for(partition_key&& key);
@@ -236,21 +238,22 @@ private:
         deletable_row* _row;
         view_key_and_action::action _action;
     };
-    std::vector<view_row_entry> get_view_rows(const partition_key& base_key, const clustering_or_static_row& update, const std::optional<clustering_or_static_row>& existing);
+    std::vector<view_row_entry> get_view_rows(const partition_key& base_key, const clustering_or_static_row& update, const std::optional<clustering_or_static_row>& existing, row_tombstone update_tomb);
     bool can_skip_view_updates(const clustering_or_static_row& update, const clustering_or_static_row& existing) const;
-    void create_entry(const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now);
-    void delete_old_entry(const partition_key& base_key, const clustering_or_static_row& existing, const clustering_or_static_row& update, gc_clock::time_point now);
+    void create_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, gc_clock::time_point now);
+    void delete_old_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& existing, const clustering_or_static_row& update, gc_clock::time_point now);
     void do_delete_old_entry(const partition_key& base_key, const clustering_or_static_row& existing, const clustering_or_static_row& update, gc_clock::time_point now);
-    void update_entry(const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now);
+    void update_entry(data_dictionary::database db, const partition_key& base_key, const clustering_or_static_row& update, const clustering_or_static_row& existing, gc_clock::time_point now);
     void update_entry_for_computed_column(const partition_key& base_key, const clustering_or_static_row& update, const std::optional<clustering_or_static_row>& existing, gc_clock::time_point now);
 };
 
 class view_update_builder {
+    data_dictionary::database _db;
     const replica::table& _base;
     schema_ptr _schema; // The base schema
     std::vector<view_updates> _view_updates;
-    flat_mutation_reader_v2 _updates;
-    flat_mutation_reader_v2_opt _existings;
+    mutation_reader _updates;
+    mutation_reader_opt _existings;
     tombstone _update_partition_tombstone;
     tombstone _update_current_tombstone;
     tombstone _existing_partition_tombstone;
@@ -259,14 +262,16 @@ class view_update_builder {
     mutation_fragment_v2_opt _existing;
     gc_clock::time_point _now;
     partition_key _key = partition_key::make_empty();
+    bool _skip_row_updates = false;
 public:
 
-    view_update_builder(const replica::table& base, schema_ptr s,
+    view_update_builder(data_dictionary::database db, const replica::table& base, schema_ptr s,
         std::vector<view_updates>&& views_to_update,
-        flat_mutation_reader_v2&& updates,
-        flat_mutation_reader_v2_opt&& existings,
+        mutation_reader&& updates,
+        mutation_reader_opt&& existings,
         gc_clock::time_point now)
-            : _base(base)
+            : _db(std::move(db))
+            , _base(base)
             , _schema(std::move(s))
             , _view_updates(std::move(views_to_update))
             , _updates(std::move(updates))
@@ -300,14 +305,16 @@ private:
 };
 
 view_update_builder make_view_update_builder(
+        data_dictionary::database db,
         const replica::table& base_table,
         const schema_ptr& base_schema,
         std::vector<view_and_base>&& views_to_update,
-        flat_mutation_reader_v2&& updates,
-        flat_mutation_reader_v2_opt&& existings,
+        mutation_reader&& updates,
+        mutation_reader_opt&& existings,
         gc_clock::time_point now);
 
 future<query::clustering_row_ranges> calculate_affected_clustering_ranges(
+        data_dictionary::database db,
         const schema& base,
         const dht::decorated_key& key,
         const mutation_partition& mp,
@@ -315,17 +322,11 @@ future<query::clustering_row_ranges> calculate_affected_clustering_ranges(
 
 bool needs_static_row(const mutation_partition& mp, const std::vector<view_and_base>& views);
 
-struct wait_for_all_updates_tag {};
-using wait_for_all_updates = bool_class<wait_for_all_updates_tag>;
-future<> mutate_MV(
-        dht::token base_token,
-        utils::chunked_vector<frozen_mutation_and_schema> view_updates,
-        db::view::stats& stats,
-        replica::cf_stats& cf_stats,
-        tracing::trace_state_ptr tr_state,
-        db::timeout_semaphore_units pending_view_updates,
-        service::allow_hints allow_hints,
-        wait_for_all_updates wait_for_all);
+// Whether this node and shard should generate and send view updates for the given token.
+// Checks that the node is one of the replicas (not a pending replicas), and is ready for reads.
+bool should_generate_view_updates_on_this_shard(const schema_ptr& base, const locator::effective_replication_map_ptr& ermp, dht::token token);
+
+size_t memory_usage_of(const frozen_mutation_and_schema& mut);
 
 /**
  * create_virtual_column() adds a "virtual column" to a schema builder.

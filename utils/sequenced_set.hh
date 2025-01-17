@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -127,6 +127,14 @@ public:
 
     const auto& get_set() const noexcept {
         return _set;
+    }
+
+    auto extract_vector() && noexcept {
+        return std::move(_vec);
+    }
+
+    auto extract_set() && noexcept {
+        return std::move(_set);
     }
 
     bool contains(const T& t) const noexcept {

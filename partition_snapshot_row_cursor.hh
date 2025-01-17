@@ -3,16 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "mutation/partition_version.hh"
 #include "row_cache.hh"
+#include "utils/assert.hh"
 #include "utils/small_vector.hh"
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/range/algorithm/heap_algorithm.hpp>
+#include <fmt/core.h>
+#include <ranges>
 
 class partition_snapshot_row_cursor;
 
@@ -111,6 +112,7 @@ class partition_snapshot_row_cursor final {
         mutation_partition::rows_type::iterator it;
         utils::immutable_collection<mutation_partition::rows_type> rows;
         int version_no;
+        const schema* schema;
         bool unique_owner = false;
         is_continuous continuous = is_continuous::no; // Range continuity in the direction of lower keys (in cursor schema domain).
 
@@ -197,12 +199,12 @@ class partition_snapshot_row_cursor final {
         version_heap_less_compare heap_less(*this);
         position_in_partition::equal_compare eq(*_snp.schema());
         do {
-            boost::range::pop_heap(_heap, heap_less);
+            std::ranges::pop_heap(_heap, heap_less);
             memory::on_alloc_point();
             position_in_version& v = _heap.back();
             rows_entry& e = *v.it;
             if (_digest_requested) {
-                e.row().cells().prepare_hash(_schema, column_kind::regular_column);
+                e.row().cells().prepare_hash(*v.schema, column_kind::regular_column);
             }
             _dummy &= bool(e.dummy());
             _continuous |= bool(v.continuous);
@@ -280,7 +282,7 @@ class partition_snapshot_row_cursor final {
                     rt = pos->range_tombstone();
                 }
                 if (pos) [[likely]] {
-                    _heap.emplace_back(position_in_version{pos, std::move(rows), version_no, unique_owner, cont, rt});
+                    _heap.emplace_back(position_in_version{pos, std::move(rows), version_no, v.get_schema().get(), unique_owner, cont, rt});
                 }
             } else {
                 if (_reversed) [[unlikely]] {
@@ -293,13 +295,13 @@ class partition_snapshot_row_cursor final {
                     _background_continuity = true; // Default continuity past the last entry
                 }
                 if (pos) [[likely]] {
-                    _heap.emplace_back(position_in_version{pos, std::move(rows), version_no, unique_owner, is_continuous::yes});
+                    _heap.emplace_back(position_in_version{pos, std::move(rows), version_no, v.get_schema().get(), unique_owner, is_continuous::yes});
                 }
             }
             ++version_no;
             first = false;
         }
-        boost::range::make_heap(_heap, heap_less);
+        std::ranges::make_heap(_heap, heap_less);
         _change_mark = _snp.get_change_mark();
     }
 
@@ -311,7 +313,7 @@ class partition_snapshot_row_cursor final {
     bool advance(bool keep) {
         memory::on_alloc_point();
         version_heap_less_compare heap_less(*this);
-        assert(iterators_valid());
+        SCYLLA_ASSERT(iterators_valid());
         for (auto&& curr : _current_row) {
             if (!keep && curr.unique_owner) {
                 mutation_partition::rows_type::key_grabber kg(curr.it);
@@ -355,7 +357,7 @@ class partition_snapshot_row_cursor final {
                     _latest_it = curr.it;
                 }
                 _heap.push_back(curr);
-                boost::range::push_heap(_heap, heap_less);
+                std::ranges::push_heap(_heap, heap_less);
             }
         }
         return recreate_current_row();
@@ -379,7 +381,7 @@ public:
 
     // If is_in_latest_version() then this returns an iterator to the entry under cursor in the latest version.
     mutation_partition::rows_type::iterator get_iterator_in_latest_version() const {
-        assert(_latest_it);
+        SCYLLA_ASSERT(_latest_it);
         return *_latest_it;
     }
 
@@ -432,7 +434,7 @@ public:
             bool match;
             auto it = rows.lower_bound(_position, match, cmp);
             _latest_it = it;
-            auto heap_i = boost::find_if(_heap, [](auto&& v) { return v.version_no == 0; });
+            auto heap_i = std::ranges::find_if(_heap, [](auto&& v) { return v.version_no == 0; });
 
             is_continuous cont;
             tombstone rt;
@@ -465,25 +467,25 @@ public:
             if (!it) {
                 if (heap_i != _heap.end()) {
                     _heap.erase(heap_i);
-                    boost::range::make_heap(_heap, heap_less);
+                    std::ranges::make_heap(_heap, heap_less);
                 }
             } else if (match) {
                 _current_row.insert(_current_row.begin(), position_in_version{
-                    it, std::move(rows), 0, _unique_owner, cont, rt});
+                    it, std::move(rows), 0, _snp.version()->get_schema().get(), _unique_owner, cont, rt});
                 if (heap_i != _heap.end()) {
                     _heap.erase(heap_i);
-                    boost::range::make_heap(_heap, heap_less);
+                    std::ranges::make_heap(_heap, heap_less);
                 }
             } else {
                 if (heap_i != _heap.end()) {
                     heap_i->it = it;
                     heap_i->continuous = cont;
                     heap_i->rt = rt;
-                    boost::range::make_heap(_heap, heap_less);
+                    std::ranges::make_heap(_heap, heap_less);
                 } else {
                     _heap.push_back(position_in_version{
-                        it, std::move(rows), 0, _unique_owner, cont, rt});
-                    boost::range::push_heap(_heap, heap_less);
+                        it, std::move(rows), 0, _snp.version()->get_schema().get(), _unique_owner, cont, rt});
+                    std::ranges::push_heap(_heap, heap_less);
                 }
             }
         }
@@ -556,11 +558,15 @@ public:
     clustering_row row() const {
         // Note: if the precondition ("cursor is valid and pointing at a row") is fulfilled
         // then _current_row is not empty, so the below is valid.
-        clustering_row cr(key(), deletable_row(_schema, _current_row[0].it->row()));
+        clustering_row cr(key(), deletable_row(_schema, *_current_row[0].schema, _current_row[0].it->row()));
         for (size_t i = 1; i < _current_row.size(); ++i) {
-            cr.apply(_schema, _current_row[i].it->row());
+            cr.apply(_schema, *_current_row[i].schema, _current_row[i].it->row());
         }
         return cr;
+    }
+
+    const schema& latest_row_schema() const noexcept {
+        return *_current_row[0].schema;
     }
 
     // Can be called only when cursor is valid and pointing at a row.
@@ -569,25 +575,21 @@ public:
     }
 
     // Can be called only when cursor is valid and pointing at a row.
-    // Monotonic exception guarantees.
-    template <typename Consumer>
-    requires std::is_invocable_v<Consumer, deletable_row>
-    void consume_row(Consumer&& consumer) {
-        for (position_in_version& v : _current_row) {
-            if (v.unique_owner) {
-                consumer(std::move(v.it->row()));
-            } else {
-                consumer(deletable_row(_schema, v.it->row()));
-            }
-        }
+    void latest_row_prepare_hash() const {
+        _current_row[0].it->row().cells().prepare_hash(*_current_row[0].schema, column_kind::regular_column);
     }
 
     // Can be called only when cursor is valid and pointing at a row.
+    // Monotonic exception guarantees.
     template <typename Consumer>
-    requires std::is_invocable_v<Consumer, const deletable_row&>
-    void consume_row(Consumer&& consumer) const {
-        for (const position_in_version& v : _current_row) {
-            consumer(v.it->row());
+    requires std::is_invocable_v<Consumer, deletable_row&&>
+    void consume_row(Consumer&& consumer) {
+        for (position_in_version& v : _current_row) {
+            if (v.unique_owner && (_schema.version() == v.schema->version())) [[likely]] {
+                consumer(std::move(v.it->row()));
+            } else {
+                consumer(deletable_row(_schema, *v.schema, v.it->row()));
+            }
         }
     }
 
@@ -596,7 +598,7 @@ public:
     size_t memory_usage() const {
         size_t result = 0;
         for (const position_in_version& v : _current_row) {
-            result += v.it->memory_usage(_schema);
+            result += v.it->memory_usage(*v.schema);
         }
         return result;
     }
@@ -631,16 +633,19 @@ public:
                                                                       is_dummy(!_position.is_clustering_row()), is_continuous::no));
                 } else {
                     return alloc_strategy_unique_ptr<rows_entry>(
-                            current_allocator().construct<rows_entry>(*_snp.schema(), *_current_row[0].it));
+                            current_allocator().construct<rows_entry>(*_snp.schema(), *_current_row[0].schema, *_current_row[0].it));
                 }
             }();
             rows_entry& re = *e;
             if (_reversed) { // latest_i is not reliably a successor
-                // FIXME: set continuity when possible. Not that important since cache sets it anyway when populating.
                 re.set_continuous(false);
                 e->set_range_tombstone(range_tombstone_for_row());
                 rows_entry::tri_compare cmp(*_snp.schema());
                 auto res = rows.insert(std::move(e), cmp);
+                if (auto l = std::next(res.first); l != rows.end() && l->continuous()) {
+                    re.set_continuous(true);
+                    re.set_range_tombstone(l->range_tombstone());
+                }
                 if (res.second) {
                     _snp.tracker()->insert(re);
                 }
@@ -682,7 +687,7 @@ public:
         position_in_partition::less_compare less(_schema);
         if (!iterators_valid() || less(position(), pos)) {
             auto has_entry = maybe_advance_to(pos);
-            assert(has_entry); // evictable snapshots must have a dummy after all rows.
+            SCYLLA_ASSERT(has_entry); // evictable snapshots must have a dummy after all rows.
         }
         auto&& rows = _snp.version()->partition().mutable_clustered_rows();
         auto latest_i = get_iterator_in_latest_version();
@@ -707,7 +712,7 @@ public:
             }
         }
         auto e = alloc_strategy_unique_ptr<rows_entry>(
-                current_allocator().construct<rows_entry>(_schema, pos,
+                current_allocator().construct<rows_entry>(*_snp.version()->get_schema(), pos,
                     is_dummy(!pos.is_clustering_row()),
                     is_continuous::no));
         if (latest_i && latest_i->continuous()) {
@@ -747,61 +752,57 @@ public:
         return _position;
     }
 
-    friend std::ostream& operator<<(std::ostream& out, const partition_snapshot_row_cursor& cur) {
-        out << "{cursor: position=" << cur._position
-            << ", cont=" << cur.continuous()
-            << ", rt=" << cur.range_tombstone();
+    friend fmt::formatter<partition_snapshot_row_cursor>;
+};
+
+template <> struct fmt::formatter<partition_snapshot_row_cursor> : fmt::formatter<string_view> {
+    auto format(const  partition_snapshot_row_cursor& cur, fmt::format_context& ctx) const {
+        auto out = ctx.out();
+        out = fmt::format_to(out, "{{cursor: position={}, cont={}, rt={}}}",
+                   cur._position, cur.continuous(), cur.range_tombstone());
         if (cur.range_tombstone() != cur.range_tombstone_for_row()) {
-            out << ", row_rt=" << cur.range_tombstone_for_row();
+            out = fmt::format_to(out, ", row_rt={}", cur.range_tombstone_for_row());
         }
-        out << ", ";
+        out = fmt::format_to(out, ", ");
         if (cur._reversed) {
-            out << "reversed, ";
+            out = fmt::format_to(out, "reversed, ");
         }
         if (!cur.iterators_valid()) {
-            return out << " iterators invalid}";
+            return fmt::format_to(out, " iterators invalid}}");
         }
-        out << "snp=" << &cur._snp << ", current=[";
+        out = fmt::format_to(out, "snp={}, current=[", fmt::ptr(&cur._snp));
         bool first = true;
         for (auto&& v : cur._current_row) {
             if (!first) {
-                out << ", ";
+                out = fmt::format_to(out, ", ");
             }
             first = false;
-            out << "{v=" << v.version_no
-                << ", pos=" << v.it->position()
-                << ", cont=" << v.continuous
-                << ", rt=" << v.rt
-                << ", row_rt=" << v.it->range_tombstone()
-                << "}";
+            out = fmt::format_to(out, "{{v={}, pos={}, cont={}, rt={}, row_rt={}}}",
+                       v.version_no, v.it->position(), v.continuous, v.rt, v.it->range_tombstone());
         }
-        out << "], heap=[\n  ";
+        out = fmt::format_to(out, "], heap[\n  ");
         first = true;
         for (auto&& v : cur._heap) {
             if (!first) {
-                out << ",\n  ";
+                out = fmt::format_to(out, ",\n  ");
             }
             first = false;
-            out << "{v=" << v.version_no
-                << ", pos=" << v.it->position()
-                << ", cont=" << v.continuous
-                << ", rt=" << v.rt
-                << ", row_rt=" << v.it->range_tombstone()
-                << "}";
+            out = fmt::format_to(out, "{{v={}, pos={}, cont={}, rt={}, row_rt={}}}",
+                       v.version_no, v.it->position(), v.continuous, v.rt, v.it->range_tombstone());
         }
-        out << "], latest_iterator=[";
+        out = fmt::format_to(out, "], latest_iterator=[");
         if (cur._latest_it) {
             mutation_partition::rows_type::iterator i = *cur._latest_it;
             if (!i) {
-                out << "end";
+                out = fmt::format_to(out, "end");
             } else {
-                out << i->position();
+                out = fmt::format_to(out, "{}", i->position());
             }
         } else {
-            out << "<none>";
+            out = fmt::format_to(out, "<none>");
         }
-        return out << "]}";
-    };
+        return fmt::format_to(out, "]}}");
+    }
 };
 
 inline

@@ -3,7 +3,7 @@
 #  Copyright (C) 2017-present ScyllaDB
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 if [ ! -e dist/offline_installer/debian/build_offline_installer.sh ]; then
     echo "run build_offline_installer.sh in top of scylla dir"
@@ -103,7 +103,7 @@ deb-src http://security.debian.org/ $SUITE/updates main contrib non-free
 EOS
 fi
 sudo wget -P build/chroot/etc/apt/sources.list.d $REPO
-# Avoid the pacakges to be deleted after installation
+# Avoid the packages to be deleted after installation
 sudo tee build/chroot/etc/apt/apt.conf.d/01keep-debs << EOS
 Binary::apt::APT::Keep-Downloaded-Packages "true";
 EOS

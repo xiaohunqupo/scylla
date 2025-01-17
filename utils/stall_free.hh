@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,8 +12,9 @@
 #include <algorithm>
 #include <seastar/core/thread.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/when_all.hh>
+#include <seastar/core/do_with.hh>
 #include "utils/collection-concepts.hh"
 
 using namespace seastar;
@@ -60,6 +61,7 @@ concept HasClearGentlyMethod = requires (T x) {
 
 template <typename T>
 concept SmartPointer = requires (T x) {
+    { x.get() } -> std::same_as<typename T::element_type*>;
     { *x } -> std::same_as<typename T::element_type&>;
 };
 
@@ -94,7 +96,7 @@ concept TriviallyClearableSequence =
 
 template <typename T>
 concept Container = Iterable<T> && requires (T x, typename T::iterator it) {
-    { x.erase(it) } -> std::same_as<typename T::iterator>;
+    x.erase(it);
 };
 
 template <typename T>
@@ -132,6 +134,12 @@ template <Container T>
 requires (!StringLike<T> && !Sequence<T> && !MapLike<T>)
 future<> clear_gently(T& c) noexcept;
 
+template <typename T>
+future<> clear_gently(std::optional<T>& opt) noexcept;
+
+template <typename T>
+future<> clear_gently(seastar::optimized_optional<T>& opt) noexcept;
+
 namespace internal {
 
 template <typename T>
@@ -167,6 +175,14 @@ future<> clear_gently(foreign_ptr<T>& o) noexcept {
     });
 }
 
+template <typename... T>
+requires (std::is_rvalue_reference_v<T&&> && ...)
+future<> clear_gently(T&&... o) {
+    return do_with(std::move(o)..., [](auto&... args) {
+        return when_all(clear_gently(args)...).discard_result();
+    });
+}
+
 template <SharedPointer T>
 future<> clear_gently(T& o) noexcept {
     if (o.use_count() == 1) {
@@ -177,7 +193,11 @@ future<> clear_gently(T& o) noexcept {
 
 template <SmartPointer T>
 future<> clear_gently(T& o) noexcept {
-    return internal::clear_gently(*o);
+    if (auto p = o.get()) {
+        return internal::clear_gently(*p);
+    } else {
+        return make_ready_future<>();
+    }
 }
 
 template <typename T, std::size_t N>
@@ -229,6 +249,43 @@ future<> clear_gently(T& c) noexcept {
         return internal::clear_gently(*it).then([&c, it = std::move(it)] () mutable {
             c.erase(it);
         });
+    });
+}
+
+template <typename T>
+future<> clear_gently(std::optional<T>& opt) noexcept {
+    if (opt) {
+        return utils::clear_gently(*opt);
+    } else {
+        return make_ready_future<>();
+    }
+}
+
+template <typename T>
+future<> clear_gently(seastar::optimized_optional<T>& opt) noexcept {
+    if (opt) {
+        return utils::clear_gently(*opt);
+    } else {
+        return make_ready_future<>();
+    }
+}
+
+namespace internal {
+
+template <typename T>
+concept gently_reservable = requires(T x) {
+    { x.capacity() } -> std::same_as<size_t>;
+    { x.reserve_partial(10) } -> std::same_as<void>;
+
+};
+
+} // namespace internal
+
+// reserve_gently gently reserves memory in containers which support partial reserve.
+future<> reserve_gently(internal::gently_reservable auto& container, size_t size) {
+    return seastar::do_until([&container, size] { return container.capacity() == size; }, [&container, size]() {
+        container.reserve_partial(size);
+        return seastar::make_ready_future();
     });
 }
 

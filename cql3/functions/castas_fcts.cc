@@ -3,15 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "castas_fcts.hh"
-#include "concrete_types.hh"
+#include "utils/big_decimal.hh"
 #include "utils/UUID_gen.hh"
 #include "cql3/functions/native_scalar_function.hh"
-#include "utils/date.h"
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <chrono>
 
 namespace cql3 {
 namespace functions {
@@ -35,7 +35,7 @@ public:
     virtual void print(std::ostream& os) const override {
         os << "cast(" << _arg_types[0]->name() << " as " << _return_type->name() << ")";
     }
-    virtual bytes_opt execute(const std::vector<bytes_opt>& parameters) override {
+    virtual bytes_opt execute(std::span<const bytes_opt> parameters) override {
         auto from_type = arg_types()[0];
         auto to_type = return_type();
 
@@ -109,7 +109,7 @@ static data_value castas_fctn_from_integer_to_decimal(data_value from) {
 template<typename FromType>
 static data_value castas_fctn_from_float_to_decimal(data_value from) {
     auto val_from = value_cast<FromType>(from);
-    return big_decimal(boost::lexical_cast<std::string>(val_from));
+    return big_decimal(fmt::to_string(val_from));
 }
 
 template<typename FromType>
@@ -134,11 +134,11 @@ simple_date_native_type time_point_to_date(const db_clock::time_point& tp) {
 }
 
 db_clock::time_point date_to_time_point(const uint32_t date) {
-    const auto epoch = boost::posix_time::from_time_t(0);
-    const auto target_date = epoch + boost::gregorian::days(int64_t(date) - (1UL<<31));
-    boost::posix_time::time_duration duration = target_date - epoch;
-    const auto millis = std::chrono::milliseconds(duration.total_milliseconds());
-    return db_clock::time_point(std::chrono::duration_cast<db_clock::duration>(millis));
+    // "date" counts the number of days since the epoch, where the middle
+    // of the unsigned range, 2^31, signifies the epoch itself.
+    int64_t millis_since_epoch = (int64_t(date) - (1UL<<31)) * 24 * 60 * 60 * 1000;
+    return db_clock::time_point(std::chrono::duration_cast<db_clock::duration>(
+        std::chrono::milliseconds(millis_since_epoch)));
 }
 
 static data_value castas_fctn_from_timestamp_to_date(data_value from) {
@@ -164,8 +164,6 @@ static data_value castas_fctn_from_timeuuid_to_date(data_value from) {
 static data_value castas_fctn_from_dv_to_string(data_value from) {
     return from.type()->to_string_impl(from);
 }
-
-// FIXME: Add conversions for counters, after they are fully implemented...
 
 static constexpr unsigned next_power_of_2(unsigned val) {
     unsigned ret = 1;
@@ -370,21 +368,33 @@ castas_fctn get_castas_fctn(data_type to_type, data_type from_type) {
         return castas_fctn_from_dv_to_string;
     case cast_switch_case_val(kind::utf8, kind::ascii):
         return castas_fctn_simple<sstring, sstring>;
+
+    case cast_switch_case_val(kind::byte, kind::counter):
+        return castas_fctn_simple<int8_t, int64_t>;
+    case cast_switch_case_val(kind::short_kind, kind::counter):
+        return castas_fctn_simple<int16_t, int64_t>;
+    case cast_switch_case_val(kind::int32, kind::counter):
+        return castas_fctn_simple<int32_t, int64_t>;
+    case cast_switch_case_val(kind::long_kind, kind::counter):
+        return castas_fctn_simple<int64_t, int64_t>;
+    case cast_switch_case_val(kind::float_kind, kind::counter):
+        return castas_fctn_simple<float, int64_t>;
+    case cast_switch_case_val(kind::double_kind, kind::counter):
+        return castas_fctn_simple<double, int64_t>;
+    case cast_switch_case_val(kind::varint, kind::counter):
+        return castas_fctn_simple<utils::multiprecision_int, int64_t>;
+    case cast_switch_case_val(kind::decimal, kind::counter):
+        return castas_fctn_from_integer_to_decimal<int64_t>;
+    case cast_switch_case_val(kind::ascii, kind::counter):
+    case cast_switch_case_val(kind::utf8, kind::counter):
+        return castas_fctn_to_string<int64_t>;
     }
     throw exceptions::invalid_request_exception(format("{} cannot be cast to {}", from_type->name(), to_type->name()));
 }
 
-shared_ptr<function> castas_functions::get(data_type to_type, const std::vector<shared_ptr<cql3::selection::selector>>& provided_args) {
-    if (provided_args.size() != 1) {
-        throw exceptions::invalid_request_exception("Invalid CAST expression");
-    }
-    auto from_type = provided_args[0]->get_type();
-    auto from_type_key = from_type;
-    if (from_type_key->is_reversed()) {
-        from_type_key = dynamic_cast<const reversed_type_impl&>(*from_type).underlying_type();
-    }
-
-    auto f = get_castas_fctn(to_type, from_type_key);
+shared_ptr<function>
+get_castas_fctn_as_cql3_function(data_type to_type, data_type from_type) {
+    auto f = get_castas_fctn(to_type, from_type->without_reversed().shared_from_this());
     return make_castas_function(to_type, from_type, f);
 }
 

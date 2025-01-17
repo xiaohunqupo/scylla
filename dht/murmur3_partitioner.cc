@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "murmur3_partitioner.hh"
@@ -21,7 +21,7 @@ namespace dht {
 // allowed anyway. However, they *are* allowed in materialized views, so the
 // empty-key partition should get a real token, not an invalid token, so
 // we dropped this special case. Since we don't support migrating sstables of
-// materialized-views from Cassandra, this Cassandra-Scylla incompatiblity
+// materialized-views from Cassandra, this Cassandra-Scylla incompatibility
 // will not cause problems in practice.
 // Note that get_token(const schema& s, partition_key_view key) below must
 // use exactly the same algorithm as this function.
@@ -34,7 +34,7 @@ murmur3_partitioner::get_token(bytes_view key) const {
 
 token
 murmur3_partitioner::get_token(uint64_t value) const {
-    return token(token::kind::key, value);
+    return token(value);
 }
 
 token

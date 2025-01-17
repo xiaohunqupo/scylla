@@ -5,24 +5,21 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include <unordered_set>
-#include <vector>
-#include <boost/signals2.hpp>
+#include "utils/assert.hh"
+#include <boost/signals2/signal_type.hpp>
 #include <boost/signals2/dummy_mutex.hpp>
 
+#include "gms/endpoint_state.hh"
+#include "locator/types.hh"
 #include "gms/inet_address.hh"
-#include "inet_address_vectors.hh"
-#include "gms/versioned_value.hh"
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/distributed.hh>
-#include "utils/class_registrator.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace gms {
 
@@ -45,10 +42,10 @@ struct snitch_config {
     sstring name = "SimpleSnitch";
     sstring properties_file_name = "";
     unsigned io_cpu_id = 0;
-    bool broadcast_rpc_address_specified_by_user = false;
 
     // Gossiping-property-file specific
     gms::inet_address listen_address;
+    gms::inet_address broadcast_address;
 
     // GCE-specific
     sstring gce_meta_server_url = "";
@@ -70,12 +67,21 @@ public:
      */
     virtual sstring get_datacenter() const = 0;
 
+    locator::endpoint_dc_rack get_location() const {
+        return locator::endpoint_dc_rack{
+            .dc = get_datacenter(),
+            .rack = get_rack(),
+        };
+    }
+
+    virtual std::optional<inet_address> get_public_address() const noexcept { return std::nullopt; }
+
     /**
      * returns whatever info snitch wants to gossip
      */
-    virtual std::list<std::pair<gms::application_state, gms::versioned_value>> get_app_states() const = 0;
+    virtual gms::application_state_map get_app_states() const = 0;
 
-    virtual ~i_endpoint_snitch() { assert(_state == snitch_state::stopped); };
+    virtual ~i_endpoint_snitch() { SCYLLA_ASSERT(_state == snitch_state::stopped); };
 
     // noop by default
     virtual future<> stop() {
@@ -126,7 +132,7 @@ public:
         return snitch_signal_connection_t();
     }
 
-    // tells wheter the INTERNAL_IP address should be preferred over endpoint address
+    // tells whether the INTERNAL_IP address should be preferred over endpoint address
     virtual bool prefer_local() const noexcept {
         return false;
     }
@@ -277,17 +283,20 @@ inline future<> i_endpoint_snitch::reset_snitch(sharded<snitch_ptr>& snitch, sni
 
 class snitch_base : public i_endpoint_snitch {
 public:
+    snitch_base(const snitch_config& cfg) : _cfg(cfg) {}
+
     //
     // Sons have to implement:
     // virtual sstring get_rack()        = 0;
     // virtual sstring get_datacenter()  = 0;
     //
 
-    virtual std::list<std::pair<gms::application_state, gms::versioned_value>> get_app_states() const override;
+    virtual gms::application_state_map get_app_states() const override;
 
 protected:
     sstring _my_dc;
     sstring _my_rack;
+    snitch_config _cfg;
 };
 
 } // namespace locator

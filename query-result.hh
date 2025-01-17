@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,6 +13,7 @@
 #include "query-request.hh"
 #include "full_position.hh"
 #include <optional>
+#include <fmt/ostream.h>
 #include <seastar/util/bool_class.hh>
 #include "seastarx.hh"
 
@@ -268,12 +269,7 @@ public:
     result_digest() = default;
     result_digest(type&& digest) : _digest(std::move(digest)) {}
     const type& get() const { return _digest; }
-    bool operator==(const result_digest& rh) const {
-        return _digest == rh._digest;
-    }
-    bool operator!=(const result_digest& rh) const {
-        return _digest != rh._digest;
-    }
+    bool operator==(const result_digest& rh) const = default;
 };
 
 //
@@ -417,7 +413,7 @@ public:
         }
     }
 
-    const api::timestamp_type last_modified() const {
+    api::timestamp_type last_modified() const {
         return _last_modified;
     }
 
@@ -455,3 +451,5 @@ public:
 
 std::ostream& operator<<(std::ostream& os, const query::result::printer&);
 }
+
+template <> struct fmt::formatter<query::result::printer> : fmt::ostream_formatter {};

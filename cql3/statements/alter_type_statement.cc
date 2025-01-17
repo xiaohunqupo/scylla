@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -39,13 +39,7 @@ void alter_type_statement::prepare_keyspace(const service::client_state& state)
 
 future<> alter_type_statement::check_access(query_processor& qp, const service::client_state& state) const
 {
-    return state.has_keyspace_access(qp.db(), keyspace(), auth::permission::ALTER);
-}
-
-void alter_type_statement::validate(query_processor& qp, const service::client_state& state) const
-{
-    // Validation is left to announceMigration as it's easier to do it while constructing the updated type.
-    // It doesn't really change anything anyway.
+    return state.has_keyspace_access(keyspace(), auth::permission::ALTER);
 }
 
 const sstring& alter_type_statement::keyspace() const
@@ -53,32 +47,32 @@ const sstring& alter_type_statement::keyspace() const
     return _name.get_keyspace();
 }
 
-future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutations(data_dictionary::database db, service::migration_manager& mm, api::timestamp_type ts) const {
+future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutations(service::storage_proxy& sp, api::timestamp_type ts) const {
     std::vector<mutation> m;
-    auto&& ks = db.find_keyspace(keyspace());
+    auto&& ks = sp.data_dictionary().find_keyspace(keyspace());
     auto&& all_types = ks.metadata()->user_types().get_all_types();
     auto to_update = all_types.find(_name.get_user_type_name());
     // Shouldn't happen, unless we race with a drop
     if (to_update == all_types.end()) {
-        throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_string()));
+        throw exceptions::invalid_request_exception(format("No user type named {} exists.", _name.to_cql_string()));
     }
 
-    for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+    for (auto&& schema : ks.metadata()->cf_meta_data() | std::views::values) {
         for (auto&& column : schema->partition_key_columns()) {
             if (column.type->references_user_type(_name.get_keyspace(), _name.get_user_type_name())) {
                 throw exceptions::invalid_request_exception(format("Cannot add new field to type {} because it is used in the partition key column {} of table {}.{}",
-                    _name.to_string(), column.name_as_text(), schema->ks_name(), schema->cf_name()));
+                    _name.to_cql_string(), column.name_as_text(), schema->ks_name(), schema->cf_name()));
             }
         }
     }
 
-    auto&& updated = make_updated_type(db, to_update->second);
+    auto&& updated = make_updated_type(sp.data_dictionary(), to_update->second);
     // Now, we need to announce the type update to basically change it for new tables using this type,
     // but we also need to find all existing user types and CF using it and change them.
-    auto res = co_await mm.prepare_update_type_announcement(updated, ts);
+    auto res = co_await service::prepare_update_type_announcement(sp, updated, ts);
     std::move(res.begin(), res.end(), std::back_inserter(m));
 
-    for (auto&& schema : ks.metadata()->cf_meta_data() | boost::adaptors::map_values) {
+    for (auto&& schema : ks.metadata()->cf_meta_data() | std::views::values) {
         auto cfm = schema_builder(schema);
         bool modified = false;
         for (auto&& column : schema->all_columns()) {
@@ -91,10 +85,10 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
         }
         if (modified) {
             if (schema->is_view()) {
-                auto res = co_await mm.prepare_view_update_announcement(view_ptr(cfm.build()), ts);
+                auto res = co_await service::prepare_view_update_announcement(sp, view_ptr(cfm.build()), ts);
                 std::move(res.begin(), res.end(), std::back_inserter(m));
             } else {
-                auto res = co_await mm.prepare_column_family_update_announcement(cfm.build(), false, {}, ts);
+                auto res = co_await service::prepare_column_family_update_announcement(sp, cfm.build(), {}, ts);
                 std::move(res.begin(), res.end(), std::back_inserter(m));
             }
         }
@@ -103,10 +97,10 @@ future<std::vector<mutation>> alter_type_statement::prepare_announcement_mutatio
     co_return m;
 }
 
-future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>>
-alter_type_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
+alter_type_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     try {
-        auto m = co_await prepare_announcement_mutations(qp.db(), qp.get_migration_manager(), ts);
+        auto m = co_await prepare_announcement_mutations(qp.proxy(), ts);
 
         using namespace cql_transport;
         auto ret = ::make_shared<event::schema_change>(
@@ -115,7 +109,7 @@ alter_type_statement::prepare_schema_mutations(query_processor& qp, api::timesta
                 keyspace(),
                 _name.get_string_type_name());
 
-        co_return std::make_pair(std::move(ret), std::move(m));
+        co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
     } catch(data_dictionary::no_such_keyspace& e) {
         auto&& ex = std::make_exception_ptr(exceptions::invalid_request_exception(format("Cannot alter type in unknown keyspace {}", keyspace())));
         co_return coroutine::exception(std::move(ex));
@@ -134,11 +128,23 @@ user_type alter_type_statement::add_or_alter::do_add(data_dictionary::database d
 {
     if (to_update->idx_of_field(_field_name->name())) {
         throw exceptions::invalid_request_exception(format("Cannot add new field {} to type {}: a field of the same name already exists",
-            _field_name->to_string(), _name.to_string()));
+            _field_name->to_string(), _name.to_cql_string()));
     }
 
     if (to_update->size() == max_udt_fields) {
         throw exceptions::invalid_request_exception(format("Cannot add new field to type {}: maximum number of fields reached", _name));
+    }
+
+    if (_field_type->is_duration()) {
+        auto&& ks = db.find_keyspace(keyspace());
+        for (auto&& schema : ks.metadata()->cf_meta_data() | std::views::values) {
+            for (auto&& column : schema->clustering_key_columns()) {
+                if (column.type->references_user_type(_name.get_keyspace(), _name.get_user_type_name())) {
+                    throw exceptions::invalid_request_exception(format("Cannot add new field to type {} because it is used in the clustering key column {} of table {}.{} where durations are not allowed",
+                        _name.to_cql_string(), column.name_as_text(), schema->ks_name(), schema->cf_name()));
+                }
+            }
+        }
     }
 
     std::vector<bytes> new_names(to_update->field_names());
@@ -147,7 +153,7 @@ user_type alter_type_statement::add_or_alter::do_add(data_dictionary::database d
     auto&& add_type = _field_type->prepare(db, keyspace()).get_type();
     if (add_type->references_user_type(to_update->_keyspace, to_update->_name)) {
         throw exceptions::invalid_request_exception(format("Cannot add new field {} of type {} to type {} as this would create a circular reference",
-                    *_field_name, *_field_type, _name.to_string()));
+                    *_field_name, *_field_type, _name.to_cql_string()));
     }
     new_types.push_back(std::move(add_type));
     return user_type_impl::get_instance(to_update->_keyspace, to_update->_name, std::move(new_names), std::move(new_types), to_update->is_multi_cell());
@@ -157,7 +163,7 @@ user_type alter_type_statement::add_or_alter::do_alter(data_dictionary::database
 {
     auto idx = to_update->idx_of_field(_field_name->name());
     if (!idx) {
-        throw exceptions::invalid_request_exception(format("Unknown field {} in type {}", _field_name->to_string(), _name.to_string()));
+        throw exceptions::invalid_request_exception(format("Unknown field {} in type {}", _field_name->to_string(), _name.to_cql_string()));
     }
 
     auto previous = to_update->field_types()[*idx];
@@ -194,7 +200,7 @@ user_type alter_type_statement::renames::make_updated_type(data_dictionary::data
         auto&& from = rename.first;
         auto idx = to_update->idx_of_field(from->name());
         if (!idx) {
-            throw exceptions::invalid_request_exception(format("Unknown field {} in type {}", from->to_string(), _name.to_string()));
+            throw exceptions::invalid_request_exception(format("Unknown field {} in type {}", from->to_string(), _name.to_cql_string()));
         }
         new_names[*idx] = rename.second->name();
     }
@@ -205,12 +211,12 @@ user_type alter_type_statement::renames::make_updated_type(data_dictionary::data
 
 std::unique_ptr<cql3::statements::prepared_statement>
 alter_type_statement::add_or_alter::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<alter_type_statement::add_or_alter>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<alter_type_statement::add_or_alter>(*this));
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 alter_type_statement::renames::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<alter_type_statement::renames>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<alter_type_statement::renames>(*this));
 }
 
 }

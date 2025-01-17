@@ -5,18 +5,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/stats.hh"
-#include "cql3/column_identifier.hh"
 #include "cql3/update_parameters.hh"
 #include "cql3/cql_statement.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
 #include "cql3/statements/statement_type.hh"
-#include "exceptions/exceptions.hh"
 #include "exceptions/coordinator_result.hh"
 
 #include <seastar/core/shared_ptr.hh>
@@ -42,7 +40,7 @@ namespace raw { class modification_statement; }
 class modification_statement : public cql_statement_opt_metadata {
 public:
     const statement_type type;
-
+    bool _may_use_token_aware_routing;
 private:
     const uint32_t _bound_terms;
     // If we have operation on list entries, such as adding or
@@ -107,6 +105,8 @@ public:
             std::unique_ptr<attributes> attrs_,
             cql_stats& stats_);
 
+    virtual ~modification_statement() override;
+
     virtual bool require_full_clustering_key() const = 0;
 
     virtual bool allow_clustering_key_slices() const = 0;
@@ -127,7 +127,7 @@ public:
 
     bool is_timestamp_set() const;
 
-    gc_clock::duration get_time_to_live(const query_options& options) const;
+    std::optional<gc_clock::duration> get_time_to_live(const query_options& options) const;
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
@@ -173,7 +173,7 @@ public:
 
 private:
     // Return true if this statement doesn't update or read any regular rows, only static rows.
-    // Note, it isn't enought to just check !_sets_regular_columns && _regular_conditions.empty(),
+    // Note, it isn't enough to just check !_sets_regular_columns && _regular_conditions.empty(),
     // because a DELETE statement that deletes whole rows (DELETE FROM ...) technically doesn't
     // have any column operations and hence doesn't have _sets_regular_columns set. It doesn't
     // have _sets_static_columns set either so checking the latter flag too here guarantees that
@@ -229,14 +229,14 @@ public:
     bool has_only_static_column_conditions() const { return !_has_regular_column_conditions && _has_static_column_conditions; }
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(query_processor& qp, service::query_state& qs, const query_options& options) const override;
+    execute(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options) const override;
+    execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
 private:
     future<exceptions::coordinator_result<>>
-    execute_without_condition(query_processor& qp, service::query_state& qs, const query_options& options) const;
+    execute_without_condition(query_processor& qp, service::query_state& qs, const query_options& options, json_cache_opt& json_cache, std::vector<dht::partition_range> keys) const;
 
     future<::shared_ptr<cql_transport::messages::result_message>>
     execute_with_condition(query_processor& qp, service::query_state& qs, const query_options& options) const;
@@ -252,7 +252,7 @@ public:
      * @return vector of the mutations
      * @throws invalid_request_exception on invalid requests
      */
-    future<std::vector<mutation>> get_mutations(query_processor& qp, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, service::query_state& qs) const;
+    future<std::vector<mutation>> get_mutations(query_processor& qp, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, service::query_state& qs, json_cache_opt& json_cache, std::vector<dht::partition_range> keys) const;
 
     virtual json_cache_opt maybe_prepare_json_cache(const query_options& options) const;
 

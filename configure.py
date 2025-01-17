@@ -5,11 +5,13 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import argparse
+import copy
 import os
+import pathlib
 import platform
 import re
 import shlex
@@ -17,42 +19,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-from distutils.spawn import find_executable
+from shutil import which
+from typing import NamedTuple
 
-curdir = os.getcwd()
 
-outdir = 'build'
-
-tempfile.tempdir = f"{outdir}/tmp"
-
-configure_args = str.join(' ', [shlex.quote(x) for x in sys.argv[1:] if not x.startswith('--out=')])
-
-if os.path.exists('/etc/os-release'):
-    for line in open('/etc/os-release'):
-        key, _, value = line.partition('=')
-        value = value.strip().strip('"')
-        if key == 'ID':
-            os_ids = [value]
-        if key == 'ID_LIKE':
-            os_ids += value.split(' ')
-    if not os_ids:
-        os_ids = ['linux']  # default ID per os-release(5)
-else:
-    os_ids = ['unknown']
-
-distro_extra_cflags = ''
-distro_extra_ldflags = ''
-distro_extra_cmake_args = []
-employ_ld_trickery = True
-
-# distro-specific setup
-def distro_setup_nix():
-    global os_ids, employ_ld_trickery
-    os_ids = ['linux']
-    employ_ld_trickery = False
-
-if os.environ.get('NIX_CC'):
-        distro_setup_nix()
+configure_args = str.join(' ', [shlex.quote(x) for x in sys.argv[1:] if not x.startswith('--out=') and not x.startswith('--out-final-name=')])
 
 # distribution "internationalization", converting package names.
 # Fedora name is key, values is distro -> package name dict.
@@ -70,10 +41,30 @@ node_exporter_filename = subprocess.run('./install-dependencies.sh --print-node-
 node_exporter_dirname = os.path.basename(node_exporter_filename).rstrip('.tar.gz')
 
 
+def get_os_ids():
+    if os.environ.get('NIX_CC'):
+        return ['linux']
+
+    if not os.path.exists('/etc/os-release'):
+        return ['unknown']
+
+    os_ids = []
+    for line in open('/etc/os-release'):
+        key, _, value = line.partition('=')
+        value = value.strip().strip('"')
+        if key == 'ID':
+            os_ids = [value]
+        if key == 'ID_LIKE':
+            os_ids += value.split(' ')
+    if os_ids:
+        return os_ids
+    return ['linux']  # default ID per os-release(5)
+
+
 def pkgname(name):
     if name in i18n_xlat:
         dict = i18n_xlat[name]
-        for id in os_ids:
+        for id in get_os_ids():
             if id in dict:
                 return dict[id]
     return name
@@ -87,8 +78,8 @@ def get_flags():
                     return re.sub(r'^flags\s+: ', '', line).split()
 
 
-def add_tristate(arg_parser, name, dest, help):
-    arg_parser.add_argument('--enable-' + name, dest=dest, action='store_true', default=None,
+def add_tristate(arg_parser, name, dest, help, default=None):
+    arg_parser.add_argument('--enable-' + name, dest=dest, action='store_true', default=default,
                             help='Enable ' + help)
     arg_parser.add_argument('--disable-' + name, dest=dest, action='store_false', default=None,
                             help='Disable ' + help)
@@ -130,13 +121,8 @@ def try_compile(compiler, source='', flags=[]):
     return try_compile_and_link(compiler, source, flags=flags + ['-c'])
 
 
-def ensure_tmp_dir_exists():
-    if not os.path.exists(tempfile.tempdir):
-        os.makedirs(tempfile.tempdir)
-
-
 def try_compile_and_link(compiler, source='', flags=[], verbose=False):
-    ensure_tmp_dir_exists()
+    os.makedirs(tempfile.tempdir, exist_ok=True)
     with tempfile.NamedTemporaryFile() as sfile:
         ofd, ofile = tempfile.mkstemp()
         os.close(ofd)
@@ -219,18 +205,6 @@ class Source(object):
     def endswith(self, end):
         return self.source.endswith(end)
 
-class Thrift(Source):
-    def __init__(self, source, service):
-        Source.__init__(self, source, '.h', '.cpp')
-        self.service = service
-
-    def generated(self, gen_dir):
-        basename = os.path.splitext(os.path.basename(self.source))[0]
-        files = [basename + '_' + ext
-                 for ext in ['types.cpp', 'types.h', 'constants.cpp', 'constants.h']]
-        files += [self.service + ext
-                  for ext in ['.cpp', '.h']]
-        return [os.path.join(gen_dir, file) for file in files]
 
 def default_target_arch():
     if platform.machine() in ['i386', 'i686', 'x86_64']:
@@ -280,18 +254,133 @@ def find_headers(repodir, excluded_dirs):
     return sorted(headers)
 
 
+def generate_compdb(compdb, ninja, buildfile, modes):
+    # per-mode compdbs are built by taking the relevant entries from the
+    # output of "ninja -t compdb" and combining them with the CMake-made
+    # compdbs for Seastar in the relevant mode.
+    #
+    # "ninja -t compdb" output has to be filtered because
+    # - it contains rules for all selected modes, and several entries for
+    #   the same source file usually confuse indexers
+    # - it contains lots of irrelevant entries (for linker invocations,
+    #   header-only compilations, etc.)
+    os.makedirs(tempfile.tempdir, exist_ok=True)
+    with tempfile.NamedTemporaryFile() as ninja_compdb:
+        subprocess.run([ninja, '-f', buildfile, '-t', 'compdb'], stdout=ninja_compdb.file.fileno())
+        ninja_compdb.file.flush()
+
+        # build mode-specific compdbs
+        for mode in modes:
+            mode_out = outdir + '/' + mode
+            submodule_compdbs = [mode_out + '/' + submodule + '/' + compdb for submodule in ['seastar', 'abseil']]
+            with open(mode_out + '/' + compdb, 'w+b') as combined_mode_specific_compdb:
+                subprocess.run(['./scripts/merge-compdb.py', outdir + '/' + mode,
+                                ninja_compdb.name] + submodule_compdbs, stdout=combined_mode_specific_compdb)
+
+    # sort modes by supposed indexing speed
+    for mode in ['dev', 'debug', 'release', 'sanitize']:
+        compdb_target = outdir + '/' + mode + '/' + compdb
+        if os.path.exists(compdb_target):
+            try:
+                os.symlink(compdb_target, compdb)
+            except FileExistsError:
+                # if there is already a valid compile_commands.json link in the
+                # source root, we are done.
+                pass
+            return
+
+
+def check_for_minimal_compiler_version(cxx):
+    compiler_test_src = '''
+
+// clang pretends to be gcc (defined __GNUC__), so we
+// must check it first
+#ifdef __clang__
+
+#if __clang_major__ < 10
+    #error "MAJOR"
+#endif
+
+#elif defined(__GNUC__)
+
+#if __GNUC__ < 10
+    #error "MAJOR"
+#elif __GNUC__ == 10
+    #if __GNUC_MINOR__ < 1
+        #error "MINOR"
+    #elif __GNUC_MINOR__ == 1
+        #if __GNUC_PATCHLEVEL__ < 1
+            #error "PATCHLEVEL"
+        #endif
+    #endif
+#endif
+
+#else
+
+#error "Unrecognized compiler"
+
+#endif
+
+int main() { return 0; }
+'''
+    if try_compile_and_link(compiler=cxx, source=compiler_test_src):
+        return
+    try_compile_and_link(compiler=cxx, source=compiler_test_src, verbose=True)
+    print('Wrong compiler version or incorrect flags. '
+          'Scylla needs GCC >= 10.1.1 with coroutines (-fcoroutines) or '
+          'clang >= 10.0.0 to compile.')
+    sys.exit(1)
+
+
+def check_for_boost(cxx):
+    pkg_name = pkgname("boost-devel")
+    if not try_compile(compiler=cxx, source='#include <boost/version.hpp>'):
+        print(f'Boost not installed.  Please install {pkg_name}.')
+        sys.exit(1)
+
+    if not try_compile(compiler=cxx, source='''\
+            #include <boost/version.hpp>
+            #if BOOST_VERSION < 105500
+            #error Boost version too low
+            #endif
+            '''):
+        print(f'Installed boost version too old.  Please update {pkg_name}.')
+        sys.exit(1)
+
+
+def check_for_lz4(cxx, cflags):
+    if not try_compile(cxx, source=textwrap.dedent('''\
+        #include <lz4.h>
+
+        void m() {
+            LZ4_compress_default(static_cast<const char*>(0), static_cast<char*>(0), 0, 0);
+        }
+        '''), flags=cflags.split()):
+        print('Installed lz4-devel is too old. Please upgrade it to r129 / v1.73 and up')
+        sys.exit(1)
+
+
+def find_ninja():
+    ninja = which('ninja') or which('ninja-build')
+    if ninja:
+        return ninja
+    print('Ninja executable (ninja or ninja-build) not found on PATH\n')
+    sys.exit(1)
+
+
 modes = {
     'debug': {
         'cxxflags': '-DDEBUG -DSANITIZE -DDEBUG_LSA_SANITIZER -DSCYLLA_ENABLE_ERROR_INJECTION',
         'cxx_ld_flags': '',
         'stack-usage-threshold': 1024*40,
-        # -fasan -Og breaks some coroutines on aarch64, use -O0 instead
-        'optimization-level': ('0' if platform.machine() == 'aarch64' else 'g'),
+        'optimization-level': 'g',
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'Debug',
         'can_have_debug_info': True,
+        'build_seastar_shared_libs': True,
         'default': True,
         'description': 'a mode with no optimizations, with sanitizers, and with additional debug checks enabled, used for testing',
+        'advanced_optimizations': False,
     },
     'release': {
         'cxxflags': '-ffunction-sections -fdata-sections ',
@@ -301,19 +390,23 @@ modes = {
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'RelWithDebInfo',
         'can_have_debug_info': True,
+        'build_seastar_shared_libs': False,
         'default': True,
         'description': 'a mode with optimizations and no debug checks, used for production builds',
+        'advanced_optimizations': True,
     },
     'dev': {
-        'cxxflags': '-DDEVEL -DSEASTAR_ENABLE_ALLOC_FAILURE_INJECTION -DSCYLLA_ENABLE_ERROR_INJECTION',
+        'cxxflags': '-DDEVEL -DSEASTAR_ENABLE_ALLOC_FAILURE_INJECTION -DSCYLLA_ENABLE_ERROR_INJECTION -DSCYLLA_ENABLE_PREEMPTION_SOURCE',
         'cxx_ld_flags': '',
         'stack-usage-threshold': 1024*21,
         'optimization-level': '2',
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'Dev',
         'can_have_debug_info': False,
+        'build_seastar_shared_libs': True,
         'default': True,
         'description': 'a mode with no optimizations and no debug checks, optimized for fast build times, used for development',
+        'advanced_optimizations': False,
     },
     'sanitize': {
         'cxxflags': '-DDEBUG -DSANITIZE -DDEBUG_LSA_SANITIZER -DSCYLLA_ENABLE_ERROR_INJECTION',
@@ -323,8 +416,10 @@ modes = {
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'Sanitize',
         'can_have_debug_info': True,
+        'build_seastar_shared_libs': False,
         'default': False,
         'description': 'a mode with optimizations and sanitizers enabled, used for finding memory errors',
+        'advanced_optimizations': False,
     },
     'coverage': {
         'cxxflags': '-fprofile-instr-generate -fcoverage-mapping -g -gz',
@@ -334,172 +429,147 @@ modes = {
         'per_src_extra_cxxflags': {},
         'cmake_build_type': 'Debug',
         'can_have_debug_info': True,
+        'build_seastar_shared_libs': False,
         'default': False,
         'description': 'a mode exclusively used for generating test coverage reports',
+        'advanced_optimizations': False,
     },
 }
 
+ldap_tests = set([
+    'test/ldap/ldap_connection_test',
+    'test/ldap/role_manager_test',
+    'test/ldap/saslauthd_authenticator_test'
+])
+
 scylla_tests = set([
+    'test/boost/combined_tests',
     'test/boost/UUID_test',
-    'test/boost/cdc_generation_test',
-    'test/boost/aggregate_fcts_test',
+    'test/boost/advanced_rpc_compressor_test',
     'test/boost/allocation_strategy_test',
     'test/boost/alternator_unit_test',
     'test/boost/anchorless_list_test',
     'test/boost/auth_passwords_test',
     'test/boost/auth_resource_test',
-    'test/boost/auth_test',
-    'test/boost/batchlog_manager_test',
     'test/boost/big_decimal_test',
+    'test/boost/bloom_filter_test',
+    'test/boost/bptree_test',
     'test/boost/broken_sstable_test',
+    'test/boost/btree_test',
     'test/boost/bytes_ostream_test',
-    'test/boost/cache_flat_mutation_reader_test',
+    'test/boost/cache_mutation_reader_test',
     'test/boost/cached_file_test',
     'test/boost/caching_options_test',
     'test/boost/canonical_mutation_test',
     'test/boost/cartesian_product_test',
-    'test/boost/castas_fcts_test',
-    'test/boost/cdc_test',
+    'test/boost/cdc_generation_test',
     'test/boost/cell_locker_test',
     'test/boost/checksum_utils_test',
-    'test/boost/chunked_vector_test',
     'test/boost/chunked_managed_vector_test',
+    'test/boost/chunked_vector_test',
     'test/boost/clustering_ranges_walker_test',
-    'test/boost/column_mapping_test',
-    'test/boost/commitlog_test',
+    'test/boost/compaction_group_test',
     'test/boost/compound_test',
     'test/boost/compress_test',
     'test/boost/config_test',
     'test/boost/continuous_data_consumer_test',
     'test/boost/counter_test',
-    'test/boost/cql_auth_query_test',
     'test/boost/cql_auth_syntax_test',
-    'test/boost/cql_query_test',
-    'test/boost/cql_query_large_test',
-    'test/boost/cql_query_like_test',
-    'test/boost/cql_query_group_test',
-    'test/boost/cql_functions_test',
     'test/boost/crc_test',
-    'test/boost/data_listeners_test',
-    'test/boost/database_test',
+    'test/boost/dict_trainer_test',
     'test/boost/dirty_memory_manager_test',
     'test/boost/double_decker_test',
     'test/boost/duration_test',
     'test/boost/dynamic_bitset_test',
+    'test/boost/encrypted_file_test',
+    'test/boost/encryption_at_rest_test',
     'test/boost/enum_option_test',
     'test/boost/enum_set_test',
-    'test/boost/extensions_test',
-    'test/boost/error_injection_test',
-    'test/boost/filtering_test',
-    'test/boost/flat_mutation_reader_test',
+    'test/boost/estimated_histogram_test',
+    'test/boost/exception_container_test',
+    'test/boost/exceptions_fallback_test',
+    'test/boost/exceptions_optimized_test',
+    'test/boost/expr_test',
     'test/boost/flush_queue_test',
     'test/boost/fragmented_temporary_buffer_test',
     'test/boost/frozen_mutation_test',
+    'test/boost/generic_server_test',
     'test/boost/gossiping_property_file_snitch_test',
     'test/boost/hash_test',
     'test/boost/hashers_test',
     'test/boost/hint_test',
     'test/boost/idl_test',
+    'test/boost/incremental_compaction_test',
+    'test/boost/index_reader_test',
     'test/boost/input_stream_test',
-    'test/boost/json_cql_query_test',
+    'test/boost/intrusive_array_test',
     'test/boost/json_test',
     'test/boost/keys_test',
-    'test/boost/large_paging_state_test',
-    'test/boost/recent_entries_map_test',
     'test/boost/like_matcher_test',
     'test/boost/limiting_data_source_test',
     'test/boost/linearizing_input_stream_test',
-    'test/boost/loading_cache_test',
+    'test/boost/lister_test',
+    'test/boost/locator_topology_test',
     'test/boost/log_heap_test',
-    'test/boost/estimated_histogram_test',
-    'test/boost/summary_test',
-    'test/boost/logalloc_test',
     'test/boost/logalloc_standard_allocator_segment_pool_backend_test',
-    'test/boost/managed_vector_test',
+    'test/boost/logalloc_test',
     'test/boost/managed_bytes_test',
-    'test/boost/intrusive_array_test',
+    'test/boost/managed_vector_test',
     'test/boost/map_difference_test',
-    'test/boost/memtable_test',
-    'test/boost/multishard_mutation_query_test',
     'test/boost/murmur_hash_test',
     'test/boost/mutation_fragment_test',
     'test/boost/mutation_query_test',
-    'test/boost/mutation_reader_test',
-    'test/boost/multishard_combining_reader_as_mutation_source_test',
+    'test/boost/mutation_reader_another_test',
     'test/boost/mutation_test',
-    'test/boost/mutation_writer_test',
     'test/boost/mvcc_test',
-    'test/boost/network_topology_strategy_test',
-    'test/boost/nonwrapping_range_test',
+    'test/boost/nonwrapping_interval_test',
     'test/boost/observable_test',
     'test/boost/partitioner_test',
-    'test/boost/querier_cache_test',
-    'test/boost/query_processor_test',
-    'test/boost/range_test',
+    'test/boost/pretty_printers_test',
+    'test/boost/radix_tree_test',
     'test/boost/range_tombstone_list_test',
+    'test/boost/rate_limiter_test',
+    'test/boost/recent_entries_map_test',
+    'test/boost/reservoir_sampling_test',
+    'test/boost/result_utils_test',
     'test/boost/reusable_buffer_test',
-    'test/boost/restrictions_test',
-    'test/boost/repair_test',
-    'test/boost/role_manager_test',
-    'test/boost/row_cache_test',
     'test/boost/rust_test',
-    'test/boost/schema_change_test',
-    'test/boost/schema_registry_test',
-    'test/boost/secondary_index_test',
-    'test/boost/tracing_test',
-    'test/boost/index_with_paging_test',
+    'test/boost/s3_test',
+    'test/boost/aws_errors_test',
+    'test/boost/aws_error_injection_test',
+    'test/boost/schema_changes_test',
+    'test/boost/schema_loader_test',
     'test/boost/serialization_test',
     'test/boost/serialized_action_test',
+    'test/boost/service_level_controller_test',
     'test/boost/small_vector_test',
     'test/boost/snitch_reset_test',
+    'test/boost/sorting_test',
     'test/boost/sstable_3_x_test',
+    'test/boost/sstable_conforms_to_mutation_source_test',
     'test/boost/sstable_datafile_test',
+    'test/boost/sstable_generation_test',
+    'test/boost/sstable_move_test',
     'test/boost/sstable_mutation_test',
     'test/boost/sstable_partition_index_cache_test',
-    'test/boost/schema_changes_test',
-    'test/boost/sstable_conforms_to_mutation_source_test',
-    'test/boost/sstable_compaction_test',
     'test/boost/sstable_resharding_test',
-    'test/boost/sstable_directory_test',
     'test/boost/sstable_test',
-    'test/boost/sstable_move_test',
-    'test/boost/statement_restrictions_test',
-    'test/boost/storage_proxy_test',
+    'test/boost/stall_free_test',
+    'test/boost/stream_compressor_test',
+    'test/boost/string_format_test',
+    'test/boost/summary_test',
+    'test/boost/tagged_integer_test',
+    'test/boost/token_metadata_test',
     'test/boost/top_k_test',
     'test/boost/transport_test',
+    'test/boost/symmetric_key_test',
     'test/boost/types_test',
-    'test/boost/user_function_test',
-    'test/boost/user_types_test',
     'test/boost/utf8_test',
-    'test/boost/view_build_test',
-    'test/boost/view_complex_test',
-    'test/boost/view_schema_test',
-    'test/boost/view_schema_pkey_test',
-    'test/boost/view_schema_ckey_test',
     'test/boost/vint_serialization_test',
-    'test/boost/virtual_reader_test',
     'test/boost/virtual_table_mutation_source_test',
-    'test/boost/virtual_table_test',
-    'test/boost/wasm_test',
     'test/boost/wasm_alloc_test',
-    'test/boost/bptree_test',
-    'test/boost/btree_test',
-    'test/boost/radix_tree_test',
-    'test/boost/double_decker_test',
-    'test/boost/stall_free_test',
-    'test/boost/sstable_set_test',
-    'test/boost/reader_concurrency_semaphore_test',
-    'test/boost/service_level_controller_test',
-    'test/boost/schema_loader_test',
-    'test/boost/lister_test',
-    'test/boost/group0_test',
-    'test/boost/exception_container_test',
-    'test/boost/result_utils_test',
-    'test/boost/rate_limiter_test',
-    'test/boost/per_partition_rate_limit_test',
-    'test/boost/expr_test',
-    'test/boost/exceptions_optimized_test',
-    'test/boost/exceptions_fallback_test',
+    'test/boost/wasm_test',
+    'test/boost/wrapping_interval_test',
     'test/manual/ec2_snitch_test',
     'test/manual/enormous_table_scan_test',
     'test/manual/gce_snitch_test',
@@ -519,18 +589,14 @@ scylla_tests = set([
     'test/perf/perf_collection',
     'test/perf/perf_row_cache_reads',
     'test/perf/logalloc',
+    'test/perf/perf_s3_client',
     'test/unit/lsa_async_eviction_test',
     'test/unit/lsa_sync_eviction_test',
     'test/unit/row_cache_alloc_stress_test',
     'test/unit/row_cache_stress_test',
-    'test/unit/bptree_stress_test',
-    'test/unit/btree_stress_test',
-    'test/unit/bptree_compaction_test',
-    'test/unit/btree_compaction_test',
-    'test/unit/radix_tree_stress_test',
-    'test/unit/radix_tree_compaction_test',
     'test/unit/cross_shard_barrier_test',
-])
+    'test/boost/address_map_test',
+]) | ldap_tests
 
 perf_tests = set([
     'test/perf/perf_mutation_readers',
@@ -539,6 +605,7 @@ perf_tests = set([
     'test/perf/perf_idl',
     'test/perf/perf_vint',
     'test/perf/perf_big_decimal',
+    'test/perf/perf_sort_by_proximity',
 ])
 
 raft_tests = set([
@@ -549,13 +616,30 @@ raft_tests = set([
     'test/raft/fsm_test',
     'test/raft/etcd_test',
     'test/raft/raft_sys_table_storage_test',
-    'test/raft/raft_address_map_test',
     'test/raft/discovery_test',
     'test/raft/failure_detector_test',
 ])
 
+wasms = set([
+    'wasm/return_input.wat',
+    'wasm/test_complex_null_values.wat',
+    'wasm/test_fib_called_on_null.wat',
+    'wasm/test_functions_with_frozen_types.wat',
+    'wasm/test_mem_grow.wat',
+    'wasm/test_pow.wat',
+    'wasm/test_short_ints.wat',
+    'wasm/test_types_with_and_without_nulls.wat',
+    'wasm/test_UDA_final.wat',
+    'wasm/test_UDA_scalar.wat',
+    'wasm/test_word_double.wat',
+])
+
 apps = set([
     'scylla',
+])
+
+lto_binaries = set([
+    'scylla'
 ])
 
 tests = scylla_tests | perf_tests | raft_tests
@@ -564,18 +648,23 @@ other = set([
     'iotune',
 ])
 
-all_artifacts = apps | tests | other
+all_artifacts = apps | tests | other | wasms
 
-arg_parser = argparse.ArgumentParser('Configure scylla')
+arg_parser = argparse.ArgumentParser('Configure scylla', add_help=False, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 arg_parser.add_argument('--out', dest='buildfile', action='store', default='build.ninja',
                         help='Output build-file name (by default build.ninja)')
+arg_parser.add_argument('--out-final-name', dest="buildfile_final_name", action='store',
+                        help='If set, rules will be generated as if this were the actual name of the file instead of the name passed by the --out option. \
+                              This option is rather not useful for developers, it is intended to be used by Ninja when it decides to regenerate the makefile \
+                              (a makefile with the same name but with a ".new" suffix is generated, then it is renamed to overwrite the old file; \
+                              the new file\'s regeneration rule itself needs to refer to the correct filename).')
 arg_parser.add_argument('--mode', action='append', choices=list(modes.keys()), dest='selected_modes',
                         help="Build modes to generate ninja files for. The available build modes are:\n{}".format("; ".join(["{} - {}".format(m, cfg['description']) for m, cfg in modes.items()])))
 arg_parser.add_argument('--with', dest='artifacts', action='append', default=[],
                         help="Specify the artifacts to build, invoke {} with --list-artifacts to list all available artifacts, if unspecified all artifacts are built".format(sys.argv[0]))
 arg_parser.add_argument('--with-seastar', action='store', dest='seastar_path', default='seastar', help='Path to Seastar sources')
 add_tristate(arg_parser, name='dist', dest='enable_dist',
-                        help='scylla-tools-java, scylla-jmx and packages')
+                        help='build dist targets')
 arg_parser.add_argument('--dist-only', dest='dist_only', action='store_true', default=False,
                         help='skip compiling code and run dist targets only')
 
@@ -599,8 +688,6 @@ arg_parser.add_argument('--optimization-level', action='append', dest='mode_o_le
                         help=f'Override default compiler optimization level for mode (defaults: {" ".join([x+"="+modes[x]["optimization-level"] for x in modes])})')
 arg_parser.add_argument('--static-stdc++', dest='staticcxx', action='store_true',
                         help='Link libgcc and libstdc++ statically')
-arg_parser.add_argument('--static-thrift', dest='staticthrift', action='store_true',
-                        help='Link libthrift statically')
 arg_parser.add_argument('--static-boost', dest='staticboost', action='store_true',
                         help='Link boost statically')
 arg_parser.add_argument('--static-yaml-cpp', dest='staticyamlcpp', action='store_true',
@@ -609,15 +696,13 @@ arg_parser.add_argument('--tests-debuginfo', action='store', dest='tests_debugin
                         help='Enable(1)/disable(0)compiler debug information generation for tests')
 arg_parser.add_argument('--perf-tests-debuginfo', action='store', dest='perf_tests_debuginfo', type=int, default=0,
                         help='Enable(1)/disable(0)compiler debug information generation for perf tests')
-arg_parser.add_argument('--python', action='store', dest='python', default='python3',
-                        help='Python3 path')
 arg_parser.add_argument('--split-dwarf', dest='split_dwarf', action='store_true', default=False,
                         help='use of split dwarf (https://gcc.gnu.org/wiki/DebugFission) to speed up linking')
 arg_parser.add_argument('--enable-alloc-failure-injector', dest='alloc_failure_injector', action='store_true', default=False,
                         help='enable allocation failure injection')
 arg_parser.add_argument('--enable-seastar-debug-allocations', dest='seastar_debug_allocations', action='store_true', default=False,
                         help='enable seastar debug allocations')
-arg_parser.add_argument('--with-antlr3', dest='antlr3_exec', action='store', default=None,
+arg_parser.add_argument('--with-antlr3', dest='antlr3_exec', action='store', default="antlr3",
                         help='path to antlr3 executable')
 arg_parser.add_argument('--with-ragel', dest='ragel_exec', action='store', default='ragel',
         help='path to ragel executable')
@@ -633,7 +718,30 @@ arg_parser.add_argument('--list-artifacts', dest='list_artifacts', action='store
                         help='List all available build artifacts, that can be passed to --with')
 arg_parser.add_argument('--date-stamp', dest='date_stamp', type=str,
                         help='Set datestamp for SCYLLA-VERSION-GEN')
+add_tristate(arg_parser, name='lto', dest='lto', default=True,
+                        help='link-time optimization.')
+arg_parser.add_argument('--use-profile', dest='use_profile', action='store',
+                        help='Path to the (optional) profile file to be used in the build. Meant to be used with the profile file (build/release/profiles/merged.profdata) generated during a previous build of build/release/scylla with --pgo (--cspgo).')
+arg_parser.add_argument('--pgo', dest='pgo', action='store_true', default=False,
+                        help='Generate and use fresh PGO profiles when building Scylla. Only supported with clang for now.')
+arg_parser.add_argument('--cspgo', dest='cspgo', action='store_true', default=False,
+                        help='Generate and use fresh CSPGO profiles when building Scylla. A clang-specific optional addition to --pgo.')
+arg_parser.add_argument('--experimental-pgo', dest='experimental_pgo', action='store_true', default=False,
+                        help='When building with PGO, enable nonconservative (potentially pessimizing) optimizations. Only supported with clang for now. Not recommended.')
+arg_parser.add_argument('--use-cmake', action=argparse.BooleanOptionalAction, default=False, help='Whether to use CMake as the build system')
+arg_parser.add_argument('--coverage', action = 'store_true', help = 'Compile scylla with coverage instrumentation')
+arg_parser.add_argument('--build-dir', action='store', default='build',
+                        help='Build directory path')
+arg_parser.add_argument('-h', '--help', action='store_true', help='show this help message and exit')
 args = arg_parser.parse_args()
+if args.help:
+    arg_parser.print_help()
+    arg_parser.exit()
+
+PROFILES_LIST_FILE_NAME = "coverage_sources.list"
+
+outdir = args.build_dir
+tempfile.tempdir = f"{outdir}/tmp"
 
 if args.list_artifacts:
     for artifact in sorted(all_artifacts):
@@ -642,7 +750,6 @@ if args.list_artifacts:
 
 defines = ['XXH_PRIVATE_API',
            'SEASTAR_TESTING_MAIN',
-           'FMT_DEPRECATED_OSTREAM',
 ]
 
 scylla_raft_core = [
@@ -656,15 +763,18 @@ scylla_raft_core = [
 scylla_core = (['message/messaging_service.cc',
                 'replica/database.cc',
                 'replica/table.cc',
+                'replica/tablets.cc',
                 'replica/distributed_loader.cc',
                 'replica/memtable.cc',
                 'replica/exceptions.cc',
                 'replica/dirty_memory_manager.cc',
+                'replica/mutation_dump.cc',
                 'mutation/atomic_cell.cc',
                 'mutation/canonical_mutation.cc',
                 'mutation/frozen_mutation.cc',
                 'mutation/mutation.cc',
                 'mutation/mutation_fragment.cc',
+                'mutation/mutation_fragment_stream_validator.cc',
                 'mutation/mutation_partition.cc',
                 'mutation/mutation_partition_v2.cc',
                 'mutation/mutation_partition_view.cc',
@@ -672,6 +782,7 @@ scylla_core = (['message/messaging_service.cc',
                 'mutation/partition_version.cc',
                 'mutation/range_tombstone.cc',
                 'mutation/range_tombstone_list.cc',
+                'mutation/async_utils.cc',
                 'absl-flat_hash_map.cc',
                 'collection_mutation.cc',
                 'client_data.cc',
@@ -685,6 +796,7 @@ scylla_core = (['message/messaging_service.cc',
                 'row_cache.cc',
                 'schema_mutations.cc',
                 'generic_server.cc',
+                'utils/alien_worker.cc',
                 'utils/array-search.cc',
                 'utils/base64.cc',
                 'utils/logalloc.cc',
@@ -692,11 +804,16 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/buffer_input_stream.cc',
                 'utils/limiting_data_source.cc',
                 'utils/updateable_value.cc',
+                'utils/dict_trainer.cc',
+                'message/dictionary_service.cc',
                 'utils/directories.cc',
-                'utils/generation-number.cc',
+                'gms/generation-number.cc',
                 'utils/rjson.cc',
                 'utils/human_readable.cc',
                 'utils/histogram_metrics_helper.cc',
+                'utils/on_internal_error.cc',
+                'utils/pretty_printers.cc',
+                'utils/stream_compressor.cc',
                 'converting_mutation_partition_applier.cc',
                 'readers/combined.cc',
                 'readers/multishard.cc',
@@ -710,19 +827,24 @@ scylla_core = (['message/messaging_service.cc',
                 'sstables/sstables.cc',
                 'sstables/sstables_manager.cc',
                 'sstables/sstable_set.cc',
+                'sstables/storage.cc',
                 'sstables/mx/partition_reversing_data_source.cc',
                 'sstables/mx/reader.cc',
                 'sstables/mx/writer.cc',
                 'sstables/kl/reader.cc',
                 'sstables/sstable_version.cc',
                 'sstables/compress.cc',
+                'sstables/checksummed_data_source.cc',
                 'sstables/sstable_mutation_reader.cc',
                 'compaction/compaction.cc',
                 'compaction/compaction_strategy.cc',
                 'compaction/size_tiered_compaction_strategy.cc',
                 'compaction/leveled_compaction_strategy.cc',
+                'compaction/task_manager_module.cc',
                 'compaction/time_window_compaction_strategy.cc',
                 'compaction/compaction_manager.cc',
+                'compaction/incremental_compaction_strategy.cc',
+                'compaction/incremental_backlog_tracker.cc',
                 'sstables/integrity_checked_file_impl.cc',
                 'sstables/prepended_input_stream.cc',
                 'sstables/m_format_read_helpers.cc',
@@ -742,10 +864,10 @@ scylla_core = (['message/messaging_service.cc',
                 'cdc/generation.cc',
                 'cdc/metadata.cc',
                 'cql3/type_json.cc',
-                'cql3/abstract_marker.cc',
                 'cql3/attributes.cc',
                 'cql3/cf_name.cc',
                 'cql3/cql3_type.cc',
+                'cql3/description.cc',
                 'cql3/operation.cc',
                 'cql3/index_name.cc',
                 'cql3/keyspace_element_name.cc',
@@ -816,27 +938,24 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/statements/detach_service_level_statement.cc',
                 'cql3/statements/list_service_level_statement.cc',
                 'cql3/statements/list_service_level_attachments_statement.cc',
+                'cql3/statements/list_effective_service_level_statement.cc',
                 'cql3/statements/describe_statement.cc',
                 'cql3/update_parameters.cc',
                 'cql3/util.cc',
                 'cql3/ut_name.cc',
                 'cql3/role_name.cc',
                 'data_dictionary/data_dictionary.cc',
-                'thrift/handler.cc',
-                'thrift/server.cc',
-                'thrift/controller.cc',
-                'thrift/thrift_validation.cc',
                 'utils/runtime.cc',
                 'utils/murmur_hash.cc',
                 'utils/uuid.cc',
                 'utils/big_decimal.cc',
-                'types.cc',
+                'types/types.cc',
                 'validation.cc',
-                'service/priority_manager.cc',
                 'service/migration_manager.cc',
+                'service/tablet_allocator.cc',
                 'service/storage_proxy.cc',
                 'query_ranges_to_vnodes.cc',
-                'service/forward_service.cc',
+                'service/mapreduce_service.cc',
                 'service/paxos/proposal.cc',
                 'service/paxos/prepare_response.cc',
                 'service/paxos/paxos_state.cc',
@@ -848,10 +967,7 @@ scylla_core = (['message/messaging_service.cc',
                 'cql3/query_options.cc',
                 'cql3/user_types.cc',
                 'cql3/untyped_result_set.cc',
-                'cql3/selection/abstract_function_selector.cc',
-                'cql3/selection/simple_selector.cc',
                 'cql3/selection/selectable.cc',
-                'cql3/selection/selector_factories.cc',
                 'cql3/selection/selection.cc',
                 'cql3/selection/selector.cc',
                 'cql3/restrictions/statement_restrictions.cc',
@@ -860,8 +976,10 @@ scylla_core = (['message/messaging_service.cc',
                 'db/consistency_level.cc',
                 'db/system_keyspace.cc',
                 'db/virtual_table.cc',
+                'db/virtual_tables.cc',
                 'db/system_distributed_keyspace.cc',
                 'db/size_estimates_virtual_reader.cc',
+                'db/schema_applier.cc',
                 'db/schema_tables.cc',
                 'db/cql_type_parser.cc',
                 'db/legacy_schema_migrator.cc',
@@ -869,6 +987,10 @@ scylla_core = (['message/messaging_service.cc',
                 'db/commitlog/commitlog_replayer.cc',
                 'db/commitlog/commitlog_entry.cc',
                 'db/data_listeners.cc',
+                'db/functions/function.cc',
+                'db/hints/internal/hint_endpoint_manager.cc',
+                'db/hints/internal/hint_sender.cc',
+                'db/hints/internal/hint_storage.cc',
                 'db/hints/manager.cc',
                 'db/hints/resource_manager.cc',
                 'db/hints/host_filter.cc',
@@ -887,6 +1009,7 @@ scylla_core = (['message/messaging_service.cc',
                 'db/snapshot-ctl.cc',
                 'db/rate_limiter.cc',
                 'db/per_partition_rate_limit_options.cc',
+                'db/snapshot/backup_task.cc',
                 'index/secondary_index_manager.cc',
                 'index/secondary_index.cc',
                 'utils/UUID_gen.cc',
@@ -902,11 +1025,14 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/multiprecision_int.cc',
                 'utils/gz/crc_combine.cc',
                 'utils/gz/crc_combine_table.cc',
+                'utils/s3/aws_error.cc',
+                'utils/s3/client.cc',
+                'utils/s3/retry_strategy.cc',
+                'utils/advanced_rpc_compressor.cc',
                 'gms/version_generator.cc',
                 'gms/versioned_value.cc',
                 'gms/gossiper.cc',
                 'gms/feature_service.cc',
-                'gms/failure_detector.cc',
                 'gms/gossip_digest_syn.cc',
                 'gms/gossip_digest_ack.cc',
                 'gms/gossip_digest_ack2.cc',
@@ -922,6 +1048,7 @@ scylla_core = (['message/messaging_service.cc',
                 'query.cc',
                 'query-result-set.cc',
                 'locator/abstract_replication_strategy.cc',
+                'locator/tablets.cc',
                 'locator/azure_snitch.cc',
                 'locator/simple_strategy.cc',
                 'locator/local_strategy.cc',
@@ -940,12 +1067,15 @@ scylla_core = (['message/messaging_service.cc',
                 'locator/util.cc',
                 'service/client_state.cc',
                 'service/storage_service.cc',
+                'service/session.cc',
+                'service/task_manager_module.cc',
                 'service/misc_services.cc',
                 'service/pager/paging_state.cc',
                 'service/pager/query_pagers.cc',
                 'service/qos/qos_common.cc',
                 'service/qos/service_level_controller.cc',
                 'service/qos/standard_service_level_distributed_data_accessor.cc',
+                'service/qos/raft_service_level_distributed_data_accessor.cc',
                 'streaming/stream_task.cc',
                 'streaming/stream_session.cc',
                 'streaming/stream_request.cc',
@@ -959,7 +1089,6 @@ scylla_core = (['message/messaging_service.cc',
                 'streaming/stream_manager.cc',
                 'streaming/stream_result_future.cc',
                 'streaming/stream_session_state.cc',
-                'streaming/stream_reason.cc',
                 'streaming/consumer.cc',
                 'clocks-impl.cc',
                 'partition_slice_builder.cc',
@@ -967,6 +1096,7 @@ scylla_core = (['message/messaging_service.cc',
                 'utils/lister.cc',
                 'repair/repair.cc',
                 'repair/row_level.cc',
+                'repair/table_check.cc',
                 'exceptions/exceptions.cc',
                 'auth/allow_all_authenticator.cc',
                 'auth/allow_all_authorizer.cc',
@@ -982,24 +1112,45 @@ scylla_core = (['message/messaging_service.cc',
                 'auth/permissions_cache.cc',
                 'auth/service.cc',
                 'auth/standard_role_manager.cc',
+                'auth/ldap_role_manager.cc',
                 'auth/transitional.cc',
-                'auth/authentication_options.cc',
+                'auth/maintenance_socket_role_manager.cc',
                 'auth/role_or_anonymous.cc',
                 'auth/sasl_challenge.cc',
+                'auth/certificate_authenticator.cc',
+                'auth/saslauthd_authenticator.cc',
                 'tracing/tracing.cc',
                 'tracing/trace_keyspace_helper.cc',
                 'tracing/trace_state.cc',
                 'tracing/traced_file.cc',
                 'table_helper.cc',
+                'audit/audit.cc',
+                'audit/audit_cf_storage_helper.cc',
+                'audit/audit_syslog_storage_helper.cc',
                 'tombstone_gc_options.cc',
                 'tombstone_gc.cc',
                 'utils/disk-error-handler.cc',
                 'utils/hashers.cc',
+                'utils/aws_sigv4.cc',
                 'duration.cc',
                 'vint-serialization.cc',
                 'utils/arch/powerpc/crc32-vpmsum/crc32_wrapper.cc',
                 'querier.cc',
                 'mutation_writer/multishard_writer.cc',
+                'ent/encryption/encryption_config.cc',
+                'ent/encryption/encryption.cc',
+                'ent/encryption/symmetric_key.cc',
+                'ent/encryption/local_file_provider.cc',
+                'ent/encryption/replicated_key_provider.cc',
+                'ent/encryption/system_key.cc',
+                'ent/encryption/encrypted_file_impl.cc',
+                'ent/encryption/kmip_host.cc',
+                'ent/encryption/kmip_key_provider.cc',
+                'ent/encryption/kms_host.cc',
+                'ent/encryption/kms_key_provider.cc',
+                'ent/encryption/gcp_host.cc',
+                'ent/encryption/gcp_key_provider.cc',
+                'ent/ldap/ldap_connection.cc',
                 'multishard_mutation_query.cc',
                 'reader_concurrency_semaphore.cc',
                 'sstables_loader.cc',
@@ -1011,11 +1162,16 @@ scylla_core = (['message/messaging_service.cc',
                 'mutation_writer/timestamp_based_splitting_writer.cc',
                 'mutation_writer/shard_based_splitting_writer.cc',
                 'mutation_writer/partition_based_splitting_writer.cc',
+                'mutation_writer/token_group_based_splitting_writer.cc',
                 'mutation_writer/feed_writers.cc',
+                'lang/manager.cc',
                 'lang/lua.cc',
                 'lang/wasm.cc',
+                'lang/wasm_alien_thread_runner.cc',
                 'lang/wasm_instance_cache.cc',
+                'service/raft/group0_state_id_handler.cc',
                 'service/raft/group0_state_machine.cc',
+                'service/raft/group0_state_machine_merger.cc',
                 'service/raft/raft_sys_table_storage.cc',
                 'serializer.cc',
                 'release.cc',
@@ -1026,9 +1182,18 @@ scylla_core = (['message/messaging_service.cc',
                 'direct_failure_detector/failure_detector.cc',
                 'service/raft/raft_group0_client.cc',
                 'service/broadcast_tables/experimental/lang.cc',
+                'tasks/task_handler.cc',
                 'tasks/task_manager.cc',
                 'rust/wasmtime_bindings/src/lib.rs',
-                ] + [Antlr3Grammar('cql3/Cql.g')] + [Thrift('interface/cassandra.thrift', 'Cassandra')] \
+                'utils/to_string.cc',
+                'service/topology_state_machine.cc',
+                'service/topology_mutation.cc',
+                'service/topology_coordinator.cc',
+                'node_ops/node_ops_ctl.cc',
+                'node_ops/task_manager_module.cc',
+                'reader_concurrency_semaphore_group.cc',
+                'utils/disk_space_monitor.cc',
+                ] + [Antlr3Grammar('cql3/Cql.g')] \
                   + scylla_raft_core
                )
 
@@ -1036,6 +1201,7 @@ api = ['api/api.cc',
        Json2Code('api/api-doc/storage_service.json'),
        Json2Code('api/api-doc/lsa.json'),
        'api/storage_service.cc',
+       'api/token_metadata.cc',
        Json2Code('api/api-doc/commitlog.json'),
        'api/commitlog.cc',
        Json2Code('api/api-doc/gossiper.json'),
@@ -1064,16 +1230,25 @@ api = ['api/api.cc',
        'api/stream_manager.cc',
        Json2Code('api/api-doc/system.json'),
        'api/system.cc',
+       Json2Code('api/api-doc/tasks.json'),
+       'api/tasks.cc',
        Json2Code('api/api-doc/task_manager.json'),
        'api/task_manager.cc',
        Json2Code('api/api-doc/task_manager_test.json'),
        'api/task_manager_test.cc',
        'api/config.cc',
        Json2Code('api/api-doc/config.json'),
+       Json2Code('api/api-doc/metrics.json'),
        'api/error_injection.cc',
        Json2Code('api/api-doc/error_injection.json'),
        'api/authorization_cache.cc',
        Json2Code('api/api-doc/authorization_cache.json'),
+       'api/raft.cc',
+       Json2Code('api/api-doc/raft.json'),
+       Json2Code('api/api-doc/cql_server_test.json'),
+       'api/cql_server_test.cc',
+       'api/service_levels.cc',
+       Json2Code('api/api-doc/service_levels.json'),
        ]
 
 alternator = [
@@ -1085,6 +1260,7 @@ alternator = [
        'alternator/expressions.cc',
        Antlr3Grammar('alternator/expressions.g'),
        'alternator/conditions.cc',
+       'alternator/consumed_capacity.cc',
        'alternator/auth.cc',
        'alternator/streams.cc',
        'alternator/ttl.cc',
@@ -1119,9 +1295,8 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/streaming.idl.hh',
         'idl/paging_state.idl.hh',
         'idl/frozen_schema.idl.hh',
-        'idl/partition_checksum.idl.hh',
+        'idl/repair.idl.hh',
         'idl/replay_position.idl.hh',
-        'idl/truncation_record.idl.hh',
         'idl/mutation.idl.hh',
         'idl/query.idl.hh',
         'idl/idl_test.idl.hh',
@@ -1138,14 +1313,19 @@ idls = ['idl/gossip_digest.idl.hh',
         'idl/hinted_handoff.idl.hh',
         'idl/storage_proxy.idl.hh',
         'idl/group0_state_machine.idl.hh',
-        'idl/forward_request.idl.hh',
+        'idl/mapreduce_request.idl.hh',
         'idl/replica_exception.idl.hh',
         'idl/per_partition_rate_limit_info.idl.hh',
         'idl/position_in_partition.idl.hh',
         'idl/experimental/broadcast_tables_lang.idl.hh',
-        ]
+        'idl/storage_service.idl.hh',
+        'idl/join_node.idl.hh',
+        'idl/utils.idl.hh',
+        'idl/gossip.idl.hh',
+        'idl/migration_manager.idl.hh',
+        "idl/node_ops.idl.hh",
 
-headers = find_headers('.', excluded_dirs=['idl', 'build', 'seastar', '.git'])
+        ]
 
 scylla_tests_generic_dependencies = [
     'test/lib/cql_test_env.cc',
@@ -1156,7 +1336,7 @@ scylla_tests_generic_dependencies = [
     'test/lib/sstable_run_based_compaction_strategy_for_tests.cc',
 ]
 
-scylla_tests_dependencies = scylla_core + idls + scylla_tests_generic_dependencies + [
+scylla_tests_dependencies = scylla_core + alternator + idls + scylla_tests_generic_dependencies + [
     'test/lib/cql_assertions.cc',
     'test/lib/result_set_assertions.cc',
     'test/lib/mutation_source_test.cc',
@@ -1167,13 +1347,24 @@ scylla_tests_dependencies = scylla_core + idls + scylla_tests_generic_dependenci
     'test/lib/key_utils.cc',
 ]
 
-scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc', 'utils/error_injection.cc']
+scylla_raft_dependencies = scylla_raft_core + ['utils/uuid.cc', 'utils/error_injection.cc', 'utils/exceptions.cc']
 
-scylla_tools = ['tools/scylla-types.cc', 'tools/scylla-sstable.cc', 'tools/schema_loader.cc', 'tools/utils.cc', 'tools/lua_sstable_consumer.cc']
-scylla_perfs = ['test/perf/perf_fast_forward.cc',
+scylla_tools = ['tools/scylla-local-file-key-generator.cc',
+                'tools/read_mutation.cc',
+                'tools/scylla-types.cc',
+                'tools/scylla-sstable.cc',
+                'tools/scylla-nodetool.cc',
+                'tools/schema_loader.cc',
+                'tools/load_system_tablets.cc',
+                'tools/utils.cc',
+                'tools/lua_sstable_consumer.cc']
+scylla_perfs = ['test/perf/perf_alternator.cc',
+                'test/perf/perf_fast_forward.cc',
                 'test/perf/perf_row_cache_update.cc',
                 'test/perf/perf_simple_query.cc',
                 'test/perf/perf_sstable.cc',
+                'test/perf/perf_tablets.cc',
+                'test/perf/tablet_load_balancing.cc',
                 'test/perf/perf.cc',
                 'test/lib/alternator_test_env.cc',
                 'test/lib/cql_test_env.cc',
@@ -1212,16 +1403,17 @@ pure_boost_tests = set([
     'test/boost/like_matcher_test',
     'test/boost/linearizing_input_stream_test',
     'test/boost/map_difference_test',
-    'test/boost/nonwrapping_range_test',
+    'test/boost/nonwrapping_interval_test',
     'test/boost/observable_test',
-    'test/boost/range_test',
+    'test/boost/wrapping_interval_test',
     'test/boost/range_tombstone_list_test',
+    'test/boost/reservoir_sampling_test',
     'test/boost/serialization_test',
     'test/boost/small_vector_test',
     'test/boost/top_k_test',
     'test/boost/vint_serialization_test',
-    'test/boost/bptree_test',
     'test/boost/utf8_test',
+    'test/boost/string_format_test',
     'test/manual/streaming_histogram_test',
 ])
 
@@ -1240,15 +1432,18 @@ tests_not_using_seastar_test_framework = set([
     'test/unit/lsa_async_eviction_test',
     'test/unit/lsa_sync_eviction_test',
     'test/unit/row_cache_alloc_stress_test',
-    'test/unit/bptree_stress_test',
-    'test/unit/btree_stress_test',
-    'test/unit/bptree_compaction_test',
-    'test/unit/btree_compaction_test',
-    'test/unit/radix_tree_stress_test',
-    'test/unit/radix_tree_compaction_test',
     'test/manual/sstable_scan_footprint_test',
     'test/unit/cross_shard_barrier_test',
 ]) | pure_boost_tests
+
+
+COVERAGE_INST_FLAGS = ['-fprofile-instr-generate', '-fcoverage-mapping', f'-fprofile-list=./{PROFILES_LIST_FILE_NAME}']
+if args.coverage:
+    for _, mode in filter(lambda m: m[0] != "coverage", modes.items()):
+        mode['cxx_ld_flags'] += ' ' + ' '.join(COVERAGE_INST_FLAGS)
+        mode['cxx_ld_flags'] = mode['cxx_ld_flags'].strip()
+        mode['cxxflags'] += ' ' + ' '.join(COVERAGE_INST_FLAGS)
+        mode['cxxflags'] = mode['cxxflags'].strip()
 
 for t in tests_not_using_seastar_test_framework:
     if t not in scylla_tests:
@@ -1259,7 +1454,7 @@ for t in sorted(scylla_tests):
     if t not in tests_not_using_seastar_test_framework:
         deps[t] += scylla_tests_dependencies
     else:
-        deps[t] += scylla_core + idls + scylla_tests_generic_dependencies
+        deps[t] += scylla_core + alternator + idls + scylla_tests_generic_dependencies
 
 perf_tests_seastar_deps = [
     'seastar/tests/perf/perf_tests.cc'
@@ -1269,8 +1464,72 @@ for t in sorted(perf_tests):
     deps[t] = [t + '.cc'] + scylla_tests_dependencies + perf_tests_seastar_deps
     deps[t] += ['test/perf/perf.cc', 'seastar/tests/perf/linux_perf_event.cc']
 
-deps['test/boost/mutation_reader_test'] += ['test/lib/dummy_sharder.cc' ]
-deps['test/boost/multishard_combining_reader_as_mutation_source_test'] += ['test/lib/dummy_sharder.cc' ]
+deps['test/boost/combined_tests'] += [
+    'test/boost/aggregate_fcts_test.cc',
+    'test/boost/auth_test.cc',
+    'test/boost/batchlog_manager_test.cc',
+    'test/boost/cache_algorithm_test.cc',
+    'test/boost/castas_fcts_test.cc',
+    'test/boost/cdc_test.cc',
+    'test/boost/column_mapping_test.cc',
+    'test/boost/commitlog_cleanup_test.cc',
+    'test/boost/commitlog_test.cc',
+    'test/boost/cql_auth_query_test.cc',
+    'test/boost/cql_functions_test.cc',
+    'test/boost/cql_query_group_test.cc',
+    'test/boost/cql_query_large_test.cc',
+    'test/boost/cql_query_like_test.cc',
+    'test/boost/cql_query_test.cc',
+    'test/boost/database_test.cc',
+    'test/boost/data_listeners_test.cc',
+    'test/boost/error_injection_test.cc',
+    'test/boost/extensions_test.cc',
+    'test/boost/filtering_test.cc',
+    'test/boost/group0_cmd_merge_test.cc',
+    'test/boost/group0_test.cc',
+    'test/boost/index_with_paging_test.cc',
+    'test/boost/json_cql_query_test.cc',
+    'test/boost/large_paging_state_test.cc',
+    'test/boost/loading_cache_test.cc',
+    'test/boost/memtable_test.cc',
+    'test/boost/multishard_combining_reader_as_mutation_source_test.cc',
+    'test/boost/multishard_mutation_query_test.cc',
+    'test/boost/mutation_reader_test.cc',
+    'test/boost/mutation_writer_test.cc',
+    'test/boost/network_topology_strategy_test.cc',
+    'test/boost/per_partition_rate_limit_test.cc',
+    'test/boost/querier_cache_test.cc',
+    'test/boost/query_processor_test.cc',
+    'test/boost/reader_concurrency_semaphore_test.cc',
+    'test/boost/repair_test.cc',
+    'test/boost/restrictions_test.cc',
+    'test/boost/role_manager_test.cc',
+    'test/boost/row_cache_test.cc',
+    'test/boost/schema_change_test.cc',
+    'test/boost/schema_registry_test.cc',
+    'test/boost/secondary_index_test.cc',
+    'test/boost/sessions_test.cc',
+    'test/boost/sstable_compaction_test.cc',
+    'test/boost/sstable_directory_test.cc',
+    'test/boost/sstable_set_test.cc',
+    'test/boost/statement_restrictions_test.cc',
+    'test/boost/storage_proxy_test.cc',
+    'test/boost/tablets_test.cc',
+    'test/boost/tracing_test.cc',
+    'test/boost/user_function_test.cc',
+    'test/boost/user_types_test.cc',
+    'test/boost/view_build_test.cc',
+    'test/boost/view_complex_test.cc',
+    'test/boost/view_schema_ckey_test.cc',
+    'test/boost/view_schema_pkey_test.cc',
+    'test/boost/view_schema_test.cc',
+    'test/boost/virtual_reader_test.cc',
+    'test/boost/virtual_table_test.cc',
+    'tools/schema_loader.cc',
+    'tools/read_mutation.cc',
+    'test/lib/expr_test_utils.cc',
+    'test/lib/dummy_sharder.cc',
+]
 
 deps['test/boost/bytes_ostream_test'] = [
     "test/boost/bytes_ostream_test.cc",
@@ -1281,7 +1540,7 @@ deps['test/boost/bytes_ostream_test'] = [
     "test/lib/log.cc",
 ]
 deps['test/boost/input_stream_test'] = ['test/boost/input_stream_test.cc']
-deps['test/boost/UUID_test'] = ['utils/UUID_gen.cc', 'test/boost/UUID_test.cc', 'utils/uuid.cc', 'utils/dynamic_bitset.cc', 'utils/hashers.cc']
+deps['test/boost/UUID_test'] = ['clocks-impl.cc', 'utils/UUID_gen.cc', 'test/boost/UUID_test.cc', 'utils/uuid.cc', 'utils/dynamic_bitset.cc', 'utils/hashers.cc', 'utils/on_internal_error.cc']
 deps['test/boost/murmur_hash_test'] = ['bytes.cc', 'utils/murmur_hash.cc', 'test/boost/murmur_hash_test.cc']
 deps['test/boost/allocation_strategy_test'] = ['test/boost/allocation_strategy_test.cc', 'utils/logalloc.cc', 'utils/dynamic_bitset.cc']
 deps['test/boost/log_heap_test'] = ['test/boost/log_heap_test.cc']
@@ -1296,7 +1555,6 @@ deps['test/boost/reusable_buffer_test'] = [
 ]
 deps['test/boost/utf8_test'] = ['utils/utf8.cc', 'test/boost/utf8_test.cc']
 deps['test/boost/small_vector_test'] = ['test/boost/small_vector_test.cc']
-deps['test/boost/multishard_mutation_query_test'] += ['test/boost/test_table.cc']
 deps['test/boost/vint_serialization_test'] = ['test/boost/vint_serialization_test.cc', 'vint-serialization.cc', 'bytes.cc']
 deps['test/boost/linearizing_input_stream_test'] = [
     "test/boost/linearizing_input_stream_test.cc",
@@ -1308,7 +1566,7 @@ deps['test/boost/exceptions_optimized_test'] = ['test/boost/exceptions_optimized
 deps['test/boost/exceptions_fallback_test'] = ['test/boost/exceptions_fallback_test.cc', 'utils/exceptions.cc']
 
 deps['test/boost/duration_test'] += ['test/lib/exception_utils.cc']
-deps['test/boost/schema_loader_test'] += ['tools/schema_loader.cc']
+deps['test/boost/schema_loader_test'] += ['tools/schema_loader.cc', 'tools/read_mutation.cc']
 deps['test/boost/rust_test'] += ['rust/inc/src/lib.rs']
 
 deps['test/raft/replication_test'] = ['test/raft/replication_test.cc', 'test/raft/replication.cc', 'test/raft/helpers.cc'] + scylla_raft_dependencies
@@ -1320,68 +1578,54 @@ deps['test/raft/fsm_test'] =  ['test/raft/fsm_test.cc', 'test/raft/helpers.cc', 
 deps['test/raft/etcd_test'] =  ['test/raft/etcd_test.cc', 'test/raft/helpers.cc', 'test/lib/log.cc'] + scylla_raft_dependencies
 deps['test/raft/raft_sys_table_storage_test'] = ['test/raft/raft_sys_table_storage_test.cc'] + \
     scylla_core + scylla_tests_generic_dependencies
-deps['test/raft/raft_address_map_test'] = ['test/raft/raft_address_map_test.cc'] + scylla_core
+deps['test/boost/address_map_test'] = ['test/boost/address_map_test.cc'] + scylla_core
 deps['test/raft/discovery_test'] =  ['test/raft/discovery_test.cc',
                                      'test/raft/helpers.cc',
                                      'test/lib/log.cc',
                                      'service/raft/discovery.cc'] + scylla_raft_dependencies
 
+wasm_deps = {}
 
-warnings = [
-    '-Wall',
-    '-Werror',
-    '-Wno-mismatched-tags',  # clang-only
-    '-Wno-maybe-uninitialized',  # false positives on gcc 5
-    '-Wno-tautological-compare',
-    '-Wno-parentheses-equality',
-    '-Wno-c++11-narrowing',
-    '-Wno-sometimes-uninitialized',
-    '-Wno-return-stack-address',
-    '-Wno-missing-braces',
-    '-Wno-unused-lambda-capture',
-    '-Wno-overflow',
-    '-Wno-noexcept-type',
-    '-Wno-nonnull-compare',
-    '-Wno-error=cpp',
-    '-Wno-ignored-attributes',
-    '-Wno-overloaded-virtual',
-    '-Wno-stringop-overflow',
-    '-Wno-unused-command-line-argument',
-    '-Wno-defaulted-function-deleted',
-    '-Wno-redeclared-class-member',
-    '-Wno-unsupported-friend',
-    '-Wno-unused-variable',
-    '-Wno-delete-non-abstract-non-virtual-dtor',
-    '-Wno-braced-scalar-init',
-    '-Wno-implicit-int-float-conversion',
-    '-Wno-delete-abstract-non-virtual-dtor',
-    '-Wno-uninitialized-const-reference',
-    # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=77728
-    '-Wno-psabi',
-    '-Wno-narrowing',
-    '-Wno-array-bounds',
-    '-Wno-nonnull',
-    '-Wno-catch-value',
-    '-Wno-stringop-overread', # false positives with gcc 12
-    '-Wno-uninitialized',  # false positives with gcc 12,
-    '-Wno-missing-attributes', # something in seastar's memory.cc, TBD,
-    '-Wno-use-after-free', # false positives with gcc 12
-    '-Wno-dangling-pointer', # false positives with gcc 12
-]
+wasm_deps['wasm/return_input.wat'] = 'test/resource/wasm/rust/return_input.rs'
+wasm_deps['wasm/test_short_ints.wat'] = 'test/resource/wasm/rust/test_short_ints.rs'
+wasm_deps['wasm/test_complex_null_values.wat'] = 'test/resource/wasm/rust/test_complex_null_values.rs'
+wasm_deps['wasm/test_functions_with_frozen_types.wat'] = 'test/resource/wasm/rust/test_functions_with_frozen_types.rs'
+wasm_deps['wasm/test_types_with_and_without_nulls.wat'] = 'test/resource/wasm/rust/test_types_with_and_without_nulls.rs'
 
-warnings = [w
-            for w in warnings
-            if flag_supported(flag=w, compiler=args.cxx)]
+wasm_deps['wasm/test_fib_called_on_null.wat'] = 'test/resource/wasm/c/test_fib_called_on_null.c'
+wasm_deps['wasm/test_mem_grow.wat'] = 'test/resource/wasm/c/test_mem_grow.c'
+wasm_deps['wasm/test_pow.wat'] = 'test/resource/wasm/c/test_pow.c'
+wasm_deps['wasm/test_UDA_final.wat'] = 'test/resource/wasm/c/test_UDA_final.c'
+wasm_deps['wasm/test_UDA_scalar.wat'] = 'test/resource/wasm/c/test_UDA_scalar.c'
+wasm_deps['wasm/test_word_double.wat'] = 'test/resource/wasm/c/test_word_double.c'
 
-warnings = ' '.join(warnings + ['-Wno-error=deprecated-declarations'])
+
+def get_warning_options(cxx):
+    warnings = [
+        '-Wall',
+        '-Werror',
+        '-Wextra',
+        '-Wimplicit-fallthrough',
+        '-Wno-mismatched-tags',  # clang-only
+        '-Wno-c++11-narrowing',
+        '-Wno-overloaded-virtual',
+        '-Wno-unused-parameter',
+        '-Wno-unsupported-friend',
+        '-Wno-missing-field-initializers',
+        '-Wno-deprecated-copy',
+        '-Wno-enum-constexpr-conversion',
+    ]
+
+    warnings = [w
+                for w in warnings
+                if flag_supported(flag=w, compiler=cxx)]
+
+    return ' '.join(warnings + ['-Wno-error=deprecated-declarations'])
+
 
 def get_clang_inline_threshold():
     if args.clang_inline_threshold != -1:
         return args.clang_inline_threshold
-    elif platform.machine() == 'aarch64':
-        # we see miscompiles with 1200 and above with format("{}", uuid)
-        # also coroutine miscompiles with 600
-        return 300
     else:
         return 2500
 
@@ -1391,106 +1635,14 @@ for mode_level in args.mode_o_levels:
         raise Exception(f'Mode {mode} is missing, cannot configure optimization level for it')
     modes[mode]['optimization-level'] = level
 
-for mode in modes:
-    modes[mode]['cxxflags'] += f' -O{modes[mode]["optimization-level"]}'
-
-optimization_flags = [
-    '--param inline-unit-growth=300', # gcc
-    f'-mllvm -inline-threshold={get_clang_inline_threshold()}',  # clang
-    # clang generates 16-byte loads that break store-to-load forwarding
-    # gcc also has some trouble: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=103554
-    '-fno-slp-vectorize',
-]
-optimization_flags = [o
-                      for o in optimization_flags
-                      if flag_supported(flag=o, compiler=args.cxx)]
-modes['release']['cxxflags'] += ' ' + ' '.join(optimization_flags)
-
-if flag_supported(flag='-Wstack-usage=4096', compiler=args.cxx):
-    for mode in modes:
-        modes[mode]['cxxflags'] += f' -Wstack-usage={modes[mode]["stack-usage-threshold"]} -Wno-error=stack-usage='
-
 linker_flags = linker_flags(compiler=args.cxx)
 
-dbgflag = '-g -gz' if args.debuginfo else ''
 tests_link_rule = 'link' if args.tests_debuginfo else 'link_stripped'
 perf_tests_link_rule = 'link' if args.perf_tests_debuginfo else 'link_stripped'
 
 # Strip if debuginfo is disabled, otherwise we end up with partial
 # debug info from the libraries we static link with
 regular_link_rule = 'link' if args.debuginfo else 'link_stripped'
-
-# a list element means a list of alternative packages to consider
-# the first element becomes the HAVE_pkg define
-# a string element is a package name with no alternatives
-optional_packages = [[]]
-pkgs = []
-
-# Lua can be provided by lua53 package on Debian-like
-# systems and by Lua on others.
-pkgs.append('lua53' if have_pkg('lua53') else 'lua')
-
-pkgs.append('libsystemd')
-
-
-compiler_test_src = '''
-
-// clang pretends to be gcc (defined __GNUC__), so we
-// must check it first
-#ifdef __clang__
-
-#if __clang_major__ < 10
-    #error "MAJOR"
-#endif
-
-#elif defined(__GNUC__)
-
-#if __GNUC__ < 10
-    #error "MAJOR"
-#elif __GNUC__ == 10
-    #if __GNUC_MINOR__ < 1
-        #error "MINOR"
-    #elif __GNUC_MINOR__ == 1
-        #if __GNUC_PATCHLEVEL__ < 1
-            #error "PATCHLEVEL"
-        #endif
-    #endif
-#endif
-
-#else
-
-#error "Unrecognized compiler"
-
-#endif
-
-int main() { return 0; }
-'''
-if not try_compile_and_link(compiler=args.cxx, source=compiler_test_src):
-    try_compile_and_link(compiler=args.cxx, source=compiler_test_src, verbose=True)
-    print('Wrong compiler version or incorrect flags. Scylla needs GCC >= 10.1.1 with coroutines (-fcoroutines) or clang >= 10.0.0 to compile.')
-    sys.exit(1)
-
-if not try_compile(compiler=args.cxx, source='#include <boost/version.hpp>'):
-    print('Boost not installed.  Please install {}.'.format(pkgname("boost-devel")))
-    sys.exit(1)
-
-if not try_compile(compiler=args.cxx, source='''\
-        #include <boost/version.hpp>
-        #if BOOST_VERSION < 105500
-        #error Boost version too low
-        #endif
-        '''):
-    print('Installed boost version too old.  Please update {}.'.format(pkgname("boost-devel")))
-    sys.exit(1)
-
-if try_compile(args.cxx, source = textwrap.dedent('''\
-        #include <lz4.h>
-
-        void m() {
-            LZ4_compress_default(static_cast<const char*>(0), static_cast<char*>(0), 0, 0);
-        }
-        '''), flags=args.user_cflags.split()):
-    defines.append("HAVE_LZ4_COMPRESS_DEFAULT")
 
 has_sanitize_address_use_after_scope = try_compile(compiler=args.cxx, flags=['-fsanitize-address-use-after-scope'], source='int f() {}')
 
@@ -1505,11 +1657,13 @@ selected_modes = args.selected_modes or modes.keys()
 default_modes = args.selected_modes or [mode for mode, mode_cfg in modes.items() if mode_cfg["default"]]
 build_modes =  {m: modes[m] for m in selected_modes}
 
+buildfile_final_name = args.buildfile_final_name or args.buildfile
+
 if args.artifacts:
-    build_artifacts = []
+    build_artifacts = set()
     for artifact in args.artifacts:
         if artifact in all_artifacts:
-            build_artifacts.append(artifact)
+            build_artifacts.add(artifact)
         else:
             print("Ignoring unknown build artifact: {}".format(artifact))
     if not build_artifacts:
@@ -1518,27 +1672,24 @@ if args.artifacts:
 else:
     build_artifacts = all_artifacts
 
-date_stamp = f"--date-stamp {args.date_stamp}" if args.date_stamp else ""
-status = subprocess.call(f"./SCYLLA-VERSION-GEN {date_stamp}", shell=True)
-if status != 0:
-    print('Version file generation failed')
-    sys.exit(1)
 
-file = open(f'{outdir}/SCYLLA-VERSION-FILE', 'r')
-scylla_version = file.read().strip().replace('-', '~')
-file = open(f'{outdir}/SCYLLA-RELEASE-FILE', 'r')
-scylla_release = file.read().strip()
-file = open(f'{outdir}/SCYLLA-PRODUCT-FILE', 'r')
-scylla_product = file.read().strip()
+def generate_version(date_stamp):
+    date_stamp_opt = ''
+    if date_stamp:
+        date_stamp_opt = f'--date-stamp {date_stamp}'
+    status = subprocess.call(f"./SCYLLA-VERSION-GEN --output-dir {outdir} {date_stamp_opt}", shell=True)
+    if status != 0:
+        print('Version file generation failed')
+        sys.exit(1)
 
-arch = platform.machine()
+    with open(f'{outdir}/SCYLLA-VERSION-FILE', 'r') as f:
+        scylla_version = f.read().strip().replace('-', '~')
+    with open(f'{outdir}/SCYLLA-RELEASE-FILE', 'r') as f:
+        scylla_release = f.read().strip()
+    with open(f'{outdir}/SCYLLA-PRODUCT-FILE', 'r') as f:
+        scylla_product = f.read().strip()
+    return scylla_product, scylla_version, scylla_release
 
-for m, mode_config in modes.items():
-    mode_config['cxxflags'] += f" -DSCYLLA_BUILD_MODE={m}"
-    cxxflags = "-DSCYLLA_VERSION=\"\\\"" + scylla_version + "\\\"\" -DSCYLLA_RELEASE=\"\\\"" + scylla_release + "\\\"\""
-    mode_config["per_src_extra_cxxflags"]["release.cc"] = cxxflags
-    if mode_config["can_have_debug_info"]:
-        mode_config['cxxflags'] += ' ' + dbgflag
 
 # The relocatable package includes its own dynamic linker. We don't
 # know the path it will be installed to, so for now use a very long
@@ -1552,15 +1703,22 @@ for m, mode_config in modes.items():
 # At the end of the build we check that the build-id is indeed in the
 # first page. At install time we check that patchelf doesn't modify
 # the program headers.
+def dynamic_linker_option():
+    gcc_linker_output = subprocess.check_output(['gcc', '-###', '/dev/null', '-o', 't'], stderr=subprocess.STDOUT).decode('utf-8')
+    original_dynamic_linker = re.search('-dynamic-linker ([^ ]*)', gcc_linker_output).groups()[0]
 
-gcc_linker_output = subprocess.check_output(['gcc', '-###', '/dev/null', '-o', 't'], stderr=subprocess.STDOUT).decode('utf-8')
-original_dynamic_linker = re.search('-dynamic-linker ([^ ]*)', gcc_linker_output).groups()[0]
-if employ_ld_trickery:
-    # gdb has a SO_NAME_MAX_PATH_SIZE of 512, so limit the path size to
-    # that. The 512 includes the null at the end, hence the 511 bellow.
-    dynamic_linker = '/' * (511 - len(original_dynamic_linker)) + original_dynamic_linker
-else:
-    dynamic_linker = original_dynamic_linker
+    employ_ld_trickery = True
+    # distro-specific setup
+    if os.environ.get('NIX_CC'):
+        employ_ld_trickery = False
+
+    if employ_ld_trickery:
+        # gdb has a SO_NAME_MAX_PATH_SIZE of 512, so limit the path size to
+        # that. The 512 includes the null at the end, hence the 511 below.
+        dynamic_linker = '/' * (511 - len(original_dynamic_linker)) + original_dynamic_linker
+    else:
+        dynamic_linker = original_dynamic_linker
+    return f'--dynamic-linker={dynamic_linker}'
 
 forced_ldflags = '-Wl,'
 
@@ -1570,20 +1728,154 @@ forced_ldflags = '-Wl,'
 # explicitly ask for SHA1 build-ids.
 forced_ldflags += '--build-id=sha1,'
 
-forced_ldflags += f'--dynamic-linker={dynamic_linker}'
+forced_ldflags += dynamic_linker_option()
 
-args.user_ldflags = forced_ldflags + ' ' + args.user_ldflags
+user_ldflags = forced_ldflags + ' ' + args.user_ldflags
 
-args.user_cflags += f" -ffile-prefix-map={curdir}=."
+curdir = os.getcwd()
+user_cflags = args.user_cflags + f" -ffile-prefix-map={curdir}=."
+
+# Since gcc 13, libgcc doesn't need the exception workaround
+user_cflags += ' -DSEASTAR_NO_EXCEPTION_HACK'
 
 if args.target != '':
-    args.user_cflags += ' -march=' + args.target
+    user_cflags += ' -march=' + args.target
 
 for mode in modes:
     # Those flags are passed not only to Scylla objects, but also to libraries
     # that we compile ourselves.
-    modes[mode]['lib_cflags'] = args.user_cflags
-    modes[mode]['lib_ldflags'] = args.user_ldflags + linker_flags
+    modes[mode]['lib_cflags'] = user_cflags
+    modes[mode]['lib_ldflags'] = user_ldflags + linker_flags
+
+
+def prepare_advanced_optimizations(*, modes, build_modes, args):
+    for mode in modes:
+        modes[mode]['has_lto'] = False
+        modes[mode]['is_profile'] = False
+
+    profile_modes = {}
+
+    for mode in modes:
+        if not modes[mode]['advanced_optimizations']:
+            continue
+
+        # When building with PGO, -Wbackend-plugin generates a warning for every
+        # function which changed its control flow graph since the profile was
+        # taken.
+        # We allow stale profiles, so these warnings are just noise to us.
+        # Let's silence them.
+        modes[mode]['lib_cflags'] += ' -Wno-backend-plugin'
+
+        if args.lto:
+            modes[mode]['has_lto'] = True
+            modes[mode]['lib_cflags'] += ' -flto=thin -ffat-lto-objects'
+
+        # Absolute path (in case of the initial profile) or path
+        # beginning with $builddir (in case of generated profiles),
+        # for use in ninja dependency rules.
+        # Using absolute paths only would work too, but we use
+        # $builddir for consistency with all other ninja targets.
+        profile_target = None
+        # Absolute path to the profile, for use in compiler flags.
+        # Can't use $builddir here because the flags are also passed
+        # to seastar, which doesn't understand ninja variables.
+        profile_path = None
+
+        if args.use_profile:
+            profile_path = os.path.abspath(args.use_profile)
+            profile_target = profile_path
+        elif args.use_profile is None:
+            # Use the default profile. There is a rule in later part of configure.py
+            # which extracts the default profile from an archive in pgo/profiles,
+            # (stored in git LFS) to build/
+
+            default_profile_archive_path = f"pgo/profiles/{platform.machine()}/profile.profdata.xz"
+            default_profile_filename = pathlib.Path(default_profile_archive_path).stem
+
+            # We are checking whether the profile archive is compressed,
+            # instead of just checking for its existence, because of how git LFS works.
+            #
+            # When a file is stored in LFS, the underlying git repository only receives a text file stub
+            # containing some metadata of the actual file. On checkout, LFS filters download the actual
+            # file based on that metadata and substitute it for the stub.
+            # If LFS is disabled or not installed, git will simply check out the stub,
+            # which will be a regular text file.
+            #
+            # By ignoring existing but uncompressed profile files we are accommodating users who don't
+            # have LFS installed yet, or don't want to be forced to use it.
+            #
+            validate_archive = subprocess.run(["file", default_profile_archive_path], capture_output=True)
+            if "compressed data" in validate_archive.stdout.decode():
+                default_profile_filename = pathlib.Path(default_profile_archive_path).stem
+                profile_path = os.path.abspath("build/" + default_profile_filename)
+                profile_target = "$builddir/" + default_profile_filename
+                modes[mode].setdefault('profile_recipe', '')
+                modes[mode]['profile_recipe'] += textwrap.dedent(f"""\
+                    rule xz_uncompress
+                        command = xz --uncompress --stdout $in > $out
+                        description = XZ_UNCOMPRESS $in to $out
+                    build {profile_target}: xz_uncompress {default_profile_archive_path}
+                    """)
+            else:
+                # Avoid breaking existing pipelines without git-lfs installed.
+                print(f"WARNING: {default_profile_archive_path} is not an archive. Building without a profile.", file=sys.stderr)
+        else:
+            # Passing --use-profile="" explicitly disables the default profile.
+            pass
+
+        # pgso (profile-guided size-optimization) adds optsize hints (-Os) to cold code.
+        # We don't want to optimize anything for size, because that's a potential source
+        # of performance regressions, and the benefits are dubious. Let's disable pgso
+        # by default. (Currently is enabled in Clang by default.)
+        #
+        # Value profiling allows the compiler to track not only the outcomes of branches
+        # but also the values of variables at interesting decision points.
+        # Currently Clang uses value profiling for two things: specializing for the most
+        # common sizes of memory ops (e.g. memcpy, memcmp) and specializing for the most
+        # common targets of indirect branches.
+        # It's valuable in general, but our training suite is not realistic and exhaustive
+        # enough to be confident about value profiling. Let's also keep it disabled by
+        # default, conservatively. (Currently it is enabled in Clang by default.)
+        conservative_opts = "" if args.experimental_pgo else "-mllvm -pgso=false -mllvm -enable-value-profiling=false"
+
+        llvm_instr_types = []
+        if args.pgo:
+            llvm_instr_types += [""]
+        if args.cspgo:
+            llvm_instr_types += ["cs-"]
+        for it in llvm_instr_types:
+            submode = copy.deepcopy(modes[mode])
+            submode_name = f'{mode}-{it}pgo'
+            submode['parent_mode'] = mode
+            if profile_path is not None:
+                submode['lib_cflags'] += f" -fprofile-use={profile_path}"
+                submode['cxx_ld_flags'] += f" -fprofile-use={profile_path}"
+                submode['profile_target'] = profile_target
+            submode['lib_cflags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
+            submode['cxx_ld_flags'] += f" -f{it}profile-generate={os.path.realpath(outdir)}/{submode_name} {conservative_opts}"
+            # Profile collection depends on java tools because we use cassandra-stress as the load.
+            submode['profile_recipe'] = textwrap.dedent(f"""\
+                build $builddir/{submode_name}/profiles/prof.profdata: train $builddir/{submode_name}/scylla | dist-tools-tar
+                build $builddir/{submode_name}/profiles/merged.profdata: merge_profdata $builddir/{submode_name}/profiles/prof.profdata {profile_target or str()}
+                """)
+            submode['is_profile'] = True
+            profile_path = f"{os.path.realpath(outdir)}/{submode_name}/profiles/merged.profdata"
+            profile_target = f"$builddir/{submode_name}/profiles/merged.profdata"
+
+            profile_modes[submode_name] = submode
+
+        if profile_path is not None:
+            modes[mode]['lib_cflags'] += f" -fprofile-use={profile_path} {conservative_opts}"
+            modes[mode]['cxx_ld_flags'] += f" -fprofile-use={profile_path} {conservative_opts}"
+            modes[mode]['profile_target'] = profile_target
+            modes[mode].setdefault('profile_recipe', "")
+            modes[mode]['profile_recipe'] += textwrap.dedent(f"""\
+                build $builddir/{mode}/profiles/merged.profdata: copy {profile_target or profile_path or str()}
+                """)
+
+    modes.update(profile_modes)
+    build_modes.update(profile_modes)
+
 
 # cmake likes to separate things with semicolons
 def semicolon_separated(*flags):
@@ -1596,22 +1888,51 @@ def real_relpath(path, start):
     return os.path.relpath(os.path.realpath(path), os.path.realpath(start))
 
 def configure_seastar(build_dir, mode, mode_config):
+    seastar_cxx_ld_flags = mode_config['cxx_ld_flags']
+    # We want to "undo" coverage for seastar if we have it enabled.
+    if args.coverage:
+        for flag in COVERAGE_INST_FLAGS:
+            seastar_cxx_ld_flags = seastar_cxx_ld_flags.replace(' ' + flag, '')
+            seastar_cxx_ld_flags = seastar_cxx_ld_flags.replace(flag, '')
+    # There is a global `-ffile-prefix-map={curdir}=.` above.
+    # By itself, it results in *both* DW_AT_name and DW_AT_comp_dir being
+    # subject to the substitution.
+    # For example, if seastar::thread_context::main is located
+    # in /home/user/scylla/seastar/src/core/thread.cc,
+    # and the compiler working directory is /home/user/scylla/seastar/build/seastar,
+    # then after the ffile-prefix-map substitution it will
+    # have DW_AT_comp_dir equal to ./build/seastar
+    # and DW_AT_name equal to ./seastar/src/core/thread.cc
+    #
+    # If DW_AT_name is a relative path, gdb looks for the source files in $DW_AT_comp_dir/$DW_AT_name.
+    # This results in e.g. gdb looking for seastar::thread_context::main
+    # in ./build/seastar/./seastar/src/core/thread.cc,
+    # instead of seastar/src/core/thread.cc as we would like.
+    # To unscrew this, we have to add a rule which will 
+    # convert the /absolute/path/to/build/seastar to `.`,
+    # which will result in gdb looking in ././seastar/src/core/thread.cc, which is fine.
+    #
+    # The second build rule, which converts `/absolute/path/to/build/seastar/` (note trailing slash)
+    # to seastar/ exists just so any possible DW_AT_name under build (e.g. if there are some generated
+    # sources) is excluded from the first rule.
     seastar_build_dir = os.path.join(build_dir, mode, 'seastar')
-
+    extra_file_prefix_map = f' -ffile-prefix-map={seastar_build_dir}=. -ffile-prefix-map={seastar_build_dir}/=seastar/'
     seastar_cmake_args = [
         '-DCMAKE_BUILD_TYPE={}'.format(mode_config['cmake_build_type']),
         '-DCMAKE_C_COMPILER={}'.format(args.cc),
         '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
         '-DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON',
-        '-DSeastar_CXX_FLAGS=SHELL:{}'.format(mode_config['lib_cflags']),
-        '-DSeastar_LD_FLAGS={}'.format(semicolon_separated(mode_config['lib_ldflags'], mode_config['cxx_ld_flags'])),
-        '-DSeastar_CXX_DIALECT=gnu++20',
-        '-DSeastar_API_LEVEL=6',
+        '-DCMAKE_CXX_STANDARD=23',
+        '-DCMAKE_CXX_EXTENSIONS=ON',
+        '-DSeastar_CXX_FLAGS=SHELL:{}'.format(mode_config['lib_cflags'] + extra_file_prefix_map),
+        '-DSeastar_LD_FLAGS={}'.format(semicolon_separated(mode_config['lib_ldflags'], seastar_cxx_ld_flags)),
+        '-DSeastar_API_LEVEL=7',
+        '-DSeastar_DEPRECATED_OSTREAM_FORMATTERS=OFF',
         '-DSeastar_UNUSED_RESULT_ERROR=ON',
         '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-        '-DSeastar_SCHEDULING_GROUPS_COUNT=16',
-        '-DSeastar_IO_URING=OFF', # io_uring backend is not stable enough
-    ] + distro_extra_cmake_args
+        '-DSeastar_SCHEDULING_GROUPS_COUNT=19',
+        '-DSeastar_IO_URING=ON',
+    ]
 
     if args.stack_guards is not None:
         stack_guards = 'ON' if args.stack_guards else 'OFF'
@@ -1621,15 +1942,18 @@ def configure_seastar(build_dir, mode, mode_config):
     if dpdk is None:
         dpdk = platform.machine() == 'x86_64' and mode == 'release'
     if dpdk:
-        seastar_cmake_args += ['-DSeastar_DPDK=ON', '-DSeastar_DPDK_MACHINE=wsm']
+        seastar_cmake_args += ['-DSeastar_DPDK=ON', '-DSeastar_DPDK_MACHINE=westmere']
     if args.split_dwarf:
         seastar_cmake_args += ['-DSeastar_SPLIT_DWARF=ON']
     if args.alloc_failure_injector:
         seastar_cmake_args += ['-DSeastar_ALLOC_FAILURE_INJECTION=ON']
     if args.seastar_debug_allocations:
         seastar_cmake_args += ['-DSeastar_DEBUG_ALLOCATIONS=ON']
+    if mode_config['build_seastar_shared_libs']:
+        seastar_cmake_args += ['-DBUILD_SHARED_LIBS=ON']
 
-    seastar_cmd = ['cmake', '-G', 'Ninja', real_relpath(args.seastar_path, seastar_build_dir)] + seastar_cmake_args
+    cmake_args = seastar_cmake_args[:]
+    seastar_cmd = ['cmake', '-G', 'Ninja', real_relpath(args.seastar_path, seastar_build_dir)] + cmake_args
     cmake_dir = seastar_build_dir
     if dpdk:
         # need to cook first
@@ -1642,95 +1966,206 @@ def configure_seastar(build_dir, mode, mode_config):
     os.makedirs(seastar_build_dir, exist_ok=True)
     subprocess.check_call(seastar_cmd, shell=False, cwd=cmake_dir)
 
-if not args.dist_only:
-    for mode, mode_config in build_modes.items():
-        configure_seastar(outdir, mode, mode_config)
 
-pc = {mode: f'{outdir}/{mode}/seastar/seastar.pc' for mode in build_modes}
-ninja = find_executable('ninja') or find_executable('ninja-build')
-if not ninja:
-    print('Ninja executable (ninja or ninja-build) not found on PATH\n')
-    sys.exit(1)
+def configure_abseil(build_dir, mode, mode_config):
+    abseil_cflags = mode_config['lib_cflags']
+    cxx_flags = mode_config['cxxflags']
+    if '-DSANITIZE' in cxx_flags:
+        abseil_cflags += ' -fsanitize=address -fsanitize=undefined -fno-sanitize=vptr'
 
-def query_seastar_flags(pc_file, link_static_cxx=False):
-    cflags = pkg_config(pc_file, '--cflags', '--static')
-    libs = pkg_config(pc_file, '--libs', '--static')
+    # We want to "undo" coverage for abseil if we have it enabled, as we are not
+    # interested in the coverage of the abseil library. these flags were previously
+    # added to cxx_ld_flags
+    if args.coverage:
+        for flag in COVERAGE_INST_FLAGS:
+            cxx_flags = cxx_flags.replace(f' {flag}', '')
 
+    cxx_flags += ' ' + abseil_cflags.strip()
+    cmake_mode = mode_config['cmake_build_type']
+    abseil_cmake_args = [
+        '-DCMAKE_BUILD_TYPE={}'.format(cmake_mode),
+        '-DCMAKE_INSTALL_PREFIX={}'.format(build_dir + '/inst'), # just to avoid a warning from absl
+        '-DCMAKE_C_COMPILER={}'.format(args.cc),
+        '-DCMAKE_CXX_COMPILER={}'.format(args.cxx),
+        '-DCMAKE_CXX_FLAGS_{}={}'.format(cmake_mode.upper(), cxx_flags),
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+        '-DCMAKE_CXX_STANDARD=23',
+        '-DABSL_PROPAGATE_CXX_STD=ON',
+    ]
+
+    cmake_args = abseil_cmake_args[:]
+    abseil_build_dir = os.path.join(build_dir, mode, 'abseil')
+    abseil_cmd = ['cmake', '-G', 'Ninja', real_relpath('abseil', abseil_build_dir)] + cmake_args
+
+    if args.verbose:
+        print(' \\\n  '.join(abseil_cmd))
+    os.makedirs(abseil_build_dir, exist_ok=True)
+    subprocess.check_call(abseil_cmd, shell=False, cwd=abseil_build_dir)
+
+abseil_libs = ['absl/' + lib for lib in [
+    'container/libabsl_hashtablez_sampler.a',
+    'container/libabsl_raw_hash_set.a',
+    'synchronization/libabsl_synchronization.a',
+    'synchronization/libabsl_graphcycles_internal.a',
+    'debugging/libabsl_stacktrace.a',
+    'debugging/libabsl_symbolize.a',
+    'debugging/libabsl_debugging_internal.a',
+    'debugging/libabsl_demangle_internal.a',
+    'time/libabsl_time.a',
+    'time/libabsl_time_zone.a',
+    'numeric/libabsl_int128.a',
+    'hash/libabsl_hash.a',
+    'hash/libabsl_city.a',
+    'hash/libabsl_low_level_hash.a',
+    'base/libabsl_malloc_internal.a',
+    'base/libabsl_spinlock_wait.a',
+    'base/libabsl_base.a',
+    'base/libabsl_raw_logging_internal.a',
+    'profiling/libabsl_exponential_biased.a',
+    'strings/libabsl_strings.a',
+    'strings/libabsl_strings_internal.a',
+    'base/libabsl_throw_delegate.a']]
+
+
+def query_seastar_flags(pc_file, use_shared_libs, link_static_cxx=False):
+    if use_shared_libs:
+        opt = '--shared'
+    else:
+        opt = '--static'
+    cflags = pkg_config(pc_file, '--cflags', opt)
+    libs = pkg_config(pc_file, '--libs', opt)
+    if use_shared_libs:
+        rpath = os.path.dirname(libs.split()[0])
+        libs = f"-Wl,-rpath='{rpath}' {libs}"
     if link_static_cxx:
         libs = libs.replace('-lstdc++ ', '')
+    testing_libs = pkg_config(pc_file.replace('seastar.pc', 'seastar-testing.pc'), '--libs', '--static')
+    return {'seastar_cflags': cflags,
+            'seastar_libs': libs,
+            'seastar_testing_libs': testing_libs}
 
-    return cflags, libs
+pkgs = ['libsystemd',
+        'jsoncpp']
+# Lua can be provided by lua53 package on Debian-like
+# systems and by Lua on others.
+pkgs.append('lua53' if have_pkg('lua53') else 'lua')
 
-for mode in build_modes:
-    seastar_pc_cflags, seastar_pc_libs = query_seastar_flags(pc[mode], link_static_cxx=args.staticcxx)
-    modes[mode]['seastar_cflags'] = seastar_pc_cflags
-    modes[mode]['seastar_libs'] = seastar_pc_libs
-    modes[mode]['seastar_testing_libs'] = pkg_config(pc[mode].replace('seastar.pc', 'seastar-testing.pc'), '--libs', '--static')
 
-abseil_pkgs = [
-    'absl_raw_hash_set',
-    'absl_hash',
-]
-
-pkgs += abseil_pkgs
-
-args.user_cflags += " " + pkg_config('jsoncpp', '--cflags')
-libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-latomic', '-llz4', '-lz', '-lsnappy', pkg_config('jsoncpp', '--libs'),
-                 ' -lstdc++fs', ' -lcrypt', ' -lcryptopp', ' -lpthread',
+libs = ' '.join([maybe_static(args.staticyamlcpp, '-lyaml-cpp'), '-latomic', '-lz', '-lsnappy', '-lcrypto',
+                 ' -lstdc++fs', ' -lcrypt', ' -lcryptopp', ' -lpthread', ' -lldap -llber',
                  # Must link with static version of libzstd, since
                  # experimental APIs that we use are only present there.
                  maybe_static(True, '-lzstd'),
+                 maybe_static(True, '-llz4'),
                  maybe_static(args.staticboost, '-lboost_date_time -lboost_regex -licuuc -licui18n'),
                  '-lxxhash',
                  '-ldeflate',
                 ])
 
+args.user_cflags += " " + pkg_config('p11-kit-1', '--cflags')
+
 if not args.staticboost:
-    args.user_cflags += ' -DBOOST_TEST_DYN_LINK'
-
-# thrift version detection, see #4538
-proc_res = subprocess.run(["thrift", "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-proc_res_output = proc_res.stdout.decode("utf-8")
-if proc_res.returncode != 0 and not re.search(r'^Thrift version', proc_res_output):
-    raise Exception("Thrift compiler must be missing: {}".format(proc_res_output))
-
-thrift_version = proc_res_output.split(" ")[-1]
-thrift_boost_versions = ["0.{}.".format(n) for n in range(1, 11)]
-if any(filter(thrift_version.startswith, thrift_boost_versions)):
-    args.user_cflags += ' -DTHRIFT_USES_BOOST'
+    user_cflags += ' -DBOOST_ALL_DYN_LINK'
 
 for pkg in pkgs:
-    args.user_cflags += ' ' + pkg_config(pkg, '--cflags')
+    user_cflags += ' ' + pkg_config(pkg, '--cflags')
     libs += ' ' + pkg_config(pkg, '--libs')
-user_cflags = args.user_cflags + ' -fvisibility=hidden'
-user_ldflags = args.user_ldflags + ' -fvisibility=hidden'
+user_cflags += ' -fvisibility=hidden'
+user_ldflags += ' -fvisibility=hidden'
 if args.staticcxx:
     user_ldflags += " -static-libstdc++"
-if args.staticthrift:
-    thrift_libs = "-Wl,-Bstatic -lthrift -Wl,-Bdynamic"
-else:
-    thrift_libs = "-lthrift"
 
-os.makedirs(outdir, exist_ok=True)
+kmip_lib_ver = '1.9.2a';
 
-if args.antlr3_exec:
-    antlr3_exec = args.antlr3_exec
-else:
-    antlr3_exec = "antlr3"
+def kmiplib():
+    os_ids = get_os_ids()
+    for id in os_ids:
+        if id in { 'centos', 'fedora', 'rhel' }:
+            return 'rhel84'
+    print('Could not resolve libkmip.a for platform {}'.format(os_ids))
+    sys.exit(1)
 
-if args.ragel_exec:
-    ragel_exec = args.ragel_exec
-else:
-    ragel_exec = "ragel"
+def target_cpu():
+    cpu, _, _ = subprocess.check_output([cxx, '-dumpmachine']).decode('utf-8').partition('-')
+    return cpu    
 
-with open(buildfile, 'w') as f:
+def kmip_arch():
+    arch = target_cpu()
+    if arch == 'x86_64':
+        return '64'
+    return arch 
+
+kmipc_dir = f'kmipc/kmipc-2.1.0t-{kmiplib()}_{kmip_arch()}'
+kmipc_lib = f'{kmipc_dir}/lib/libkmip.a'
+libs += ' -lboost_filesystem'
+if os.path.exists(kmipc_lib):
+    libs += f' {kmipc_lib}'
+    user_cflags += f' -I{kmipc_dir}/include -DHAVE_KMIP'
+
+def get_extra_cxxflags(mode, mode_config, cxx, debuginfo):
+    cxxflags = []
+
+    optimization_level = mode_config['optimization-level']
+    cxxflags.append(f'-O{optimization_level}')
+
+    if mode == 'release':
+        optimization_flags = [
+            '--param inline-unit-growth=300', # gcc
+            f'-mllvm -inline-threshold={get_clang_inline_threshold()}',  # clang
+            # clang generates 16-byte loads that break store-to-load forwarding
+            # gcc also has some trouble: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=103554
+            '-fno-slp-vectorize',
+        ]
+        optimization_flags = [o
+                              for o in optimization_flags
+                              if flag_supported(flag=o, compiler=cxx)]
+        cxxflags += optimization_flags
+
+    if flag_supported(flag='-Wstack-usage=4096', compiler=cxx):
+        stack_usage_threshold = mode_config['stack-usage-threshold']
+        cxxflags += [f'-Wstack-usage={stack_usage_threshold}',
+                     '-Wno-error=stack-usage=']
+
+    cxxflags.append(f'-DSCYLLA_BUILD_MODE={mode}')
+
+    if debuginfo and mode_config['can_have_debug_info']:
+        cxxflags += ['-g', '-gz']
+
+    # Since AssignmentTracking was enabled by default in clang
+    # (llvm/llvm-project@de6da6ad55d3ca945195d1cb109cb8efdf40a52a)
+    # coroutine frame debugging info (`coro_frame_ty`) is broken.
+    # 
+    # It seems that we aren't losing much by disabling AssigmentTracking,
+    # so for now we choose to disable it to get `coro_frame_ty` back.
+    cxxflags.append('-Xclang -fexperimental-assignment-tracking=disabled')
+
+    return cxxflags
+
+
+def get_release_cxxflags(scylla_product,
+                         scylla_version,
+                         scylla_release):
+    definitions = {'SCYLLA_PRODUCT': scylla_product,
+                   'SCYLLA_VERSION': scylla_version,
+                   'SCYLLA_RELEASE': scylla_release}
+    return [f'-D{name}="\\"{value}\\""' for name, value in definitions.items()]
+
+
+def write_build_file(f,
+                     arch,
+                     ninja,
+                     scylla_product,
+                     scylla_version,
+                     scylla_release,
+                     args):
+    warnings = get_warning_options(args.cxx)
     f.write(textwrap.dedent('''\
         configure_args = {configure_args}
         builddir = {outdir}
         cxx = {cxx}
-        cxxflags = --std=gnu++20 {user_cflags} {distro_extra_cflags} {warnings} {defines}
-        ldflags = {linker_flags} {user_ldflags} {distro_extra_ldflags}
-        ldflags_build = {linker_flags} {distro_extra_ldflags}
+        cxxflags = -std=gnu++23 {user_cflags} {warnings} {defines}
+        ldflags = {linker_flags} {user_ldflags}
+        ldflags_build = {linker_flags}
         libs = {libs}
         pool link_pool
             depth = {link_pool_depth}
@@ -1740,10 +2175,10 @@ with open(buildfile, 'w') as f:
             command = echo -e $text > $out
             description = GEN $out
         rule swagger
-            command = {args.seastar_path}/scripts/seastar-json2code.py --create-cc -f $in -o $out
+            command = {seastar_path}/scripts/seastar-json2code.py --create-cc -f $in -o $out
             description = SWAGGER $out
         rule serializer
-            command = {python} ./idl-compiler.py --ns ser -f $in -o $out
+            command = ./idl-compiler.py --ns ser -f $in -o $out
             description = IDL compiler $out
         rule ninja
             command = {ninja} -C $subdir $target
@@ -1763,17 +2198,17 @@ with open(buildfile, 'w') as f:
         rule strip
             command = scripts/strip.sh $in
         rule package
-            command = scripts/create-relocatable-package.py --mode $mode $out
+            command = scripts/create-relocatable-package.py --build-dir $builddir/$mode --node-exporter-dir $builddir/node_exporter --debian-dir $builddir/debian/debian $out
         rule stripped_package
-            command = scripts/create-relocatable-package.py --stripped --mode $mode $out
+            command = scripts/create-relocatable-package.py --stripped --build-dir $builddir/$mode --node-exporter-dir $builddir/node_exporter --debian-dir $builddir/debian/debian $out
         rule debuginfo_package
-            command = dist/debuginfo/scripts/create-relocatable-package.py --mode $mode $out
+            command = dist/debuginfo/scripts/create-relocatable-package.py --build-dir $builddir/$mode --node-exporter-dir $builddir/node_exporter $out
         rule rpmbuild
             command = reloc/build_rpm.sh --reloc-pkg $in --builddir $out
         rule debbuild
             command = reloc/build_deb.sh --reloc-pkg $in --builddir $out
         rule unified
-            command = unified/build_unified.sh --mode $mode --unified-pkg $out
+            command = unified/build_unified.sh --build-dir $builddir/$mode --unified-pkg $out
         rule rust_header
             command = cxxbridge --include rust/cxx.h --header $in > $out
             description = RUST_HEADER $out
@@ -1782,14 +2217,57 @@ with open(buildfile, 'w') as f:
             description = RUST_SOURCE $out
         rule cxxbridge_header
             command = cxxbridge --header > $out
-        ''').format(**globals()))
+        rule c2wasm
+            command = clang --target=wasm32 --no-standard-libraries -Wl,--export-all -Wl,--no-entry $in -o $out
+            description = C2WASM $out
+        rule rust2wasm
+            command = cargo build --target=wasm32-wasi --example=$example --locked --manifest-path=test/resource/wasm/rust/Cargo.toml --target-dir=$builddir/wasm/ $
+                && wasm-opt -Oz $builddir/wasm/wasm32-wasi/debug/examples/$example.wasm -o $builddir/wasm/$example.wasm $
+                && wasm-strip $builddir/wasm/$example.wasm
+            description = RUST2WASM $out
+        rule wasm2wat
+            command = wasm2wat $in > $out
+            description = WASM2WAT $out
+        rule run_profile
+          command = rm -r `dirname $out` && pgo/run_all $in `dirname $out` $type
+        rule train
+          command = rm -r `dirname $out` && pgo/train `realpath $in` `realpath -m $out` `realpath -m $builddir/pgo_datasets`
+          pool = console
+        rule merge_profdata
+          command = llvm-profdata merge $in -output=$out
+        ''').format(configure_args=configure_args,
+                    outdir=outdir,
+                    cxx=args.cxx,
+                    user_cflags=user_cflags,
+                    warnings=warnings,
+                    defines=defines,
+                    linker_flags=linker_flags,
+                    user_ldflags=user_ldflags,
+                    libs=libs,
+                    link_pool_depth=link_pool_depth,
+                    seastar_path=args.seastar_path,
+                    ninja=ninja,
+                    ragel_exec=args.ragel_exec))
+
+    for binary in sorted(wasms):
+        src = wasm_deps[binary]
+        wasm = binary[:-4] + '.wasm'
+        if src.endswith('.rs'):
+            f.write(f'build $builddir/{wasm}: rust2wasm {src} | test/resource/wasm/rust/Cargo.lock test/resource/wasm/rust/build.rs\n')
+            example_name = binary[binary.rindex('/')+1:-4]
+            f.write(f'   example = {example_name}\n')
+        else:
+            f.write(f'build $builddir/{wasm}: c2wasm {src}\n')
+        f.write(f'build $builddir/{binary}: wasm2wat $builddir/{wasm}\n')
+
     for mode in build_modes:
         modeval = modes[mode]
+
         fmt_lib = 'fmt'
         f.write(textwrap.dedent('''\
             cxx_ld_flags_{mode} = {cxx_ld_flags}
             ld_flags_{mode} = $cxx_ld_flags_{mode} {lib_ldflags}
-            cxxflags_{mode} = $cxx_ld_flags_{mode} {lib_cflags} {cxxflags} -iquote. -iquote $builddir/{mode}/gen
+            cxxflags_{mode} = {lib_cflags} {cxxflags} -iquote. -iquote $builddir/{mode}/gen
             libs_{mode} = -l{fmt_lib}
             seastar_libs_{mode} = {seastar_libs}
             seastar_testing_libs_{mode} = {seastar_testing_libs}
@@ -1812,10 +2290,6 @@ with open(buildfile, 'w') as f:
             rule ar.{mode}
               command = rm -f $out; ar cr $out $in; ranlib $out
               description = AR $out
-            rule thrift.{mode}
-                command = thrift -gen cpp:cob_style -out $builddir/{mode}/gen $in
-                description = THRIFT $in
-                restat = 1
             rule antlr3.{mode}
                 # We replace many local `ExceptionBaseType* ex` variables with a single function-scope one.
                 # Because we add such a variable to every function, and because `ExceptionBaseType` is not a global
@@ -1825,12 +2299,12 @@ with open(buildfile, 'w') as f:
                      && sed -i -e '/^.*On :.*$$/d' $builddir/{mode}/gen/${{stem}}Lexer.hpp $
                      && sed -i -e '/^.*On :.*$$/d' $builddir/{mode}/gen/${{stem}}Lexer.cpp $
                      && sed -i -e '/^.*On :.*$$/d' $builddir/{mode}/gen/${{stem}}Parser.hpp $
-                     && sed -i -e 's/^\\( *\)\\(ImplTraits::CommonTokenType\\* [a-zA-Z0-9_]* = NULL;\\)$$/\\1const \\2/' $
+                     && sed -i -e 's/^\\( *\\)\\(ImplTraits::CommonTokenType\\* [a-zA-Z0-9_]* = NULL;\\)$$/\\1const \\2/' $
                         -e '/^.*On :.*$$/d' $
                         -e '1i using ExceptionBaseType = int;' $
-                        -e 's/^{{/{{ ExceptionBaseType\* ex = nullptr;/; $
-                            s/ExceptionBaseType\* ex = new/ex = new/; $
-                            s/exceptions::syntax_exception e/exceptions::syntax_exception\& e/' $
+                        -e 's/^{{/{{ ExceptionBaseType\\* ex = nullptr;/; $
+                            s/ExceptionBaseType\\* ex = new/ex = new/; $
+                            s/exceptions::syntax_exception e/exceptions::syntax_exception\\& e/' $
                         $builddir/{mode}/gen/${{stem}}Parser.cpp
                 description = ANTLR3 $in
             rule checkhh.{mode}
@@ -1841,76 +2315,102 @@ with open(buildfile, 'w') as f:
               command = ./test.py --mode={mode} --repeat={test_repeat} --timeout={test_timeout}
               pool = console
               description = TEST {mode}
+            # This rule is unused for PGO stages. They use the rust lib from the parent mode.
             rule rust_lib.{mode}
               command = CARGO_BUILD_DEP_INFO_BASEDIR='.' cargo build --locked --manifest-path=rust/Cargo.toml --target-dir=$builddir/{mode} --profile=rust-{mode} $
                         && touch $out
               description = RUST_LIB $out
-            ''').format(mode=mode, antlr3_exec=antlr3_exec, fmt_lib=fmt_lib, test_repeat=test_repeat, test_timeout=test_timeout, **modeval))
+            ''').format(mode=mode, antlr3_exec=args.antlr3_exec, fmt_lib=fmt_lib, test_repeat=args.test_repeat, test_timeout=args.test_timeout, **modeval))
         f.write(
-            'build {mode}-build: phony {artifacts}\n'.format(
+            'build {mode}-build: phony {artifacts} {wasms}\n'.format(
                 mode=mode,
-                artifacts=str.join(' ', ['$builddir/' + mode + '/' + x for x in sorted(build_artifacts)])
+                artifacts=str.join(' ', ['$builddir/' + mode + '/' + x for x in sorted(build_artifacts - wasms)]),
+                wasms = str.join(' ', ['$builddir/' + x for x in sorted(build_artifacts & wasms)]),
             )
         )
+        if profile_recipe := modes[mode].get('profile_recipe'):
+            f.write(profile_recipe)
         include_cxx_target = f'{mode}-build' if not args.dist_only else ''
         include_dist_target = f'dist-{mode}' if args.enable_dist is None or args.enable_dist else ''
         f.write(f'build {mode}: phony {include_cxx_target} {include_dist_target}\n')
         compiles = {}
         swaggers = set()
         serializers = {}
-        thrifts = set()
         ragels = {}
         antlr3_grammars = set()
         rust_headers = {}
-        seastar_dep = '$builddir/{}/seastar/libseastar.a'.format(mode)
-        seastar_testing_dep = '$builddir/{}/seastar/libseastar_testing.a'.format(mode)
+
+        # We want LTO, but with the regular LTO, clang generates special LLVM IR files instead of
+        # regular ELF objects after the compile phase, and these special LLVM bitcode can only be
+        # used for LTO builds. The cost of compiling all tests with LTO is prohibitively high, so
+        # we can't use these IR files for tests -- we need to compile regular ELF objects as well.
+        # Therefore, we build FatLTO objects, which contain LTO compatible IR and the regular
+        # object code. And we enable LTO when linking the main Scylla executable, while disable
+        # it when linking anything else.
+
+        seastar_lib_ext = 'so' if modeval['build_seastar_shared_libs'] else 'a'
         for binary in sorted(build_artifacts):
-            if binary in other:
+            if modeval['is_profile'] and binary != "scylla":
+                # Just to avoid clutter in build.ninja
+                continue
+            profile_dep = modes[mode].get('profile_target', "")
+
+            if binary in other or binary in wasms:
                 continue
             srcs = deps[binary]
             objs = ['$builddir/' + mode + '/' + src.replace('.cc', '.o')
                     for src in srcs
                     if src.endswith('.cc')]
             objs.append('$builddir/../utils/arch/powerpc/crc32-vpmsum/crc32.S')
-            has_thrift = False
             has_rust = False
             for dep in deps[binary]:
-                if isinstance(dep, Thrift):
-                    has_thrift = True
-                    objs += dep.objects('$builddir/' + mode + '/gen')
                 if isinstance(dep, Antlr3Grammar):
-                    objs += dep.objects('$builddir/' + mode + '/gen')
+                    objs += dep.objects(f'$builddir/{mode}/gen')
                 if isinstance(dep, Json2Code):
-                    objs += dep.objects('$builddir/' + mode + '/gen')
+                    objs += dep.objects(f'$builddir/{mode}/gen')
                 if dep.endswith('.rs'):
                     has_rust = True
                     idx = dep.rindex('/src/')
                     obj = dep[:idx].replace('rust/','') + '.o'
-                    objs.append('$builddir/' + mode + '/gen/rust/' + obj)
+                    objs.append(f'$builddir/{mode}/gen/rust/{obj}')
             if has_rust:
-                objs.append('$builddir/' + mode +'/rust-' + mode + '/librust_combined.a')
-            local_libs = '$seastar_libs_{} $libs'.format(mode)
-            if has_thrift:
-                local_libs += ' ' + thrift_libs + ' ' + maybe_static(args.staticboost, '-lboost_system')
+                parent_mode = modes[mode].get('parent_mode', mode)
+                objs.append(f'$builddir/{parent_mode}/rust-{parent_mode}/librust_combined.a')
+
+            do_lto = modes[mode]['has_lto'] and binary in lto_binaries
+            seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
+            seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
+            abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
+            seastar_testing_libs = f'$seastar_testing_libs_{mode}'
+
+            local_libs = f'$seastar_libs_{mode} $libs'
+            objs.extend([f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs])
+
+            if do_lto:
+                local_libs += ' -flto=thin -ffat-lto-objects'
+            else:
+                local_libs += ' -fno-lto'
             if binary in tests:
                 if binary in pure_boost_tests:
                     local_libs += ' ' + maybe_static(args.staticboost, '-lboost_unit_test_framework')
                 if binary not in tests_not_using_seastar_test_framework:
-                    local_libs += ' ' + "$seastar_testing_libs_{}".format(mode)
+                    local_libs += f' {seastar_testing_libs}'
+                else:
+                    local_libs += ' ' + '-lgnutls' + ' ' + '-lboost_unit_test_framework'
                 # Our code's debugging information is huge, and multiplied
                 # by many tests yields ridiculous amounts of disk space.
                 # So we strip the tests by default; The user can very
                 # quickly re-link the test unstripped by adding a "_g"
                 # to the test name, e.g., "ninja build/release/testname_g"
                 link_rule = perf_tests_link_rule if binary.startswith('test/perf/') else tests_link_rule
-                f.write('build $builddir/{}/{}: {}.{} {} | {} {}\n'.format(mode, binary, link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep))
+                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {}\n'.format(mode, binary, link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
                 f.write('   libs = {}\n'.format(local_libs))
-                f.write('build $builddir/{}/{}_g: {}.{} {} | {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep))
+                f.write('build $builddir/{}/{}_g: {}.{} {} | {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
                 f.write('   libs = {}\n'.format(local_libs))
             else:
                 if binary == 'scylla':
-                    local_libs += ' ' + "$seastar_testing_libs_{}".format(mode)
-                f.write('build $builddir/{}/{}: {}.{} {} | {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep))
+                    local_libs += f' {seastar_testing_libs}'
+                f.write('build $builddir/{}/{}: {}.{} {} | {} {} {}\n'.format(mode, binary, regular_link_rule, mode, str.join(' ', objs), seastar_dep, seastar_testing_dep, abseil_dep))
                 f.write('   libs = {}\n'.format(local_libs))
                 f.write(f'build $builddir/{mode}/{binary}.stripped: strip $builddir/{mode}/{binary}\n')
                 f.write(f'build $builddir/{mode}/{binary}.debug: phony $builddir/{mode}/{binary}.stripped\n')
@@ -1926,8 +2426,6 @@ with open(buildfile, 'w') as f:
                 elif src.endswith('.rl'):
                     hh = '$builddir/' + mode + '/gen/' + src.replace('.rl', '.hh')
                     ragels[hh] = src
-                elif src.endswith('.thrift'):
-                    thrifts.add(src)
                 elif src.endswith('.g'):
                     antlr3_grammars.add(src)
                 elif src.endswith('.rs'):
@@ -1936,13 +2434,14 @@ with open(buildfile, 'w') as f:
                     rust_headers[hh] = src
                 else:
                     raise Exception('No rule for ' + src)
-        f.write('   libs = $seastar_libs_{}\n'.format(mode))
         f.write(
             'build {mode}-objects: phony {objs}\n'.format(
                 mode=mode,
                 objs=' '.join(compiles)
             )
         )
+
+        headers = find_headers('.', excluded_dirs=['idl', 'build', 'seastar', '.git'])
         f.write(
             'build {mode}-headers: phony {header_objs}\n'.format(
                 mode=mode,
@@ -1951,9 +2450,10 @@ with open(buildfile, 'w') as f:
         )
 
         f.write(
-            'build {mode}-test: test.{mode} {test_executables} $builddir/{mode}/scylla\n'.format(
+            'build {mode}-test: test.{mode} {test_executables} $builddir/{mode}/scylla {wasms}\n'.format(
                 mode=mode,
                 test_executables=' '.join(['$builddir/{}/{}'.format(mode, binary) for binary in sorted(tests)]),
+                wasms=' '.join([f'$builddir/{binary}' for binary in sorted(wasms)]),
             )
         )
         f.write(
@@ -1961,11 +2461,20 @@ with open(buildfile, 'w') as f:
                 mode=mode,
             )
         )
+        compiler_training_artifacts=[]
+        if mode == 'dev':
+            compiler_training_artifacts.append(f'$builddir/{mode}/scylla')
+        elif mode == 'release' or mode == 'debug':
+            compiler_training_artifacts.append(f'$builddir/{mode}/service/storage_proxy.o')
+        f.write(
+            'build {mode}-compiler-training: phony {artifacts}\n'.format(
+                mode=mode,
+                artifacts=str.join(' ', compiler_training_artifacts)
+            )
+        )
 
         gen_dir = '$builddir/{}/gen'.format(mode)
         gen_headers = []
-        for th in thrifts:
-            gen_headers += th.headers('$builddir/{}/gen'.format(mode))
         for g in antlr3_grammars:
             gen_headers += g.headers('$builddir/{}/gen'.format(mode))
         for g in swaggers:
@@ -1976,9 +2485,18 @@ with open(buildfile, 'w') as f:
         gen_headers.append('$builddir/{}/gen/rust/cxx.h'.format(mode))
         gen_headers_dep = ' '.join(gen_headers)
 
+        for hh in rust_headers:
+            src = rust_headers[hh]
+            f.write('build {}: rust_header {}\n'.format(hh, src))
+            cc = hh.replace('.hh', '.cc')
+            f.write('build {}: rust_source {}\n'.format(cc, src))
+            obj = cc.replace('.cc', '.o')
+            compiles[obj] = cc
         for obj in compiles:
             src = compiles[obj]
-            f.write('build {}: cxx.{} {} || {} {}\n'.format(obj, mode, src, seastar_dep, gen_headers_dep))
+            seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
+            abseil_dep = ' '.join(f'$builddir/{mode}/abseil/{lib}' for lib in abseil_libs)
+            f.write(f'build {obj}: cxx.{mode} {src} | {profile_dep} || {seastar_dep} {abseil_dep} {gen_headers_dep}\n')
             if src in modeval['per_src_extra_cxxflags']:
                 f.write('    cxxflags = {seastar_cflags} $cxxflags $cxxflags_{mode} {extra_cxxflags}\n'.format(mode=mode, extra_cxxflags=modeval["per_src_extra_cxxflags"][src], **modeval))
         for swagger in swaggers:
@@ -1987,63 +2505,64 @@ with open(buildfile, 'w') as f:
             obj = swagger.objects(gen_dir)[0]
             src = swagger.source
             f.write('build {} | {} : swagger {} | {}/scripts/seastar-json2code.py\n'.format(hh, cc, src, args.seastar_path))
-            f.write('build {}: cxx.{} {}\n'.format(obj, mode, cc))
+            f.write(f'build {obj}: cxx.{mode} {cc} | {profile_dep}\n')
         for hh in serializers:
             src = serializers[hh]
             f.write('build {}: serializer {} | idl-compiler.py\n'.format(hh, src))
         for hh in ragels:
             src = ragels[hh]
             f.write('build {}: ragel {}\n'.format(hh, src))
-        for hh in rust_headers:
-            src = rust_headers[hh]
-            f.write('build {}: rust_header {}\n'.format(hh, src))
-            cc = hh.replace('.hh', '.cc')
-            f.write('build {}: rust_source {}\n'.format(cc, src))
-            obj = cc.replace('.cc', '.o')
-            f.write('build {}: cxx.{} {} || {}\n'.format(obj, mode, cc, gen_headers_dep))
         f.write('build {}: cxxbridge_header\n'.format('$builddir/{}/gen/rust/cxx.h'.format(mode)))
-        librust = '$builddir/{}/rust-{}/librust_combined'.format(mode, mode)
-        f.write('build {}.a: rust_lib.{} rust/Cargo.lock\n  depfile={}.d\n'.format(librust, mode, librust))
-        for thrift in thrifts:
-            outs = ' '.join(thrift.generated('$builddir/{}/gen'.format(mode)))
-            f.write('build {}: thrift.{} {}\n'.format(outs, mode, thrift.source))
-            for cc in thrift.sources('$builddir/{}/gen'.format(mode)):
-                obj = cc.replace('.cpp', '.o')
-                f.write('build {}: cxx.{} {}\n'.format(obj, mode, cc))
+        if 'parent_mode' not in modes[mode]:
+            librust = '$builddir/{}/rust-{}/librust_combined'.format(mode, mode)
+            f.write('build {}.a: rust_lib.{} rust/Cargo.lock\n  depfile={}.d\n'.format(librust, mode, librust))
         for grammar in antlr3_grammars:
             outs = ' '.join(grammar.generated('$builddir/{}/gen'.format(mode)))
             f.write('build {}: antlr3.{} {}\n  stem = {}\n'.format(outs, mode, grammar.source,
                                                                    grammar.source.rsplit('.', 1)[0]))
             for cc in grammar.sources('$builddir/{}/gen'.format(mode)):
                 obj = cc.replace('.cpp', '.o')
-                f.write('build {}: cxx.{} {} || {}\n'.format(obj, mode, cc, ' '.join(serializers)))
+                f.write(f'build {obj}: cxx.{mode} {cc} | {profile_dep} || {" ".join(serializers)}\n')
+                flags = '-Wno-parentheses-equality'
                 if cc.endswith('Parser.cpp'):
                     # Unoptimized parsers end up using huge amounts of stack space and overflowing their stack
-                    flags = '-O1' if modes[mode]['optimization-level'] in ['0', 'g', 's'] else ''
+                    flags += ' -O1' if modes[mode]['optimization-level'] in ['0', 'g', 's'] else ''
 
-                    if has_sanitize_address_use_after_scope:
+                    if '-DSANITIZE' in modeval['cxxflags'] and has_sanitize_address_use_after_scope:
                         flags += ' -fno-sanitize-address-use-after-scope'
-                    f.write('  obj_cxxflags = %s\n' % flags)
+                f.write('  obj_cxxflags = %s\n' % flags)
         f.write(f'build $builddir/{mode}/gen/empty.cc: gen\n')
         for hh in headers:
-            f.write('build $builddir/{mode}/{hh}.o: checkhh.{mode} {hh} | $builddir/{mode}/gen/empty.cc || {gen_headers_dep}\n'.format(
-                    mode=mode, hh=hh, gen_headers_dep=gen_headers_dep))
+            f.write('build $builddir/{mode}/{hh}.o: checkhh.{mode} {hh} | $builddir/{mode}/gen/empty.cc {profile_dep} || {gen_headers_dep}\n'.format(
+                    mode=mode, hh=hh, gen_headers_dep=gen_headers_dep, profile_dep=profile_dep))
 
-        f.write('build {seastar_dep}: ninja $builddir/{mode}/seastar/build.ninja | always\n'
+        seastar_dep = f'$builddir/{mode}/seastar/libseastar.{seastar_lib_ext}'
+        seastar_testing_dep = f'$builddir/{mode}/seastar/libseastar_testing.{seastar_lib_ext}'
+        f.write('build {seastar_dep}: ninja $builddir/{mode}/seastar/build.ninja | always {profile_dep}\n'
                 .format(**locals()))
         f.write('  pool = submodule_pool\n')
         f.write('  subdir = $builddir/{mode}/seastar\n'.format(**locals()))
         f.write('  target = seastar\n'.format(**locals()))
-        f.write('build {seastar_testing_dep}: ninja $builddir/{mode}/seastar/build.ninja | always\n'
+        f.write('build {seastar_testing_dep}: ninja $builddir/{mode}/seastar/build.ninja | always {profile_dep}\n'
                 .format(**locals()))
         f.write('  pool = submodule_pool\n')
         f.write('  subdir = $builddir/{mode}/seastar\n'.format(**locals()))
         f.write('  target = seastar_testing\n'.format(**locals()))
-        f.write('build $builddir/{mode}/seastar/apps/iotune/iotune: ninja $builddir/{mode}/seastar/build.ninja\n'
+        f.write('  profile_dep = {profile_dep}\n'.format(**locals()))
+
+        for lib in abseil_libs:
+            f.write('build $builddir/{mode}/abseil/{lib}: ninja $builddir/{mode}/abseil/build.ninja | always {profile_dep}\n'.format(**locals()))
+            f.write('  pool = submodule_pool\n')
+            f.write('  subdir = $builddir/{mode}/abseil\n'.format(**locals()))
+            f.write('  target = {lib}\n'.format(**locals()))
+            f.write('  profile_dep = {profile_dep}\n'.format(**locals()))
+
+        f.write('build $builddir/{mode}/seastar/apps/iotune/iotune: ninja $builddir/{mode}/seastar/build.ninja | $builddir/{mode}/seastar/libseastar.{seastar_lib_ext}\n'
                 .format(**locals()))
         f.write('  pool = submodule_pool\n')
         f.write('  subdir = $builddir/{mode}/seastar\n'.format(**locals()))
         f.write('  target = iotune\n'.format(**locals()))
+        f.write('  profile_dep = {profile_dep}\n'.format(**locals()))
         f.write(textwrap.dedent('''\
             build $builddir/{mode}/iotune: copy $builddir/{mode}/seastar/apps/iotune/iotune
             build $builddir/{mode}/iotune.stripped: strip $builddir/{mode}/iotune
@@ -2074,11 +2593,11 @@ with open(buildfile, 'w') as f:
         f.write(f'  mode = {mode}\n')
         f.write(f'build dist-server-{mode}: phony $builddir/dist/{mode}/redhat $builddir/dist/{mode}/debian\n')
         f.write(f'build dist-server-debuginfo-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-debuginfo-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build dist-jmx-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz dist-jmx-rpm dist-jmx-deb\n')
         f.write(f'build dist-tools-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz dist-tools-rpm dist-tools-deb\n')
+        f.write(f'build dist-cqlsh-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz dist-cqlsh-rpm dist-cqlsh-deb\n')
         f.write(f'build dist-python3-{mode}: phony dist-python3-tar dist-python3-rpm dist-python3-deb\n')
         f.write(f'build dist-unified-{mode}: phony $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
-        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz | always\n')
+        f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz: unified $builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz | always\n')
         f.write(f'  mode = {mode}\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
         f.write(f'build $builddir/{mode}/dist/tar/{scylla_product}-unified-{arch}-package-{scylla_version}-{scylla_release}.tar.gz: copy $builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz\n')
@@ -2095,62 +2614,68 @@ with open(buildfile, 'w') as f:
     f.write(
             'build check: phony {}\n'.format(' '.join(['{mode}-check'.format(mode=mode) for mode in default_modes]))
     )
+    f.write(
+            'build wasm: phony {}\n'.format(' '.join([f'$builddir/{binary}' for binary in sorted(wasms)]))
+    )
+    f.write(
+            'build compiler-training: phony {}\n'.format(' '.join(['{mode}-compiler-training'.format(mode=mode) for mode in default_modes]))
+    )
 
     f.write(textwrap.dedent(f'''\
         build dist-unified-tar: phony {' '.join([f'$builddir/{mode}/dist/tar/{scylla_product}-unified-{scylla_version}-{scylla_release}.{arch}.tar.gz' for mode in default_modes])}
         build dist-unified: phony dist-unified-tar
 
-        build dist-server-deb: phony {' '.join(['$builddir/dist/{mode}/debian'.format(mode=mode) for mode in build_modes])}
-        build dist-server-rpm: phony {' '.join(['$builddir/dist/{mode}/redhat'.format(mode=mode) for mode in build_modes])}
+        build dist-server-deb: phony {' '.join(['$builddir/dist/{mode}/debian'.format(mode=mode) for mode in default_modes])}
+        build dist-server-rpm: phony {' '.join(['$builddir/dist/{mode}/redhat'.format(mode=mode) for mode in default_modes])}
         build dist-server-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, arch=arch, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-server-debuginfo: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-debuginfo-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, arch=arch, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-server: phony dist-server-tar dist-server-debuginfo dist-server-rpm dist-server-deb
 
         rule build-submodule-reloc
-          command = cd $reloc_dir && ./reloc/build_reloc.sh --version $$(<../../build/SCYLLA-PRODUCT-FILE)-$$(sed 's/-/~/' <../../build/SCYLLA-VERSION-FILE)-$$(<../../build/SCYLLA-RELEASE-FILE) --nodeps $args
+          command = cd $reloc_dir && ./reloc/build_reloc.sh --version $$(<../../$builddir/SCYLLA-PRODUCT-FILE)-$$(sed 's/-/~/' <../../$builddir/SCYLLA-VERSION-FILE)-$$(<../../$builddir/SCYLLA-RELEASE-FILE) --nodeps $args
         rule build-submodule-rpm
           command = cd $dir && ./reloc/build_rpm.sh --reloc-pkg $artifact
         rule build-submodule-deb
           command = cd $dir && ./reloc/build_deb.sh --reloc-pkg $artifact
 
-        build tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz: build-submodule-reloc | build/SCYLLA-PRODUCT-FILE build/SCYLLA-VERSION-FILE build/SCYLLA-RELEASE-FILE
-          reloc_dir = tools/jmx
-        build dist-jmx-rpm: build-submodule-rpm tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
-          dir = tools/jmx
-          artifact = $builddir/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-jmx-deb: build-submodule-deb tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
-          dir = tools/jmx
-          artifact = $builddir/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build dist-jmx-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
-        build dist-jmx: phony dist-jmx-tar dist-jmx-rpm dist-jmx-deb
-
-        build tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: build-submodule-reloc | build/SCYLLA-PRODUCT-FILE build/SCYLLA-VERSION-FILE build/SCYLLA-RELEASE-FILE
+        build tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
           reloc_dir = tools/java
         build dist-tools-rpm: build-submodule-rpm tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
           dir = tools/java
-          artifact = $builddir/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
+          artifact = build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
         build dist-tools-deb: build-submodule-deb tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
           dir = tools/java
-          artifact = $builddir/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
+          artifact = build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
         build dist-tools-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-tools: phony dist-tools-tar dist-tools-rpm dist-tools-deb
 
-        build tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | build/SCYLLA-PRODUCT-FILE build/SCYLLA-VERSION-FILE build/SCYLLA-RELEASE-FILE
+        build tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
+          reloc_dir = tools/cqlsh
+        build dist-cqlsh-rpm: build-submodule-rpm tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+          dir = tools/cqlsh
+          artifact = build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+        build dist-cqlsh-deb: build-submodule-deb tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+          dir = tools/cqlsh
+          artifact = build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+        build dist-cqlsh-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, scylla_version=scylla_version, scylla_release=scylla_release, arch=arch) for mode in default_modes])}
+        build dist-cqlsh: phony dist-cqlsh-tar dist-cqlsh-rpm dist-cqlsh-deb
+
+        build tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz: build-submodule-reloc | $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE
           reloc_dir = tools/python3
           args = --packages "{python3_dependencies}" --pip-packages "{pip_dependencies}" --pip-symlinks "{pip_symlinks}"
         build dist-python3-rpm: build-submodule-rpm tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
           dir = tools/python3
-          artifact = $builddir/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
+          artifact = build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build dist-python3-deb: build-submodule-deb tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
           dir = tools/python3
-          artifact = $builddir/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
+          artifact = build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build dist-python3-tar: phony {' '.join(['$builddir/{mode}/dist/tar/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz'.format(mode=mode, scylla_product=scylla_product, arch=arch, scylla_version=scylla_version, scylla_release=scylla_release) for mode in default_modes])}
         build dist-python3: phony dist-python3-tar dist-python3-rpm dist-python3-deb
-        build dist-deb: phony dist-server-deb dist-python3-deb dist-jmx-deb dist-tools-deb
-        build dist-rpm: phony dist-server-rpm dist-python3-rpm dist-jmx-rpm dist-tools-rpm
-        build dist-tar: phony dist-unified-tar dist-server-tar dist-python3-tar dist-jmx-tar dist-tools-tar
+        build dist-deb: phony dist-server-deb dist-python3-deb dist-tools-deb dist-cqlsh-deb
+        build dist-rpm: phony dist-server-rpm dist-python3-rpm dist-tools-rpm dist-cqlsh-rpm
+        build dist-tar: phony dist-unified-tar dist-server-tar dist-python3-tar dist-tools-tar dist-cqlsh-tar
 
-        build dist: phony dist-unified dist-server dist-python3 dist-jmx dist-tools
+        build dist: phony dist-unified dist-server dist-python3 dist-tools dist-cqlsh
         '''))
 
     f.write(textwrap.dedent(f'''\
@@ -2165,21 +2690,27 @@ with open(buildfile, 'w') as f:
         build $builddir/{mode}/dist/tar/{scylla_product}-python3-{arch}-package.tar.gz: copy tools/python3/build/{scylla_product}-python3-{scylla_version}-{scylla_release}.{arch}.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
         build $builddir/{mode}/dist/tar/{scylla_product}-tools-package.tar.gz: copy tools/java/build/{scylla_product}-tools-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz: copy tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
-        build $builddir/{mode}/dist/tar/{scylla_product}-jmx-package.tar.gz: copy tools/jmx/build/{scylla_product}-jmx-{scylla_version}-{scylla_release}.noarch.tar.gz
+        build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
+        build $builddir/{mode}/dist/tar/{scylla_product}-cqlsh-package.tar.gz: copy tools/cqlsh/build/{scylla_product}-cqlsh-{scylla_version}-{scylla_release}.{arch}.tar.gz
 
-        build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-tools-{mode} dist-jmx-{mode} dist-unified-{mode}
+        build {mode}-dist: phony dist-server-{mode} dist-server-debuginfo-{mode} dist-python3-{mode} dist-tools-{mode} dist-unified-{mode} dist-cqlsh-{mode}
         build dist-{mode}: phony {mode}-dist
         build dist-check-{mode}: dist-check
           mode = {mode}
             '''))
 
+
+    build_ninja_files=[]
+    for mode in build_modes:
+        build_ninja_files += [f'{outdir}/{mode}/seastar/build.ninja']
+        build_ninja_files += [f'{outdir}/{mode}/abseil/build.ninja']
+
     f.write(textwrap.dedent('''\
         rule configure
-          command = {python} configure.py --out=build.ninja.new $configure_args && mv build.ninja.new build.ninja
+          command = ./configure.py --out={buildfile_final_name}.new --out-final-name={buildfile_final_name} $configure_args && mv {buildfile_final_name}.new {buildfile_final_name}
           generator = 1
           description = CONFIGURE $configure_args
-        build build.ninja {build_ninja_list}: configure | configure.py SCYLLA-VERSION-GEN {args.seastar_path}/CMakeLists.txt
+        build {buildfile_final_name} {build_ninja_list}: configure | configure.py SCYLLA-VERSION-GEN $builddir/SCYLLA-PRODUCT-FILE $builddir/SCYLLA-VERSION-FILE $builddir/SCYLLA-RELEASE-FILE {args.seastar_path}/CMakeLists.txt
         rule cscope
             command = find -name '*.[chS]' -o -name "*.cc" -o -name "*.hh" | cscope -bq -i-
             description = CSCOPE
@@ -2193,7 +2724,7 @@ with open(buildfile, 'w') as f:
             description = List configured modes
         build mode_list: mode_list
         default {modes_list}
-        ''').format(modes_list=' '.join(default_modes), build_ninja_list=' '.join([f'build/{mode}/{dir}/build.ninja' for mode in build_modes for dir in ['seastar']]), **globals()))
+        ''').format(modes_list=' '.join(default_modes), build_ninja_list=" ".join(build_ninja_files), **globals()))
     unit_test_list = set(test for test in build_artifacts if test in set(tests))
     f.write(textwrap.dedent('''\
         rule unit_test_list
@@ -2204,13 +2735,14 @@ with open(buildfile, 'w') as f:
     f.write(textwrap.dedent('''\
         build always: phony
         rule scylla_version_gen
-            command = ./SCYLLA-VERSION-GEN
-        build $builddir/SCYLLA-RELEASE-FILE $builddir/SCYLLA-VERSION-FILE: scylla_version_gen
+            command = ./SCYLLA-VERSION-GEN --output-dir $builddir
+            restat = 1
+        build $builddir/SCYLLA-RELEASE-FILE $builddir/SCYLLA-VERSION-FILE: scylla_version_gen | always
         rule debian_files_gen
-            command = ./dist/debian/debian_files_gen.py
+            command = ./dist/debian/debian_files_gen.py --build-dir $builddir
         build $builddir/debian/debian: debian_files_gen | always
         rule extract_node_exporter
-            command = tar -C build -xvpf {node_exporter_filename} --no-same-owner && rm -rfv build/node_exporter && mv -v build/{node_exporter_dirname} build/node_exporter
+            command = tar -C $builddir -xvpf {node_exporter_filename} --no-same-owner && rm -rfv $builddir/node_exporter && mv -v $builddir/{node_exporter_dirname} $builddir/node_exporter
         build $builddir/node_exporter/node_exporter: extract_node_exporter | always
         build $builddir/node_exporter/node_exporter.stripped: strip $builddir/node_exporter/node_exporter
         build $builddir/node_exporter/node_exporter.debug: phony $builddir/node_exporter/node_exporter.stripped
@@ -2219,34 +2751,156 @@ with open(buildfile, 'w') as f:
         build help: print_help | always
         ''').format(**globals()))
 
-compdb = 'compile_commands.json'
-# per-mode compdbs are built by taking the relevant entries from the
-# output of "ninja -t compdb" and combining them with the CMake-made
-# compdbs for Seastar in the relevant mode.
-#
-# "ninja -t compdb" output has to be filtered because
-# - it contains rules for all selected modes, and several entries for
-#   the same source file usually confuse indexers
-# - it contains lots of irrelevant entries (for linker invocations,
-#   header-only compilations, etc.)
-ensure_tmp_dir_exists()
-with tempfile.NamedTemporaryFile() as ninja_compdb:
-    subprocess.run([ninja, '-f', buildfile, '-t', 'compdb'], stdout=ninja_compdb.file.fileno())
-    ninja_compdb.file.flush()
 
-    # build mode-specific compdbs
-    for mode in selected_modes:
-        mode_out = outdir + '/' + mode
-        submodule_compdbs = [mode_out + '/' + submodule + '/' + compdb for submodule in ['seastar']]
-        with open(mode_out + '/' + compdb, 'w+b') as combined_mode_specific_compdb:
-            subprocess.run(['./scripts/merge-compdb.py', 'build/' + mode,
-                            ninja_compdb.name] + submodule_compdbs, stdout=combined_mode_specific_compdb)
+def create_build_system(args):
+    check_for_minimal_compiler_version(args.cxx)
+    check_for_boost(args.cxx)
+    check_for_lz4(args.cxx, args.user_cflags)
 
-# make sure there is a valid compile_commands.json link in the source root
-if not os.path.exists(compdb):
-    # sort modes by supposed indexing speed
-    for mode in ['dev', 'debug', 'release', 'sanitize']:
-        compdb_target = outdir + '/' + mode + '/' + compdb
-        if os.path.exists(compdb_target):
-            os.symlink(compdb_target, compdb)
+    os.makedirs(outdir, exist_ok=True)
+
+    scylla_product, scylla_version, scylla_release = generate_version(args.date_stamp)
+
+    for mode, mode_config in build_modes.items():
+        extra_cxxflags = ' '.join(get_extra_cxxflags(mode, mode_config, args.cxx, args.debuginfo))
+        mode_config['cxxflags'] += f' {extra_cxxflags}'
+
+        mode_config['per_src_extra_cxxflags']['release.cc'] = ' '.join(get_release_cxxflags(scylla_product, scylla_version, scylla_release))
+
+    prepare_advanced_optimizations(modes=modes, build_modes=build_modes, args=args)
+
+    if not args.dist_only:
+        global user_cflags, libs
+        # args.buildfile builds seastar with the rules of
+        # {outdir}/{mode}/seastar/build.ninja, and
+        # {outdir}/{mode}/seastar/seastar.pc is queried for building flags
+        for mode, mode_config in build_modes.items():
+            configure_seastar(outdir, mode, mode_config)
+            configure_abseil(outdir, mode, mode_config)
+        user_cflags += ' -isystem abseil'
+
+    for mode, mode_config in build_modes.items():
+        mode_config.update(query_seastar_flags(f'{outdir}/{mode}/seastar/seastar.pc',
+                                               mode_config['build_seastar_shared_libs'],
+                                               args.staticcxx))
+
+    ninja = find_ninja()
+    with open(args.buildfile, 'w') as f:
+        arch = platform.machine()
+        write_build_file(f,
+                         arch,
+                         ninja,
+                         scylla_product,
+                         scylla_version,
+                         scylla_release,
+                         args)
+    generate_compdb('compile_commands.json', ninja, args.buildfile, selected_modes)
+
+
+class BuildType(NamedTuple):
+    build_by_default: bool
+    cmake_build_type: str
+
+
+def generate_compdb_for_cmake_build(source_dir, build_dir):
+    # Since Seastar and Scylla are configured as separate projects, their compilation
+    # databases need to be merged into a single database for tooling consumption.
+    compdb = 'compile_commands.json'
+    scylla_compdb_path = os.path.join(build_dir, compdb)
+    seastar_compdb_path = ''
+    # sort build types by supposed indexing speed
+    for build_type in ['Dev', 'Debug', 'RelWithDebInfo', 'Sanitize']:
+        seastar_compdb_path = os.path.join(build_dir, build_type, 'seastar', compdb)
+        if os.path.exists(seastar_compdb_path):
             break
+    assert seastar_compdb_path, "Seasetar's building system is not configured yet."
+    # if the file exists, just overwrite it so we can keep it updated
+    with open(os.path.join(source_dir, compdb), 'w+b') as merged_compdb:
+        # "merge-compdb.py" considers all object files under the "--prefix"
+        # directory as relevant. Since CMake generates .o files in
+        # "CMakeFiles" directories, we preserve the compilation rules for
+        # these generated files.
+        prefix = ""
+        subprocess.run([os.path.join(source_dir, 'scripts/merge-compdb.py'),
+                        prefix,
+                        scylla_compdb_path,
+                        seastar_compdb_path],
+                       stdout=merged_compdb,
+                       check=True)
+
+
+def configure_using_cmake(args):
+    # all supported build modes, and if they are built by default if selected
+    build_modes = {'debug': BuildType(True, 'Debug'),
+                   'release': BuildType(True, 'RelWithDebInfo'),
+                   'dev': BuildType(True, 'Dev'),
+                   'sanitize': BuildType(False, 'Sanitize'),
+                   'coverage': BuildType(False, 'Coverage')}
+    default_modes = list(name for name, mode in build_modes.items()
+                         if mode.build_by_default)
+    selected_modes = args.selected_modes or default_modes
+    selected_configs = ';'.join(build_modes[mode].cmake_build_type for mode
+                                in selected_modes)
+    settings = {
+        'CMAKE_CONFIGURATION_TYPES': selected_configs,
+        'CMAKE_CROSS_CONFIGS': selected_configs,
+        'CMAKE_DEFAULT_CONFIGS': selected_configs,
+        'CMAKE_C_COMPILER': args.cc,
+        'CMAKE_CXX_COMPILER': args.cxx,
+        'CMAKE_CXX_FLAGS': args.user_cflags,
+        'CMAKE_EXE_LINKER_FLAGS': semicolon_separated(args.user_ldflags),
+        'CMAKE_EXPORT_COMPILE_COMMANDS': 'ON',
+        'Scylla_CHECK_HEADERS': 'ON',
+        'Scylla_DIST': 'ON' if args.enable_dist in (None, True) else 'OFF',
+        'Scylla_TEST_TIMEOUT': args.test_timeout,
+        'Scylla_TEST_REPEAT': args.test_repeat,
+        'Scylla_ENABLE_LTO': 'ON' if args.lto else 'OFF',
+    }
+    if args.date_stamp:
+        settings['Scylla_DATE_STAMP'] = args.date_stamp
+    if args.staticboost:
+        settings['Boost_USE_STATIC_LIBS'] = 'ON'
+    if args.clang_inline_threshold != -1:
+        settings['Scylla_CLANG_INLINE_THRESHOLD'] = args.clang_inline_threshold
+    if args.cspgo:
+        settings['Scylla_BUILD_INSTRUMENTED'] = "CSIR"
+    elif args.pgo:
+        settings['Scylla_BUILD_INSTRUMENTED'] = "IR"
+    if args.use_profile:
+        settings['Scylla_PROFDATA_FILE'] = args.use_profile
+    elif args.use_profile is None:
+        profile_archive_path = f"pgo/profiles/{platform.machine()}/profile.profdata.xz"
+        if "compressed data" in subprocess.check_output(["file", profile_archive_path], text=True):
+            settings['Scylla_PROFDATA_COMPRESSED_FILE'] = profile_archive_path
+        else:
+            # Avoid breaking existing pipelines without git-lfs installed.
+            print(f"WARNING: {profile_archive_path} is not an archive. Building without a profile.", file=sys.stderr)
+    # scripts/refresh-pgo-profiles.sh does not specify the path to the profile
+    # so we don't define Scylla_PROFDATA_COMPRESSED_FILE, and use the default
+    # value
+
+    source_dir = os.path.realpath(os.path.dirname(__file__))
+    if os.path.isabs(args.build_dir):
+        build_dir = args.build_dir
+    else:
+        build_dir = os.path.join(source_dir, args.build_dir)
+
+    if not args.dist_only:
+        for mode in selected_modes:
+            configure_seastar(build_dir, build_modes[mode].cmake_build_type, modes[mode])
+
+    cmake_command = ['cmake']
+    cmake_command += [f'-D{var}={value}' for var, value in settings.items()]
+    cmake_command += ['-G', 'Ninja Multi-Config',
+                      '-B', build_dir,
+                      '-S', source_dir]
+    subprocess.check_call(cmake_command, shell=False, cwd=source_dir)
+    generate_compdb_for_cmake_build(source_dir, build_dir)
+
+
+if __name__ == '__main__':
+    if args.use_cmake:
+        prepare_advanced_optimizations(modes=modes, build_modes=build_modes, args=args)
+        configure_using_cmake(args)
+    else:
+        create_build_system(args)

@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -12,12 +12,11 @@
 #include <memory>
 
 #include <seastar/core/future.hh>
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/core/stream.hh>
-#include <seastar/core/file.hh>
+#include <seastar/core/simple-stream.hh>
 #include "replay_position.hh"
 #include "commitlog_entry.hh"
 #include "db/timeout_clock.hh"
+#include "gc_clock.hh"
 #include "utils/fragmented_temporary_buffer.hh"
 
 namespace seastar { class file; }
@@ -64,7 +63,7 @@ class extensions;
  * Code should ensure to use discard_completed_segments with UUID +
  * highest rp once a memtable has been flushed. This will allow
  * discarding used segments. Failure to do so will keep stuff
- * indefinately.
+ * indefinitely.
  */
 class commitlog {
 public:
@@ -87,12 +86,14 @@ public:
     struct config {
         config() = default;
         config(const config&) = default;
-        static config from_db_config(const db::config&, size_t shard_available_memory);
+        static config from_db_config(const db::config&, seastar::scheduling_group sg, size_t shard_available_memory);
 
+        seastar::scheduling_group sched_group;
         sstring commit_log_location;
         sstring metrics_category_name;
         uint64_t commitlog_total_space_in_mb = 0;
         std::optional<uint64_t> commitlog_flush_threshold_in_mb = {};
+        std::optional<uint64_t> commitlog_data_max_lifetime_in_seconds = {};
         uint64_t commitlog_segment_size_in_mb = 32;
         uint64_t commitlog_sync_period_in_ms = 10 * 1000; //TODO: verify default!
         // Max number of segments to keep in pre-alloc reserve.
@@ -107,7 +108,8 @@ public:
 
         bool use_o_dsync = false;
         bool warn_about_segments_left_on_disk_after_shutdown = true;
-        bool allow_going_over_size_limit = true;
+        bool allow_going_over_size_limit = false;
+        bool allow_fragmented_entries = false;
 
         // The base segment ID to use.
         // The segment IDs of newly allocated segments will be issued sequentially
@@ -132,12 +134,15 @@ public:
 
         static inline constexpr uint32_t segment_version_1 = 1u;
         static inline constexpr uint32_t segment_version_2 = 2u;
+        static inline constexpr uint32_t segment_version_3 = 3u;
+        static inline constexpr uint32_t segment_version_4 = 4u;
+        static inline constexpr uint32_t current_version = segment_version_4;
 
         descriptor(descriptor&&) noexcept = default;
         descriptor(const descriptor&) = default;
-        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = segment_version_2, sstring = {});
+        descriptor(segment_id_type i, const std::string& fname_prefix, uint32_t v = current_version, sstring = {});
         descriptor(replay_position p, const std::string& fname_prefix = FILENAME_PREFIX);
-        descriptor(const sstring& filename, const std::string& fname_prefix = FILENAME_PREFIX);
+        descriptor(const std::string& filename, const std::string& fname_prefix = FILENAME_PREFIX);
 
         sstring filename() const;
         operator replay_position() const;
@@ -157,6 +162,12 @@ public:
      */
     static future<commitlog> create_commitlog(config);
 
+    /**
+     * Update a running instance with new config options.
+     * Note: only some options (see code part) are actually 
+     * applied once started.
+     */
+    void update_configuration(const config&);
 
     /**
      * Note: To be able to keep impl out of header file,
@@ -169,7 +180,7 @@ public:
      * of data to be written. (See add).
      * Don't write less, absolutely don't write more...
      */
-    using output = fragmented_temporary_buffer::ostream;
+    using output = typename seastar::memory_output_stream<detail::sector_split_iterator>;
     using serializer_func = std::function<void(output&)>;
 
     /**
@@ -184,22 +195,22 @@ public:
     /**
      * Template version of add.
      * Resolves with timed_out_error when timeout is reached.
-     * @param mu an invokable op that generates the serialized data. (Of size bytes)
+     * @param mu an invocable op that generates the serialized data. (Of size bytes)
      */
-    template<typename _MutationOp>
-    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, force_sync sync, _MutationOp&& mu) {
-        return add(id, size, timeout, sync, [mu = std::forward<_MutationOp>(mu)](output& out) {
+    template<typename MutationOp>
+    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, db::timeout_clock::time_point timeout, force_sync sync, MutationOp&& mu) {
+        return add(id, size, timeout, sync, [mu = std::forward<MutationOp>(mu)](output& out) {
             mu(out);
         });
     }
 
     /**
      * Template version of add.
-     * @param mu an invokable op that generates the serialized data. (Of size bytes)
+     * @param mu an invocable op that generates the serialized data. (Of size bytes)
      */
-    template<typename _MutationOp>
-    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, force_sync sync, _MutationOp&& mu) {
-        return add_mutation(id, size, db::timeout_clock::time_point::max(), sync, std::forward<_MutationOp>(mu));
+    template<typename MutationOp>
+    future<rp_handle> add_mutation(const cf_id_type& id, size_t size, force_sync sync, MutationOp&& mu) {
+        return add_mutation(id, size, db::timeout_clock::time_point::max(), sync, std::forward<MutationOp>(mu));
     }
 
     /**
@@ -226,6 +237,20 @@ public:
     void discard_completed_segments(const cf_id_type&, const rp_set&);
 
     void discard_completed_segments(const cf_id_type&);
+
+    /**
+     * Forces active segment switch.
+     * Called from API calls to help tests that need predictable
+     * compaction behaviour.
+    */
+    future<> force_new_active_segment() noexcept;
+
+    /**
+     * Waits for all segment deletes issued up until now to complete.
+     * Segment delete is done when a segment no longer is active or dirty,
+     * thus most often by calls to `discard_completed_segments` above.
+    */
+    future<> wait_for_pending_deletes() noexcept;
 
     /**
      * A 'flush_handler' is invoked when the CL determines that size on disk has
@@ -279,6 +304,7 @@ public:
     future<> delete_segments(std::vector<sstring>) const;
 
     uint64_t get_total_size() const;
+    uint64_t get_buffer_size() const;
     uint64_t get_completed_tasks() const;
     uint64_t get_flush_count() const;
     uint64_t get_pending_tasks() const;
@@ -349,7 +375,17 @@ public:
     future<std::vector<sstring>> list_existing_segments() const;
     future<std::vector<sstring>> list_existing_segments(const sstring& dir) const;
 
-    typedef std::function<future<>(buffer_and_replay_position)> commit_load_reader_func;
+    gc_clock::time_point min_gc_time(const cf_id_type&) const;
+
+    // Return the lowest possible replay position across all existing or future commitlog segments.
+    // In other words, only positions greater or equal to min_position() can
+    // be replayed on the next reboot.
+    replay_position min_position() const;
+
+    // (Re-)set data mix lifetime.
+    void update_max_data_lifetime(std::optional<uint64_t> commitlog_data_max_lifetime_in_seconds);
+
+    using commit_load_reader_func = std::function<future<>(buffer_and_replay_position)>;
 
     class segment_error : public std::exception {};
 
@@ -362,7 +398,7 @@ public:
         uint64_t bytes() const {
             return _bytes;
         }
-        virtual const char* what() const noexcept {
+        const char* what() const noexcept override {
             return _msg.c_str();
         }
     private:
@@ -372,7 +408,7 @@ public:
     class invalid_segment_format : public segment_error {
         static constexpr const char* _msg = "Not a scylla format commitlog file";
     public:
-        virtual const char* what() const noexcept {
+        const char* what() const noexcept override {
             return _msg;
         }
     };
@@ -380,12 +416,33 @@ public:
     class header_checksum_error : public segment_error {
         static constexpr const char* _msg = "Checksum error in file header";
     public:
-        virtual const char* what() const noexcept {
+        const char* what() const noexcept override {
             return _msg;
         }
     };
 
-    static future<> read_log_file(sstring filename, sstring prefix, seastar::io_priority_class read_io_prio_class, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
+    class segment_truncation : public segment_error {
+        std::string _msg;
+        uint64_t _pos;
+    public:
+        segment_truncation(uint64_t);
+
+        uint64_t position() const;
+        const char* what() const noexcept override;
+    };
+
+    class replay_state {
+    public:
+        replay_state();
+        ~replay_state();
+    private:
+        friend class commitlog;
+        class impl;
+        std::unique_ptr<impl> _impl;
+    };
+
+    static future<> read_log_file(sstring filename, sstring prefix, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
+    static future<> read_log_file(const replay_state&, sstring filename, sstring prefix, commit_load_reader_func, position_type = 0, const db::extensions* = nullptr);
 private:
     commitlog(config);
 

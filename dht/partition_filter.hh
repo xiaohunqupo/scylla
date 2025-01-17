@@ -4,13 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include "dht/i_partitioner.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "dht/i_partitioner_fwd.hh"
+#include "dht/token.hh"
 
 namespace dht {
 
@@ -28,6 +28,10 @@ public:
         // While token T is after a range Rn, advance the iterator.
         // iterator will be stopped at a range which either overlaps with T (if T belongs to node),
         // or at a range which is after T (if T doesn't belong to this node).
+        //
+        // As the name "incremental" suggests, the search is expected to
+        // terminate quickly (usually after 0 or 1 iterations) and so linear
+        // search is best.
         while (_it != _sorted_owned_ranges.end() && _it->after(t, dht::token_comparator())) {
             _it++;
         }
@@ -35,7 +39,13 @@ public:
         return _it != _sorted_owned_ranges.end() && _it->contains(t, dht::token_comparator());
     }
 
-    static flat_mutation_reader_v2::filter make_partition_filter(const dht::token_range_vector& sorted_owned_ranges);
+    const dht::token_range* next_owned_range() const noexcept {
+        if (_it == _sorted_owned_ranges.end()) {
+            return nullptr;
+        }
+        return &*_it++;
+    }
+
 };
 
 } // dht

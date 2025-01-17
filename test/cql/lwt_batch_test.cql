@@ -1,3 +1,8 @@
+CREATE KEYSPACE ks
+    WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND
+    tablets = {'enabled': false};
+USE ks;
+
 create table lwt (a int, b int, primary key (a,b));
 -- basic batch: ok
 begin batch
@@ -189,8 +194,8 @@ select * from lwt;
 drop table lwt;
 --
 --
--- condtitions on different list columns and different rows of the same
--- partition, these columns are retreived fine and the appropriate row
+-- conditions on different list columns and different rows of the same
+-- partition, these columns are retrieved fine and the appropriate row
 -- is found when checking the conds
 --
 -- correct read command: statement 1 condition is on column a and list update
@@ -264,3 +269,7 @@ BEGIN BATCH
     UPDATE gh7113 SET int1 = 4, int2 = 8 WHERE part = 0 AND key = 9 IF lwt_trivial = null
     UPDATE gh7113 SET int1 = 0, int2 = 9 WHERE part = 0 AND key = 0 IF lwt_trivial = null
 APPLY BATCH;
+DROP TABLE gh7113;
+
+-- cleanup
+DROP KEYSPACE ks;

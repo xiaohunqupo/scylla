@@ -5,13 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <unordered_map>
 #include <optional>
 #include <seastar/core/sharded.hh>
 #include "bytes.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
@@ -41,13 +41,12 @@ class metadata;
 
 class untyped_result_set_row {
 public:
-    using view_type = query::result_bytes_view;
+    using view_type = managed_bytes_view;
     using opt_view_type = std::optional<view_type>;
-    using view_holder = std::variant<std::monostate, view_type, bytes>;
 private:
     friend class untyped_result_set;
     using index_map = std::unordered_map<std::string_view, size_t>;
-    using data_views = std::vector<view_holder>;
+    using data_views = std::vector<managed_bytes_opt>;
 
     const index_map& _name_to_index;
     const cql3::metadata& _metadata;
@@ -62,7 +61,7 @@ public:
     bool has(std::string_view) const;
     view_type get_view(std::string_view name) const;
     bytes get_blob(std::string_view name) const {
-        return get_view(name).linearize();
+        return to_bytes(get_view(name));
     }
     managed_bytes get_blob_fragmented(std::string_view name) const {
         return managed_bytes(get_view(name));
@@ -150,6 +149,8 @@ public:
 
 class result_set;
 
+/// A tabular result. Unlike result_set, untyped_result_set is optimized for safety
+/// and convenience, not performance.
 class untyped_result_set {
 public:
     using row = untyped_result_set_row;

@@ -9,10 +9,10 @@
 -- 
 -- Modified by ScyllaDB
 -- 
--- SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+-- SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
 
 -- setup
-CREATE KEYSPACE k WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+CREATE KEYSPACE k WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1};
 USE k;
 
 -- testBatch

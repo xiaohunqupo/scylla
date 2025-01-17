@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <lz4.h>
@@ -11,6 +11,7 @@
 #include <snappy-c.h>
 
 #include "compress.hh"
+#include "exceptions/exceptions.hh"
 #include "utils/class_registrator.hh"
 
 const sstring compressor::namespace_prefix = "org.apache.cassandra.io.compress.";
@@ -147,6 +148,12 @@ void compression_parameters::validate() {
             throw exceptions::configuration_exception(
                 fmt::format("{}/{} must be a power of 2.", CHUNK_LENGTH_KB, CHUNK_LENGTH_KB_ERR));
         }
+        // Excessive _chunk_length is pointless and can lead to allocation
+        // failures (see issue #9933)
+        if (chunk_length > 128 * 1024) {
+            throw exceptions::configuration_exception(
+                fmt::format("{}/{} must be 128 or less.", CHUNK_LENGTH_KB, CHUNK_LENGTH_KB_ERR));
+        }
     }
     if (_crc_check_chance && (_crc_check_chance.value() < 0.0 || _crc_check_chance.value() > 1.0)) {
         throw exceptions::configuration_exception(sstring(CRC_CHECK_CHANCE) + " must be between 0.0 and 1.0.");
@@ -173,10 +180,6 @@ bool compression_parameters::operator==(const compression_parameters& other) con
     return _compressor == other._compressor
            && _chunk_length == other._chunk_length
            && _crc_check_chance == other._crc_check_chance;
-}
-
-bool compression_parameters::operator!=(const compression_parameters& other) const {
-    return !(*this == other);
 }
 
 void compression_parameters::validate_options(const std::map<sstring, sstring>& options) {
@@ -234,11 +237,7 @@ size_t lz4_processor::compress(const char* input, size_t input_len,
     output[1] = (input_len >> 8) & 0xFF;
     output[2] = (input_len >> 16) & 0xFF;
     output[3] = (input_len >> 24) & 0xFF;
-#ifdef HAVE_LZ4_COMPRESS_DEFAULT
     auto ret = LZ4_compress_default(input, output + 4, input_len, LZ4_compressBound(input_len));
-#else
-    auto ret = LZ4_compress(input, output + 4, input_len);
-#endif
     if (ret == 0) {
         throw std::runtime_error("LZ4 compression failure: LZ4_compress() failed");
     }

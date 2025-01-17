@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <algorithm>
 #include <iterator>
@@ -15,6 +15,20 @@
 #include "result_set.hh"
 #include "cql3/column_identifier.hh"
 #include "transport/messages/result_message.hh"
+
+struct missing_column : public std::bad_variant_access {
+private:
+    sstring _msg;
+public:
+    missing_column(std::string_view column_name)
+            : bad_variant_access()
+            , _msg(seastar::format("missing column: {}", column_name))
+    {}
+
+    const char* what() const noexcept override {
+        return _msg.c_str();
+    }
+};
 
 cql3::untyped_result_set_row::untyped_result_set_row(const index_map& index, const cql3::metadata& metadata, data_views data)
     : _name_to_index(index)
@@ -30,17 +44,17 @@ size_t cql3::untyped_result_set_row::index(const std::string_view& name) const {
 bool cql3::untyped_result_set_row::has(std::string_view name) const {
     auto i = index(name);
     if (i < _data.size()) {
-        return !std::holds_alternative<std::monostate>(_data.at(i));
+        return _data.at(i).has_value();
     }
     return false;
 }
 
 cql3::untyped_result_set_row::view_type cql3::untyped_result_set_row::get_view(std::string_view name) const {
-    return std::visit(make_visitor(
-        [](std::monostate) -> view_type { throw std::bad_variant_access(); },
-        [](const view_type& v) -> view_type { return v; },
-        [](const bytes& b) -> view_type { return view_type(b); }
-    ), _data.at(index(name)));
+    auto& data = _data.at(index(name));
+    if (!data) {
+        throw missing_column(name);
+    }
+    return *data;
 }
 
 const std::vector<lw_shared_ptr<cql3::column_specification>>& cql3::untyped_result_set_row::get_columns() const {
@@ -74,12 +88,12 @@ struct cql3::untyped_result_set::visitor {
     void start_row() {
         tmp.reserve(index.size());
     }
-    void accept_value(std::optional<query::result_bytes_view>&& v) {
+    void accept_value(managed_bytes_view_opt&& v) {
         if (v) {
-            tmp.emplace_back(std::move(*v));
+            tmp.emplace_back(*v);
         } else {
-            tmp.emplace_back(std::monostate{});
-        } 
+            tmp.emplace_back(std::nullopt);
+        }
     }
     // somewhat weird dispatch, but when visiting directly via
     // result_generator, pk:s will be temporary - and sent 

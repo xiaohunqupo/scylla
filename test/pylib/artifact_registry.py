@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 from typing import Protocol
 from typing import Callable, Coroutine, List, Dict, Optional
@@ -23,7 +23,7 @@ class ArtifactRegistry:
     resources and artifacts, such as open ports, directories with temporary
     files or running auxiliary processes. Contains a map of all glboal
     resources, and as soon as the resource is taken by the test it is
-    reprsented in the artifact registry. """
+    represented in the artifact registry. """
 
     def __init__(self) -> None:
         self.suite_artifacts: Dict[Suite, List[Artifact]] = {}

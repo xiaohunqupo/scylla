@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -83,7 +83,7 @@ public:
 
         position_in_partition::tri_compare cmp(_schema);
         std::optional<range_tombstone> prev;
-        const bool allow_eq = end_of_range || upper_bound.is_after_all_clustered_rows(_schema);
+        const bool allow_eq = upper_bound.is_after_all_clustered_rows(_schema);
         const auto should_flush = [&] (position_in_partition_view pos) {
             const auto res = cmp(pos, upper_bound);
             if (allow_eq) {

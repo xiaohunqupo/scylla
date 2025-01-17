@@ -3,16 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <map>
-#include <memory>
-#include <iosfwd>
+#include <fmt/core.h>
 #include "replica/database_fwd.hh"
-#include "dht/i_partitioner.hh"
+#include "dht/decorated_key.hh"
+#include "dht/ring_position.hh"
 #include "schema/schema_fwd.hh"
 #include "encoding_stats.hh"
 #include "dirty_memory_manager.hh"
@@ -20,7 +19,6 @@
 #include "db/commitlog/rp_set.hh"
 #include "utils/extremum_tracking.hh"
 #include "mutation/mutation_cleaner.hh"
-#include "sstables/types.hh"
 #include "utils/double-decker.hh"
 #include "readers/empty_v2.hh"
 #include "readers/mutation_source.hh"
@@ -33,7 +31,6 @@ namespace bi = boost::intrusive;
 namespace replica {
 
 class memtable_entry {
-    schema_ptr _schema;
     dht::decorated_key _key;
     partition_entry _pe;
     struct {
@@ -52,9 +49,8 @@ public:
     friend class memtable;
 
     memtable_entry(schema_ptr s, dht::decorated_key key, mutation_partition p)
-        : _schema(std::move(s))
-        , _key(std::move(key))
-        , _pe(*_schema, std::move(p))
+        : _key(std::move(key))
+        , _pe(*s, std::move(p))
     { }
 
     memtable_entry(memtable_entry&& o) noexcept;
@@ -65,13 +61,12 @@ public:
     dht::decorated_key& key() { return _key; }
     const partition_entry& partition() const { return _pe; }
     partition_entry& partition() { return _pe; }
-    const schema_ptr& schema() const { return _schema; }
-    schema_ptr& schema() { return _schema; }
+    const schema_ptr& schema() const { return _pe.get_schema(); }
     partition_snapshot_ptr snapshot(memtable& mtbl);
 
     // Makes the entry conform to given schema.
     // Must be called under allocating section of the region which owns the entry.
-    void upgrade_schema(const schema_ptr&, mutation_cleaner&);
+    void upgrade_schema(logalloc::region&, const schema_ptr&, mutation_cleaner&);
 
     size_t external_memory_usage_without_rows() const {
         return _key.key().external_memory_usage();
@@ -86,18 +81,23 @@ public:
     size_t size_in_allocator(allocation_strategy& allocator) {
         auto size = size_in_allocator_without_rows(allocator);
         for (auto&& v : _pe.versions()) {
-            size += v.size_in_allocator(*_schema, allocator);
+            size += v.size_in_allocator(allocator);
         }
         return size;
     }
 
     friend dht::ring_position_view ring_position_view_to_compare(const memtable_entry& mt) { return mt._key; }
-    friend std::ostream& operator<<(std::ostream&, const memtable_entry&);
 };
 
 }
 
 namespace replica {
+
+// Statistics that need to be shared across all memtables for a single table
+struct memtable_table_shared_data {
+    logalloc::allocating_section read_section;
+    logalloc::allocating_section allocating_section;
+};
 
 class dirty_memory_manager;
 
@@ -114,8 +114,7 @@ private:
     mutation_cleaner _cleaner;
     memtable_list *_memtable_list;
     schema_ptr _schema;
-    logalloc::allocating_section _read_section;
-    logalloc::allocating_section _allocating_section;
+    memtable_table_shared_data& _table_shared_data;
     partitions_type partitions;
     size_t nr_partitions = 0;
     db::replay_position _replay_position;
@@ -134,8 +133,23 @@ private:
     class memtable_encoding_stats_collector : public encoding_stats_collector {
     private:
         min_max_tracker<api::timestamp_type> min_max_timestamp;
+        min_tracker<api::timestamp_type> min_live_timestamp;
+        min_tracker<api::timestamp_type> min_live_row_marker_timestamp;
 
-        void update_timestamp(api::timestamp_type ts) noexcept;
+        void update_timestamp(api::timestamp_type ts, is_live is_live) noexcept {
+            if (ts == api::missing_timestamp) {
+                return;
+            }
+            encoding_stats_collector::update_timestamp(ts);
+            min_max_timestamp.update(ts);
+            if (is_live) {
+                min_live_timestamp.update(ts);
+            }
+        }
+
+        void update_live_row_marker_timestamp(api::timestamp_type ts) noexcept {
+            min_live_row_marker_timestamp.update(ts);
+        }
 
     public:
         memtable_encoding_stats_collector() noexcept;
@@ -156,6 +170,14 @@ private:
         api::timestamp_type get_max_timestamp() const noexcept {
             return min_max_timestamp.max();
         }
+
+        api::timestamp_type get_min_live_timestamp() const noexcept {
+            return min_live_timestamp.get();
+        }
+
+        api::timestamp_type get_min_live_row_marker_timestamp() const noexcept {
+            return min_live_row_marker_timestamp.get();
+        }
     } _stats_collector;
 
     void update(db::rp_handle&&);
@@ -165,7 +187,7 @@ private:
     friend class flush_memory_accounter;
     friend class partition_snapshot_read_accounter;
 private:
-    boost::iterator_range<partitions_type::const_iterator> slice(const dht::partition_range& r) const;
+    std::ranges::subrange<partitions_type::const_iterator> slice(const dht::partition_range& r) const;
     partition_entry& find_or_create_partition(const dht::decorated_key& key);
     partition_entry& find_or_create_partition_slow(partition_key_view key);
     void upgrade_entry(memtable_entry&);
@@ -174,7 +196,9 @@ private:
     void clear() noexcept;
     uint64_t dirty_size() const;
 public:
-    explicit memtable(schema_ptr schema, dirty_memory_manager&, replica::table_stats& table_stats, memtable_list *memtable_list = nullptr,
+    explicit memtable(schema_ptr schema, dirty_memory_manager&,
+            memtable_table_shared_data& shared_data,
+            replica::table_stats& table_stats, memtable_list *memtable_list = nullptr,
             seastar::scheduling_group compaction_scheduling_group = seastar::current_scheduling_group());
     // Used for testing that want to control the flush process.
     explicit memtable(schema_ptr schema);
@@ -216,9 +240,19 @@ public:
         return _stats_collector.get_max_timestamp();
     }
 
+    api::timestamp_type get_min_live_timestamp() const noexcept {
+        return _stats_collector.get_min_live_timestamp();
+    }
+
+    api::timestamp_type get_min_live_row_marker_timestamp() const noexcept {
+        return _stats_collector.get_min_live_row_marker_timestamp();
+    }
+
     mutation_cleaner& cleaner() noexcept {
         return _cleaner;
     }
+
+    bool contains_partition(const dht::decorated_key& key) const;
 public:
     memtable_list* get_memtable_list() noexcept {
         return _memtable_list;
@@ -235,38 +269,36 @@ public:
     // The 'range' parameter must be live as long as the reader is being used
     //
     // Mutations returned by the reader will all have given schema.
-    flat_mutation_reader_v2 make_flat_reader(schema_ptr s,
+    mutation_reader make_flat_reader(schema_ptr s,
                                              reader_permit permit,
                                              const dht::partition_range& range,
                                              const query::partition_slice& slice,
-                                             const io_priority_class& pc = default_priority_class(),
                                              tracing::trace_state_ptr trace_state_ptr = nullptr,
                                              streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                              mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) {
-        if (auto reader_opt = make_flat_reader_opt(s, permit, range, slice, pc, std::move(trace_state_ptr), fwd, fwd_mr)) {
+        if (auto reader_opt = make_flat_reader_opt(s, permit, range, slice, std::move(trace_state_ptr), fwd, fwd_mr)) {
             return std::move(*reader_opt);
         }
         [[unlikely]] return make_empty_flat_reader_v2(std::move(s), std::move(permit));
     }
     // Same as make_flat_reader, but returns an empty optional instead of a no-op reader when there is nothing to
     // read. This is an optimization.
-    flat_mutation_reader_v2_opt make_flat_reader_opt(schema_ptr,
+    mutation_reader_opt make_flat_reader_opt(schema_ptr query_schema,
                                           reader_permit permit,
                                           const dht::partition_range& range,
                                           const query::partition_slice& slice,
-                                          const io_priority_class& pc = default_priority_class(),
                                           tracing::trace_state_ptr trace_state_ptr = nullptr,
                                           streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
                                           mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes);
 
-    flat_mutation_reader_v2 make_flat_reader(schema_ptr s,
+    mutation_reader make_flat_reader(schema_ptr s,
                                              reader_permit permit,
                                              const dht::partition_range& range = query::full_partition_range) {
         auto& full_slice = s->full_slice();
         return make_flat_reader(s, std::move(permit), range, full_slice);
     }
 
-    flat_mutation_reader_v2 make_flush_reader(schema_ptr, reader_permit permit, const io_priority_class& pc);
+    mutation_reader make_flush_reader(schema_ptr, reader_permit permit);
 
     mutation_source as_data_source();
 
@@ -294,7 +326,17 @@ public:
         return _dirty_mgr;
     }
 
-    friend std::ostream& operator<<(std::ostream&, memtable&);
+    friend fmt::formatter<memtable>;
 };
 
 }
+
+template <> struct fmt::formatter<replica::memtable_entry> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const replica::memtable_entry&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<replica::memtable> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(replica::memtable&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

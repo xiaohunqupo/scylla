@@ -42,7 +42,7 @@ namespace cdc {
         uint8_t sharding_ignore_msb;
     };
     class topology_description {
-        std::vector<token_range_description> _entries;
+        utils::chunked_vector<token_range_description> _entries;
 public:
         ... methods ...
     };
@@ -105,9 +105,11 @@ Shard-colocation is an optimization.
 
 ### Generation switching
 
-Having different generations operating at different points in time is necessary to maintain colocation in presence of topology changes. When a new node joins the cluster it modifies the token ring by refining existing vnodes into smaller vnodes. But before it does it, it will introduce a new CDC generation whose token ranges refine those new (smaller) vnodes (which means they also refine the old vnodes; that way writes will be colocated on both old and new replicas).
+Having different generations operating at different points in time is necessary to maintain colocation in presence of topology changes. When a new node joins the cluster we modify the token ring by refining existing vnodes into smaller vnodes. But before we do it, we introduce a new CDC generation whose token ranges refine those new (smaller) vnodes (which means they also refine the old vnodes; that way writes will be colocated on both old and new replicas).
 
-The joining node learns about the current vnodes, chooses tokens which will split them into smaller vnodes and creates a new `cdc::topology_description` which refines those smaller vnodes. This is done in the `cdc::topology_description_generator` class. It then inserts the generation description into an internal distributed table `cdc_generation_descriptions_v2` in the `system_distributed_everywhere` keyspace. The table is defined as follows:
+#### Gossiper-based topology changes
+
+The joining node learns about the current vnodes, chooses tokens which will split them into smaller vnodes and creates a new `cdc::topology_description` which refines those smaller vnodes. This is done in the `cdc::make_new_generation_description` function It then inserts the generation description into an internal distributed table `cdc_generation_descriptions_v2` in the `system_distributed_everywhere` keyspace. The table is defined as follows:
 ```
 CREATE TABLE system_distributed_everywhere.cdc_generation_descriptions_v2 (
     id uuid,
@@ -124,11 +126,9 @@ Note that constructing the `cdc::topology_description` (which describes the gene
 
 The table lies in the `system_distributed_everywhere` keyspace which is replicated using the `Everywhere` strategy, meaning that the generation data is replicated by every node. The insert is performed using `CL=ALL`, allowing nodes to read the data locally later using `CL=ONE`.
 
-The timestamp for the new generation is chosen after the data is inserted to the table. To choose the timestamp, the node takes its local time and adds a minute or two so that other nodes have a chance to learn about this generation before it starts operating. Thus, the node makes the following assumptions:
+The timestamp for the new generation is chosen after the data is inserted to the table. To choose the timestamp, the node takes its local time and adds `2 * ring_delay` (a minute by default) so that other nodes have a chance to learn about this generation before it starts operating. Thus, the node makes the following assumptions:
 1. its clock is not too desynchronized with other nodes' clocks,
 2. the cluster is not partitioned.
-
-Future patches will make the solution safe by using a two-phase-commit approach.
 
 The timestamp and the randomly generated UUID together form a "generation ID" which uniquely identifies this generation and can be used to retrieve its data from the table and to learn when it starts operating.
 
@@ -152,15 +152,73 @@ CREATE TABLE system.cdc_local (
 The timestamp and UUID forming the generation ID are kept under the `"cdc_local"` key in the `streams_timestamp` and `uuid` columns, respectively.
 
 When other nodes learn about the generation, they'll extract it from the `cdc_generation_descriptions_v2` table and insert it into their set of known CDC generations using `cdc::metadata::insert(db_clock::time_point, topology_description&&)`.
-Notice that nodes learn about the generation together with the new node's tokens. When they learn about its tokens they'll immediately start sending writes to the new node (in the case of bootstrapping, it will become a pending replica). But the old generation will still be operating for a minute or two. Thus colocation will be lost for a while. This problem will be fixed when the two-phase-commit approach is implemented.
+Notice that nodes learn about the generation together with the new node's tokens. When they learn about its tokens they'll immediately start sending writes to the new node (in the case of bootstrapping, it will become a pending replica). But the old generation will still be operating for `~ 2 * ring_delay`; during this short period of time we don't have complete colocation of CDC log writes with base writes (one replica may be different).
 
 We're not able to prevent a node learning about a new generation too late due to a network partition: if gossip doesn't reach the node in time, some writes might be sent to the wrong (old) generation.
 However, it could happen that a node learns about the generation from gossip in time, but then won't be able to extract it from `cdc_generation_descriptions_v2`. In that case we can still maintain consistency: the node will remember that there is a new generation even though it doesn't yet know what it is (it knows only the ID, in particular it knows the timestamp) using the `cdc::metadata::prepare(db_clock::time_point)` method, and then _reject_ writes for CDC-enabled tables that are supposed to use this new generation. The node will keep trying to read the generation's data in background until it succeeds or sees that it's not necessary anymore (e.g. because the generation was already superseded by a new generation).
 Thus we give up availability for safety. This likely won't happen if the administrator ensures that the cluster is not partitioned before bootstrapping a new node. This problem will also be mitigated with a future patch.
 
-Due to the need of maintaining colocation we don't allow the client to send writes with arbitrary timestamps.
-Suppose that a write is requested and the write coordinator's local clock has time `C` and the generation operating at time `C` has timestamp `T` (`T <= C`). Then we only allow the write if its timestamp is in the interval [`T`, `C + generation_leeway`), where `generation_leeway` is a small time-inteval constant (e.g. 5 seconds).
-Reason: we cannot allow writes before `T`, because they belong to the old generation whose token ranges might no longer refine the current vnodes, so the corresponding log write would not necessarily be colocated with the base write. We also cannot allow writes too far "into the future" because we don't know what generation will be operating at that time (the node which will introduce this generation might not have joined yet). But, as mentioned before, we assume that we'll learn about the next generation in time. Again --- the need for this assumption will be gone in a future patch.
+#### Raft group 0 based topology changes (WIP)
+
+When a node requests the cluster to join, the topology coordinator chooses tokens for the new node. This splits vnodes in the token ring into smaller vnodes. The coordinator then creates a new `cdc::topology_description` which refines those smaller vnodes. This is node using the `cdc::make_new_generation_description` function.
+
+The generation data described by `cdc::topology_description` is then translated into mutations and committed to group 0 using Raft commands. When a node applies these commands (every node in the cluster eventually does that, being a member of group 0), it writes the data into a local table `system.cdc_generations_v3`. The table has the following schema:
+```
+CREATE TABLE system.cdc_generations_v3 (
+    key text,
+    id timeuuid,
+    range_end bigint,
+    ignore_msb tinyint,
+    streams frozen<set<blob>>,
+    PRIMARY KEY (key, id, range_end)
+) ...
+```
+
+The table is single-partition where `key` always equals "cdc_generations". The time UUID used to insert a new generation into this table is generated by the coordinator.
+
+The committed commands also update the `system.topology` table, storing the time UUID in the `new_cdc_generation_data_uuid` column in the row which describes the joining node. Thanks to this, if the coordinator manages to insert the data but then fails, the next coordinator can resume from where the previous coordinator left off - using `new_cdc_generation_data_uuid` to continue with the generation switch.
+
+Note that the `cdc::topology_description` contains the stream IDs of the generation and describes the generation's mapping, so constructing and inserting it into this table does not require knowing the generation's timestamp.
+
+The coordinator then performs a global barrier, ensuring that every node managed to store the data locally before proceeding.
+
+Once the barrier finishes, the coordinator picks a timestamp for the new generation. To choose the timestamp, it takes its local time and adds `2 * ring_delay` (a minute by default) so that other nodes have a chance to learn about this timestamp before the generation starts operating (i.e. before their clocks cross the timestamp). Thus we make the following assumptions:
+1. its clock is not too desynchronized with other nodes' clocks,
+2. the cluster is not partitioned.
+
+FIXME: consider implementing a safe algorithm (using separate 'prepare' phase before committing the new generation timestamp).
+
+The timestamp and the randomly generated UUID together form a "generation ID" which uniquely identifies this generation and can be used to retrieve its data from the table and to learn when it starts operating.
+
+The coordinator commits the generation ID with a group 0 command which appends the new generation ID to the static column `committed_cdc_generations` in the `system.topology` table. Each node, when applying this command, learns about the new CDC generation ID (the `storage_service::topology_state_load` function calls `cdc::generation_service::handle_cdc_generation`), retrieves the generation data from `system.cdc_generations_v3` using the UUID key, and inserts it into its in-memory set of known CDC generations using `cdc::metadata::insert(...)`.
+
+Nodes learn about the new generation together with the new node's tokens. When they learn about its tokens, they immediately start sending writes to the new node (it becomes a pending replica). But the old generation will still be operating for `~ 2 * ring_delay`; during this short period of time we don't have complete colocation of CDC log writes with base writes (one replica may be different).
+
+We're not able to prevent a node learning about a new generation too late due to a network partition: if the timestamp is not replicated to some node in time, some writes might be sent to the wrong (old) generation. (See FIXME above.)
+
+After committing the generation ID, the topology coordinator publishes the generation data to user-facing description tables (`system_distributed.cdc_streams_descriptions_v2` and `system_distributed.cdc_generation_timestamps`).
+
+#### Generation switching: accepting writes
+
+Due to the need of maintaining colocation we don't allow the client to send writes with arbitrary timestamps. We allow:
+- writes to the current and next generations unless they are too far into the future,
+- writes to the previous generations unless they are too far into the past.
+
+##### Writes to the current and next generations
+
+Suppose that a write with timestamp `W` is requested and the write coordinator's local clock has time `C` and the generation operating at time `C` has timestamp `T` (`T <= C`) such that `T <= W`. Then we only allow the write if `W < C + generation_leeway`, where `generation_leeway` is a small time-interval constant (e.g. 5 seconds).
+
+We cannot allow writes too far "into the future" because we don't know what generation will be operating at that time (the node which will introduce this generation might not have joined yet). But, as mentioned before, we assume that we'll learn about the next generation in time. Again --- the need for this assumption will be gone in a future patch.
+
+##### Writes to the previous generations
+
+This time suppose that `T > W`. Then we only allow the write if `W > C - generation_leeway` and there was a generation operating at `W`.
+
+We allow writes to previous generations to improve user experience. If a client generates timestamps by itself and clocks are not perfectly synchronized, there may be short periods of time around the moment of switching generations when client's writes are rejected because they fall into one of the previous generations. Usually, this problem is easy to overcome by the client. It can simply repeat a write a few times, but using a higher timestamp. Unfortunately, if a table additionally uses LWT, the client cannot increase the timestamp because LWT makes timestamps permanent. Once Paxos commits an entry with a given timestamp, Scylla will keep trying to apply that entry until it succeeds, with the same timestamp. Applying the entry involves doing a CDC log table write. If it fails, we are stuck. Allowing writes to the previous generations is also a probabilistic fix for this bug.
+
+Note that writing only to the previous generation might not be enough. With the Raft-based topology and tablets, we can add multiple nodes almost instantly. Then, we can have multiple generations with almost identical timestamps.
+
+We allow writes only to the recent past to reduce the number of generations that must be stored in memory.
 
 ### Streams description tables
 
@@ -175,7 +233,7 @@ The `cdc_streams_descriptions_v2` table in the `system_distributed` keyspace all
                 /* The set of stream identifiers used in this CDC generation for the token range
                  * ending on `range_end`. */
                 .with_column("streams", cdc_streams_set_type)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
 ```
 where
@@ -194,7 +252,7 @@ There is a second table that contains just the generations' timestamps, `cdc_gen
                 .with_column("time", timestamp_type, column_kind::clustering_key)
                 /* Expiration time of this CDC generation (or null if not expired). */
                 .with_column("expired", timestamp_type)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
 ```
 It is a single-partition table, containing the timestamps of generations found in `cdc_streams_descriptions_v2` in separate clustered rows. It allows clients to efficiently query if there are any new generations, e.g.:
@@ -208,6 +266,8 @@ When nodes learn about a CDC generation through gossip, they race to update thes
 Note that the first phase of inserting stream IDs may fail in the middle; in that case, the partition for that generation may contain partial information. Thus a client can only safely read a partition from `cdc_streams_descriptions_v2` (i.e. without the risk of observing only a part of the stream IDs) if they first observe its timestamp in `cdc_generation_timestamps`.
 
 ### Internal generation descriptions table V1 and upgrade procedure
+
+FIXME: update this section once we implement upgrades for group 0 topology coordinator. The coordinator will have to create a new CDC generation when it's first enabled.
 
 As the name suggests, `cdc_generation_descriptions_v2` is the second version of the generation description table. The previous schema was:
 ```
@@ -238,7 +298,7 @@ As the name suggests, `cdc_streams_descriptions_v2` is the second version of the
                 .with_column("streams", cdc_streams_set_type)
                 /* Expiration time of this CDC generation (or null if not expired). */
                 .with_column("expired", timestamp_type)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
 ```
 

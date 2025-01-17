@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include "mutation/mutation.hh"
 #include "schema/schema_fwd.hh"
 #include "mutation/canonical_mutation.hh"
+#include "db/schema_features.hh"
 
 // Commutative representation of table schema
 // Equality ignores tombstones.
@@ -124,11 +125,10 @@ public:
 
     bool is_view() const;
 
-    table_schema_version digest() const;
+    table_schema_version digest(db::schema_features) const;
     std::optional<sstring> partitioner() const;
 
     bool operator==(const schema_mutations&) const;
-    bool operator!=(const schema_mutations&) const;
     schema_mutations& operator+=(schema_mutations&&);
 
     // Returns true iff any mutations contain any live cells
@@ -137,3 +137,6 @@ public:
     friend std::ostream& operator<<(std::ostream&, const schema_mutations&);
 };
 
+template <> struct fmt::formatter<schema_mutations> : fmt::formatter<string_view> {
+    auto format(const schema_mutations&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

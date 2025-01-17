@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -20,7 +20,6 @@ std::unique_ptr<sstable_writer::writer_impl> make_writer(sstable& sst,
     uint64_t estimated_partitions,
     const sstable_writer_config& cfg,
     encoding_stats enc_stats,
-    const io_priority_class& pc,
     shard_id shard);
 
 }

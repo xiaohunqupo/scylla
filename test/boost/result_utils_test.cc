@@ -3,11 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <vector>
-#include <stdexcept>
 #include "utils/exception_container.hh"
 #include "utils/result.hh"
 #include "utils/result_combinators.hh"
@@ -242,7 +241,6 @@ SEASTAR_THREAD_TEST_CASE(test_result_map_reduce) {
         auto foo_exc = [] () { return result<sstring>(bo::failure(foo_exception())); };
         auto bar_exc = [] () { return result<sstring>(bo::failure(bar_exception())); };
         auto foo_throw = [] () { return make_exception_future<result<sstring>>(foo_exception()); };
-        auto bar_throw = [] () { return make_exception_future<result<sstring>>(bar_exception()); };
 
         BOOST_REQUIRE_EQUAL(reduce(sstring("brown"), sstring("fox")).value(), "the brown fox");
         BOOST_REQUIRE_EQUAL(reduce(foo_exc(), sstring("fox")).error(), exc_container(foo_exception()));

@@ -1,11 +1,11 @@
 /*
- * Fast ASCII string validataion.
+ * Fast ASCII string validation.
  *
  * Copyright (c) 2018, Arm Limited.
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "ascii.hh"

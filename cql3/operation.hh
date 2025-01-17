@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
 #include "cql3/cql3_type.hh"
-#include "exceptions/exceptions.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "update_parameters.hh"
 #include "cql3/column_identifier.hh"
@@ -22,10 +21,6 @@
 #include <optional>
 
 namespace cql3 {
-
-namespace statements::broadcast_tables {
-    struct prepared_update;
-}
 
 class update_parameters;
 
@@ -84,11 +79,7 @@ public:
      * @param meta the list of column specification where to collect the
      * bind variables of this term in.
      */
-    virtual void fill_prepare_context(prepare_context& ctx) {
-        if (_e.has_value()) {
-            expr::fill_prepare_context(*_e, ctx);
-        }
-    }
+    virtual void fill_prepare_context(prepare_context& ctx);
 
     /**
      * Execute the operation. Check should_skip_operation() first.
@@ -99,7 +90,7 @@ public:
         return _unset_guard.is_unset(qo);
     }
 
-    virtual void prepare_for_broadcast_tables(statements::broadcast_tables::prepared_update&) const;
+    virtual expr::expression prepare_new_value_for_broadcast_tables() const;
 
     /**
      * A parsed raw UPDATE operation.

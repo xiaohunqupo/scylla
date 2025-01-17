@@ -6,7 +6,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /*
@@ -287,7 +287,7 @@ internal::validate_partial(const uint8_t *data, size_t len) {
             // range |= (tmp1, tmp2) << 3 bytes
             range = vorrq_u8(range, vextq_u8(tmp2, tmp1, 13));
 
-            // Now we have below range indices caluclated
+            // Now we have below range indices calculated
             // Correct cases:
             // - 8 for C0~FF
             // - 3 for 1st byte after F0~FF
@@ -470,7 +470,7 @@ internal::validate_partial(const uint8_t *data, size_t len) {
             // range |= (tmp1, tmp2) << 3 bytes
             range = _mm_or_si128(range, _mm_alignr_epi8(tmp1, tmp2, 13));
 
-            // Now we have below range indices caluclated
+            // Now we have below range indices calculated
             // Correct cases:
             // - 8 for C0~FF
             // - 3 for 1st byte after F0~FF

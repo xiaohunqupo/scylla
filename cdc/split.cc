@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "mutation/mutation.hh"
@@ -15,8 +15,6 @@
 #include "split.hh"
 #include "log.hh"
 #include "change_visitor.hh"
-
-#include <type_traits>
 
 struct atomic_column_update {
     column_id id;
@@ -389,7 +387,7 @@ struct extract_changes_visitor {
     }
 
     void partition_delete(const tombstone& t) {
-        _result[t.timestamp].partition_deletions = {t};
+        _result[t.timestamp].partition_deletions = partition_deletion{t};
     }
 
     constexpr bool finished() const { return false; }
@@ -462,7 +460,7 @@ api::timestamp_type find_timestamp(const mutation& m) {
  * The visitor uses the order in which the mutation is being visited (see the documentation of ChangeVisitor),
  * remembers a bunch of state based on whatever was visited until now (e.g. was there a static row update?
  * Was there a clustered row update? Was there a clustered row delete? Was there a TTL?)
- * and tells the caller to stop on the first occurence of a second timestamp/ttl/type of change.
+ * and tells the caller to stop on the first occurrence of a second timestamp/ttl/type of change.
  */
 struct should_split_visitor {
     bool _had_static_row = false;

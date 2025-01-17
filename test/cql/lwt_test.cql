@@ -1,3 +1,7 @@
+CREATE KEYSPACE ks
+    WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND
+    tablets = {'enabled': false};
+USE ks;
 --
 -- basic: ensure the grammar works
 --
@@ -433,7 +437,7 @@ update lwt set i = 3 where a = 1 if i < 1;
 update lwt set i = 4 where a = 1 if i > 1;
 update lwt set i = 5 where a = 1 if i >= 1;
 update lwt set i = 6 where a = 1 if i <= 1;
--- Compare with another column: cassandra doesnt allow anyting but a
+-- Compare with another column: cassandra doesn't allow anything but a
 -- constant on the right hand side :(
 update lwt set i = 7 where a = 1 if i = t;
 update lwt set i = 7 where a = 1 if i = d;
@@ -826,4 +830,7 @@ insert into t (p, c) values (1,2) if not exists;
 select count(*) from t;
 -- stop this travesty
 drop table t;
+
+-- cleanup
+DROP KEYSPACE ks;
 

@@ -2,7 +2,7 @@
 #
 #  Copyright (C) 2017-present ScyllaDB
 
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # When a CLI tool is not installed, use relocatable CLI tool provided by Scylla
 export PATH=$PATH:/opt/scylladb/bin
@@ -287,7 +287,7 @@ echo "=======" >> $REPORT
 echo "This document first serves as a system review and health check report." >> $REPORT
 echo "It is based on the configuration data (hardware, OS, Scylla SW, etc.) collected from the node." >> $REPORT
 echo "Based on the review and analysis of the collected data, ScyllaDB can recommend on possible" >> $REPORT
-echo "ways to better utilize the cluster, based on both experiance and best practices." >> $REPORT
+echo "ways to better utilize the cluster, based on both experience and best practices." >> $REPORT
 echo "" >> $REPORT
 echo "" >> $REPORT
 

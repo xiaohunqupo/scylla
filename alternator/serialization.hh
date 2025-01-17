@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 #include <optional>
-#include "types.hh"
+#include "types/types.hh"
 #include "schema/schema_fwd.hh"
 #include "keys.hh"
 #include "utils/rjson.hh"
@@ -94,5 +94,12 @@ std::optional<rjson::value> set_diff(const rjson::value& v1, const rjson::value&
 // Returns a null value if one of the arguments is not actually a list.
 rjson::value list_concatenate(const rjson::value& v1, const rjson::value& v2);
 
+namespace internal {
+struct magnitude_and_precision {
+    int magnitude;
+    int precision;
+};
+magnitude_and_precision get_magnitude_and_precision(std::string_view);
+}
 
 }

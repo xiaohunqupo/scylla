@@ -3,25 +3,28 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "db/system_distributed_keyspace.hh"
 
 #include "cql3/untyped_result_set.hh"
 #include "replica/database.hh"
 #include "db/consistency_level_type.hh"
 #include "db/system_keyspace.hh"
+#include "db/config.hh"
 #include "schema/schema_builder.hh"
 #include "timeout_config.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "types/tuple.hh"
 #include "types/set.hh"
 #include "cdc/generation.hh"
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
+#include "gms/feature_service.hh"
+
 #include "service/migration_manager.hh"
-#include "db/config.hh"
 #include "locator/host_id.hh"
 
 #include <seastar/core/seastar.hh>
@@ -29,18 +32,26 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-
-#include <boost/range/adaptor/transformed.hpp>
+#include <seastar/coroutine/parallel_for_each.hh>
 
 #include <optional>
 #include <vector>
-#include <set>
 
 static logging::logger dlogger("system_distributed_keyspace");
 extern logging::logger cdc_log;
 
 namespace db {
+namespace {
+    const auto set_wait_for_sync_to_commitlog = schema_builder::register_static_configurator([](const sstring& ks_name, const sstring& cf_name, schema_static_props& props) {
+        if ((ks_name == system_distributed_keyspace::NAME_EVERYWHERE && cf_name == system_distributed_keyspace::CDC_GENERATIONS_V2) ||
+            (ks_name == system_distributed_keyspace::NAME && cf_name == system_distributed_keyspace::CDC_TOPOLOGY_DESCRIPTION))
+        {
+            props.wait_for_sync_to_commitlog = true;
+        }
+    });
+}
 
+extern thread_local data_type cdc_streams_set_type;
 thread_local data_type cdc_streams_set_type = set_type_impl::get_instance(bytes_type, false);
 
 /* See `token_range_description` struct */
@@ -60,7 +71,7 @@ schema_ptr view_build_status() {
                 .with_column("view_name", utf8_type, column_kind::partition_key)
                 .with_column("host_id", uuid_type, column_kind::clustering_key)
                 .with_column("status", utf8_type)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -97,7 +108,7 @@ schema_ptr cdc_generations_v2() {
                  * For a given generation it's equal to the number of ranges in this generation;
                  * thus, after the generation is fully inserted, it must be equal to the number of rows in the partition. */
                 .with_column("num_ranges", int32_type, column_kind::static_column)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -116,7 +127,7 @@ schema_ptr cdc_desc() {
                 /* The set of stream identifiers used in this CDC generation for the token range
                  * ending on `range_end`. */
                 .with_column("streams", cdc_streams_set_type)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -133,7 +144,7 @@ schema_ptr cdc_timestamps() {
                 .with_column("time", reversed_type_impl::get_instance(timestamp_type), column_kind::clustering_key)
                 /* Expiration time of this CDC generation (or null if not expired). */
                 .with_column("expired", timestamp_type)
-                .with_version(system_keyspace::generate_schema_version(id))
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -144,9 +155,15 @@ static const sstring CDC_TIMESTAMPS_KEY = "timestamps";
 schema_ptr service_levels() {
     static thread_local auto schema = [] {
         auto id = generate_legacy_id(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS);
-        return schema_builder(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS, std::make_optional(id))
+        auto builder = schema_builder(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS, std::make_optional(id))
                 .with_column("service_level", utf8_type, column_kind::partition_key)
-                .with_version(db::system_keyspace::generate_schema_version(id))
+                .with_column("shares", int32_type);
+        if (utils::get_local_injector().is_enabled("service_levels_v1_table_without_shares")) {
+            builder.remove_column("shares");
+        }
+
+        return builder
+                .with_hash_version()
                 .build();
     }();
     return schema;
@@ -179,14 +196,10 @@ static void check_exists(std::string_view ks_name, std::string_view cf_name, con
         // 'upgrade' Scylla from Cassandra work directories (which is an unsupported upgrade path)
         // on which this check does not pass. We don't want the node to crash in these dtests,
         // but throw an error instead. In production clusters we don't crash on `on_internal_error` anyway.
-        auto err = format("expected {}.{} to exist but it doesn't", ks_name, cf_name);
-        dlogger.error(err.c_str());
+        auto err = fmt::format("expected {}.{} to exist but it doesn't", ks_name, cf_name);
+        dlogger.error("{}", err);
         throw std::runtime_error{std::move(err)};
     }
-}
-
-bool system_distributed_keyspace::is_extra_durable(const sstring& cf_name) {
-    return cf_name == CDC_TOPOLOGY_DESCRIPTION || cf_name == CDC_GENERATIONS_V2;
 }
 
 std::vector<schema_ptr> system_distributed_keyspace::all_distributed_tables() {
@@ -203,58 +216,133 @@ system_distributed_keyspace::system_distributed_keyspace(cql3::query_processor& 
         , _sp(sp) {
 }
 
-static thread_local std::pair<std::string_view, data_type> new_columns[] {
-    {"timeout", duration_type},
-    {"workload_type", utf8_type}
+static std::vector<std::pair<std::string_view, data_type>> new_service_levels_columns(bool workload_prioritization_enabled) {
+    std::vector<std::pair<std::string_view, data_type>> new_columns {{"timeout", duration_type}, {"workload_type", utf8_type}};
+    if (workload_prioritization_enabled) {
+        new_columns.push_back({"shares", int32_type});
+    }
+    return new_columns;
 };
 
-static bool has_missing_columns(data_dictionary::database db) noexcept {
-    assert(this_shard_id() == 0);
-    try {
-        auto schema = db.find_schema(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS);
-        for (const auto& col : new_columns) {
-            auto& [col_name, col_type] = col;
-            bytes options_name = to_bytes(col_name.data());
-            if (schema->get_column_definition(options_name)) {
-                continue;
-            }
-            return true;
-        }
-    } catch (...) {
-        dlogger.warn("Failed to update options column in the role attributes table: {}", std::current_exception());
-        return true;
-    }
-
-    return false;
+static schema_ptr get_current_service_levels(data_dictionary::database db) {
+    return db.has_schema(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS)
+            ? db.find_schema(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS)
+            : service_levels();
 }
 
-static future<> add_new_columns_if_missing(replica::database& db, ::service::migration_manager& mm, ::service::group0_guard group0_guard) noexcept {
-    assert(this_shard_id() == 0);
-    try {
-        auto schema = db.find_schema(system_distributed_keyspace::NAME, system_distributed_keyspace::SERVICE_LEVELS);
-        schema_builder b(schema);
-        bool updated = false;
-        for (const auto& col : new_columns) {
-            auto& [col_name, col_type] = col;
-            bytes options_name = to_bytes(col_name.data());
-            if (schema->get_column_definition(options_name)) {
+static schema_ptr get_updated_service_levels(data_dictionary::database db, bool workload_prioritization_enabled) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    auto schema = get_current_service_levels(db);
+    schema_builder b(schema);
+    for (const auto& col : new_service_levels_columns(workload_prioritization_enabled)) {
+        auto& [col_name, col_type] = col;
+        bytes options_name = to_bytes(col_name.data());
+        if (schema->get_column_definition(options_name)) {
+            continue;
+        }
+        b.with_column(options_name, col_type, column_kind::regular_column);
+    }
+    b.with_hash_version();
+    return b.build();
+}
+
+future<> system_distributed_keyspace::create_tables(std::vector<schema_ptr> tables) {
+    if (this_shard_id() != 0) {
+        _started = true;
+        co_return;
+    }
+
+    auto db = _sp.data_dictionary();
+
+    while (true) {
+        // Check if there is any work to do before taking the group 0 guard.
+        bool workload_prioritization_enabled = _sp.features().workload_prioritization;
+        bool keyspaces_setup = db.has_keyspace(NAME) && db.has_keyspace(NAME_EVERYWHERE);
+        bool tables_setup = std::all_of(tables.begin(), tables.end(), [db] (schema_ptr t) { return db.has_schema(t->ks_name(), t->cf_name()); } );
+        bool service_levels_up_to_date = get_current_service_levels(db)->equal_columns(*get_updated_service_levels(db, workload_prioritization_enabled));
+        if (keyspaces_setup && tables_setup && service_levels_up_to_date) {
+            dlogger.info("system_distributed(_everywhere) keyspaces and tables are up-to-date. Not creating");
+            _started = true;
+            co_return;
+        }
+
+        auto group0_guard = co_await _mm.start_group0_operation();
+        auto ts = group0_guard.write_timestamp();
+        std::vector<mutation> mutations;
+        sstring description;
+
+        auto sd_ksm = keyspace_metadata::new_keyspace(
+                NAME,
+                "org.apache.cassandra.locator.SimpleStrategy",
+                {{"replication_factor", "3"}},
+                std::nullopt);
+        if (!db.has_keyspace(NAME)) {
+            mutations = service::prepare_new_keyspace_announcement(db.real_database(), sd_ksm, ts);
+            description += format(" create {} keyspace;", NAME);
+        } else {
+            dlogger.info("{} keyspace is already present. Not creating", NAME);
+        }
+
+        auto sde_ksm = keyspace_metadata::new_keyspace(
+                NAME_EVERYWHERE,
+                "org.apache.cassandra.locator.EverywhereStrategy",
+                {},
+                std::nullopt);
+        if (!db.has_keyspace(NAME_EVERYWHERE)) {
+            auto sde_mutations = service::prepare_new_keyspace_announcement(db.real_database(), sde_ksm, ts);
+            std::move(sde_mutations.begin(), sde_mutations.end(), std::back_inserter(mutations));
+            description += format(" create {} keyspace;", NAME_EVERYWHERE);
+        } else {
+            dlogger.info("{} keyspace is already present. Not creating", NAME_EVERYWHERE);
+        }
+
+        // Get mutations for creating and updating tables.
+        auto num_keyspace_mutations = mutations.size();
+        co_await coroutine::parallel_for_each(ensured_tables(),
+                [this, &mutations, db, ts, sd_ksm, sde_ksm, workload_prioritization_enabled] (auto&& table) -> future<> {
+            auto ksm = table->ks_name() == NAME ? sd_ksm : sde_ksm;
+
+            // Ensure that the service_levels table contains new columns.
+            if (table->cf_name() == SERVICE_LEVELS) {
+                table = get_updated_service_levels(db, workload_prioritization_enabled);
+            }
+
+            if (!db.has_schema(table->ks_name(), table->cf_name())) {
+                co_return co_await service::prepare_new_column_family_announcement(mutations, _sp, *ksm, std::move(table), ts);
+            }
+
+            // The service_levels table exists. Update it if it lacks new columns.
+            if (table->cf_name() == SERVICE_LEVELS && !get_current_service_levels(db)->equal_columns(*table)) {
+                auto update_mutations = co_await service::prepare_column_family_update_announcement(_sp, table, std::vector<view_ptr>(), ts);
+                std::move(update_mutations.begin(), update_mutations.end(), std::back_inserter(mutations));
+            }
+        });
+        if (mutations.size() > num_keyspace_mutations) {
+            description += " create and update system_distributed(_everywhere) tables";
+        } else {
+            dlogger.info("All tables are present and up-to-date on start");
+        }
+
+        if (!mutations.empty()) {
+            try {
+                co_await _mm.announce(std::move(mutations), std::move(group0_guard), description);
+            } catch (service::group0_concurrent_modification&) {
+                dlogger.info("Concurrent operation is detected while starting, retrying.");
                 continue;
             }
-            updated = true;
-            b.with_column(options_name, col_type, column_kind::regular_column);
         }
-        if (updated) {
-            schema_ptr table = b.build();
-            try {
-                auto ts = group0_guard.write_timestamp();
-                co_return co_await mm.announce(co_await mm.prepare_column_family_update_announcement(table, false, std::vector<view_ptr>(), ts),
-                        std::move(group0_guard), "Add new columns to system_distributed.service_levels");
-            } catch (...) {}
-        }
-    } catch (...) {
-        // FIXME: do we really want to allow the node to boot if the table fails to update?
-        // Will this not prevent other components from working correctly?
-        dlogger.warn("Failed to update options column in the role attributes table: {}", std::current_exception());
+
+        _started = true;
+        co_return;
+    }
+}
+
+ future<> system_distributed_keyspace::start_workload_prioritization() {
+    if (this_shard_id() != 0) {
+        co_return;
+    }
+    if (_qp.db().features().workload_prioritization) {
+       co_await create_tables({get_updated_service_levels(_qp.db(), true)});
     }
 }
 
@@ -264,79 +352,7 @@ future<> system_distributed_keyspace::start() {
         co_return;
     }
 
-    // FIXME: fix this code to `announce` once
-
-    if (!_sp.get_db().local().has_keyspace(NAME)) {
-        auto group0_guard = co_await _mm.start_group0_operation();
-        auto ts = group0_guard.write_timestamp();
-
-        try {
-            auto ksm = keyspace_metadata::new_keyspace(
-                    NAME,
-                    "org.apache.cassandra.locator.SimpleStrategy",
-                    {{"replication_factor", "3"}},
-                    true /* durable_writes */);
-            co_await _mm.announce(_mm.prepare_new_keyspace_announcement(ksm, ts), std::move(group0_guard),
-                    "Create system_distributed keyspace");
-        } catch (exceptions::already_exists_exception&) {}
-    } else {
-        dlogger.info("{} keyspase is already present. Not creating", NAME);
-    }
-
-    if (!_sp.get_db().local().has_keyspace(NAME_EVERYWHERE)) {
-        auto group0_guard = co_await _mm.start_group0_operation();
-        auto ts = group0_guard.write_timestamp();
-
-        try {
-            auto ksm = keyspace_metadata::new_keyspace(
-                    NAME_EVERYWHERE,
-                    "org.apache.cassandra.locator.EverywhereStrategy",
-                    {},
-                    true /* durable_writes */);
-            co_await _mm.announce(_mm.prepare_new_keyspace_announcement(ksm, ts), std::move(group0_guard),
-                    "Create system_distributed_everywhere keyspace");
-        } catch (exceptions::already_exists_exception&) {}
-    } else {
-        dlogger.info("{} keyspase is already present. Not creating", NAME_EVERYWHERE);
-    }
-
-    auto tables = ensured_tables();
-    bool exist = std::all_of(tables.begin(), tables.end(), [this] (schema_ptr s) {
-        return _sp.get_db().local().has_schema(s->ks_name(), s->cf_name());
-    });
-
-    if (!exist) {
-        auto group0_guard = co_await _mm.start_group0_operation();
-        auto ts = group0_guard.write_timestamp();
-
-        auto m = co_await map_reduce(tables,
-        /* Mapper */ [this, ts] (auto&& table) -> future<std::vector<mutation>> {
-            try {
-                co_return co_await _mm.prepare_new_column_family_announcement(std::move(table), ts);
-            } catch (exceptions::already_exists_exception&) {
-                co_return std::vector<mutation>();
-            }
-        },
-        /* Initial value*/ std::vector<mutation>(),
-        /* Reducer */ [] (std::vector<mutation> m1, std::vector<mutation> m2) {
-            std::move(m2.begin(), m2.end(), std::back_inserter(m1));
-            return m1;
-        });
-        if (m.size()) {
-            co_await _mm.announce(std::move(m), std::move(group0_guard),
-                    "Create system_distributed(_everywhere) tables");
-        }
-    } else {
-        dlogger.info("All tables are present on start");
-    }
-
-    _started = true;
-    if (has_missing_columns(_qp.db())) {
-        auto group0_guard = co_await _mm.start_group0_operation();
-        co_await add_new_columns_if_missing(_qp.db().real_database(), _mm, std::move(group0_guard));
-    } else {
-        dlogger.info("All schemas are uptodate on start");
-    }
+    co_await create_tables(ensured_tables());
 }
 
 future<> system_distributed_keyspace::stop() {
@@ -352,24 +368,8 @@ static service::query_state& internal_distributed_query_state() {
     return qs;
 };
 
-future<std::unordered_map<locator::host_id, sstring>> system_distributed_keyspace::view_status(sstring ks_name, sstring view_name) const {
-    return _qp.execute_internal(
-            format("SELECT host_id, status FROM {}.{} WHERE keyspace_name = ? AND view_name = ?", NAME, VIEW_BUILD_STATUS),
-            db::consistency_level::ONE,
-            internal_distributed_query_state(),
-            { std::move(ks_name), std::move(view_name) },
-            cql3::query_processor::cache_internal::no).then([] (::shared_ptr<cql3::untyped_result_set> cql_result) {
-        return boost::copy_range<std::unordered_map<locator::host_id, sstring>>(*cql_result
-                | boost::adaptors::transformed([] (const cql3::untyped_result_set::row& row) {
-                    auto host_id = locator::host_id(row.get_as<utils::UUID>("host_id"));
-                    auto status = row.get_as<sstring>("status");
-                    return std::pair(std::move(host_id), std::move(status));
-                }));
-    });
-}
-
 future<> system_distributed_keyspace::start_view_build(sstring ks_name, sstring view_name) const {
-    auto host_id = _sp.local_db().get_config().host_id;
+    auto host_id = _sp.local_db().get_token_metadata().get_my_id();
     return _qp.execute_internal(
             format("INSERT INTO {}.{} (keyspace_name, view_name, host_id, status) VALUES (?, ?, ?, ?)", NAME, VIEW_BUILD_STATUS),
             db::consistency_level::ONE,
@@ -379,7 +379,7 @@ future<> system_distributed_keyspace::start_view_build(sstring ks_name, sstring 
 }
 
 future<> system_distributed_keyspace::finish_view_build(sstring ks_name, sstring view_name) const {
-    auto host_id = _sp.local_db().get_config().host_id;
+    auto host_id = _sp.local_db().get_token_metadata().get_my_id();
     return _qp.execute_internal(
             format("UPDATE {}.{} SET status = ? WHERE keyspace_name = ? AND view_name = ? AND host_id = ?", NAME, VIEW_BUILD_STATUS),
             db::consistency_level::ONE,
@@ -486,7 +486,7 @@ system_distributed_keyspace::read_cdc_topology_description(
             return {};
         }
 
-        std::vector<cdc::token_range_description> entries;
+        utils::chunked_vector<cdc::token_range_description> entries;
 
         auto entries_val = value_cast<list_type_impl::native_type>(
                 cdc_generation_description_type->deserialize(cql_result->one().get_view("description")));
@@ -498,14 +498,15 @@ system_distributed_keyspace::read_cdc_topology_description(
     });
 }
 
-static future<utils::chunked_vector<mutation>> get_cdc_generation_mutations(
-        const replica::database& db,
+future<>
+system_distributed_keyspace::insert_cdc_generation(
         utils::UUID id,
-        size_t num_replicas,
-        size_t concurrency,
-        const cdc::topology_description& desc) {
-    assert(num_replicas);
-    auto s = db.find_schema(system_distributed_keyspace::NAME_EVERYWHERE, system_distributed_keyspace::CDC_GENERATIONS_V2);
+        const cdc::topology_description& desc,
+        context ctx) {
+    using namespace std::chrono_literals;
+
+    const size_t concurrency = 10;
+    const size_t num_replicas = ctx.num_token_owners;
 
     // To insert the data quickly and efficiently we send it in batches of multiple rows
     // (each batch represented by a single mutation). We also send multiple such batches concurrently.
@@ -525,46 +526,11 @@ static future<utils::chunked_vector<mutation>> get_cdc_generation_mutations(
     // It has been tested that sending 1MB batches to 3 replicas with concurrency 20 works OK,
     // which would correspond to L ~= 60MB. Hence that's the limit we use here.
     const size_t L = 60'000'000;
-    const auto new_mutation_threshold = std::max(size_t(1), L / (num_replicas * concurrency));
+    const auto mutation_size_threshold = std::max(size_t(1), L / (num_replicas * concurrency));
 
-    auto ts = api::new_timestamp();
-    utils::chunked_vector<mutation> res;
-    res.emplace_back(s, partition_key::from_singular(*s, id));
-    res.back().set_static_cell(to_bytes("num_ranges"), int32_t(desc.entries().size()), ts);
-    size_t size_estimate = 0;
-    for (auto& e : desc.entries()) {
-        if (size_estimate >= new_mutation_threshold) {
-            res.emplace_back(s, partition_key::from_singular(*s, id));
-            size_estimate = 0;
-        }
-
-        set_type_impl::native_type streams;
-        streams.reserve(e.streams.size());
-        for (auto& stream: e.streams) {
-            streams.push_back(data_value(stream.to_bytes()));
-        }
-
-        size_estimate += e.streams.size() * 20;
-        auto ckey = clustering_key::from_singular(*s, dht::token::to_int64(e.token_range_end));
-        res.back().set_cell(ckey, to_bytes("streams"), make_set_value(cdc_streams_set_type, std::move(streams)), ts);
-        res.back().set_cell(ckey, to_bytes("ignore_msb"), int8_t(e.sharding_ignore_msb), ts);
-
-        co_await coroutine::maybe_yield();
-    }
-
-    co_return res;
-}
-
-future<>
-system_distributed_keyspace::insert_cdc_generation(
-        utils::UUID id,
-        const cdc::topology_description& desc,
-        context ctx) {
-    using namespace std::chrono_literals;
-
-    const size_t concurrency = 10;
-
-    auto ms = co_await get_cdc_generation_mutations(_qp.db().real_database(), id, ctx.num_token_owners, concurrency, desc);
+    auto s = _qp.db().real_database().find_schema(
+        system_distributed_keyspace::NAME_EVERYWHERE, system_distributed_keyspace::CDC_GENERATIONS_V2);
+    auto ms = co_await cdc::get_cdc_generation_mutations_v2(s, id, desc, mutation_size_threshold, api::new_timestamp());
     co_await max_concurrent_for_each(ms, concurrency, [&] (mutation& m) -> future<> {
         co_await _sp.mutate(
             { std::move(m) },
@@ -580,8 +546,8 @@ system_distributed_keyspace::insert_cdc_generation(
 
 future<std::optional<cdc::topology_description>>
 system_distributed_keyspace::read_cdc_generation(utils::UUID id) {
-    std::vector<cdc::token_range_description> entries;
-    auto num_ranges = 0;
+    utils::chunked_vector<cdc::token_range_description> entries;
+    size_t num_ranges = 0;
     co_await _qp.query_internal(
             // This should be a local read so 20s should be more than enough
             format("SELECT range_end, streams, ignore_msb, num_ranges FROM {}.{} WHERE id = ? USING TIMEOUT 20s", NAME_EVERYWHERE, CDC_GENERATIONS_V2),
@@ -804,56 +770,19 @@ system_distributed_keyspace::get_cdc_desc_v1_timestamps(context ctx) {
     co_return res;
 }
 
-static qos::service_level_options::timeout_type get_duration(const cql3::untyped_result_set_row&row, std::string_view col_name) {
-    auto dur_opt = row.get_opt<cql_duration>(col_name);
-    if (!dur_opt) {
-        return qos::service_level_options::unset_marker{};
-    }
-    return std::chrono::duration_cast<lowres_clock::duration>(std::chrono::nanoseconds(dur_opt->nanoseconds));
-};
+bool system_distributed_keyspace::workload_prioritization_tables_exists() {
+    auto wp_table = get_updated_service_levels(_qp.db(), true);
+    auto table = _qp.db().try_find_table(NAME, wp_table->cf_name());
 
-future<qos::service_levels_info> system_distributed_keyspace::get_service_levels() const {
-    static sstring prepared_query = format("SELECT * FROM {}.{};", NAME, SERVICE_LEVELS);
+    return table && table->schema()->equal_columns(*wp_table);
+}
 
-    return _qp.execute_internal(prepared_query, db::consistency_level::ONE, internal_distributed_query_state(), cql3::query_processor::cache_internal::yes).then([] (shared_ptr<cql3::untyped_result_set> result_set) {
-        qos::service_levels_info service_levels;
-        for (auto &&row : *result_set) {
-            try {
-                auto service_level_name = row.get_as<sstring>("service_level");
-                auto workload = qos::service_level_options::parse_workload_type(row.get_opt<sstring>("workload_type").value_or(""));
-                qos::service_level_options slo{
-                    .timeout = get_duration(row, "timeout"),
-                    .workload = workload.value_or(qos::service_level_options::workload_type::unspecified),
-                };
-                service_levels.emplace(service_level_name, slo);
-            } catch (...) {
-                dlogger.warn("Failed to fetch data for service levels: {}", std::current_exception());
-            }
-        }
-        return service_levels;
-    });
+future<qos::service_levels_info> system_distributed_keyspace::get_service_levels(qos::query_context ctx) const {
+    return qos::get_service_levels(_qp, NAME, SERVICE_LEVELS, db::consistency_level::ONE, ctx);
 }
 
 future<qos::service_levels_info> system_distributed_keyspace::get_service_level(sstring service_level_name) const {
-    static sstring prepared_query = format("SELECT * FROM {}.{} WHERE service_level = ?;", NAME, SERVICE_LEVELS);
-    return _qp.execute_internal(prepared_query, db::consistency_level::ONE, internal_distributed_query_state(), {service_level_name}, cql3::query_processor::cache_internal::yes).then(
-                [service_level_name = std::move(service_level_name)] (shared_ptr<cql3::untyped_result_set> result_set) {
-        qos::service_levels_info service_levels;
-        if (!result_set->empty()) {
-            try {
-                auto &&row = result_set->one();
-                auto workload = qos::service_level_options::parse_workload_type(row.get_opt<sstring>("workload_type").value_or(""));
-                qos::service_level_options slo{
-                    .timeout = get_duration(row, "timeout"),
-                    .workload = workload.value_or(qos::service_level_options::workload_type::unspecified),
-                };
-                service_levels.emplace(service_level_name, slo);
-            } catch (...) {
-                dlogger.warn("Failed to fetch data for service level {}: {}", service_level_name, std::current_exception());
-            }
-        }
-        return service_levels;
-    });
+    return qos::get_service_level(_qp, NAME, SERVICE_LEVELS, service_level_name, db::consistency_level::ONE);
 }
 
 future<> system_distributed_keyspace::set_service_level(sstring service_level_name, qos::service_level_options slo) const {
@@ -874,6 +803,19 @@ future<> system_distributed_keyspace::set_service_level(sstring service_level_na
             },
         }, tv);
     };
+    auto to_data_value_g = [&] <typename T> (const std::variant<qos::service_level_options::unset_marker, qos::service_level_options::delete_marker, T>& v) {
+        return std::visit(overloaded_functor {
+            [&] (const qos::service_level_options::unset_marker&) {
+                return data_value::make_null(data_type_for<T>());
+            },
+            [&] (const qos::service_level_options::delete_marker&) {
+                return data_value::make_null(data_type_for<T>());
+            },
+            [&] (const T& v) {
+                return data_value(v);
+            },
+        }, v);
+    };
     data_value workload = slo.workload == qos::service_level_options::workload_type::unspecified
             ? data_value::make_null(utf8_type)
             : data_value(qos::service_level_options::to_string(slo.workload));
@@ -883,6 +825,11 @@ future<> system_distributed_keyspace::set_service_level(sstring service_level_na
                 {to_data_value(slo.timeout),
                     workload,
                     service_level_name},
+                cql3::query_processor::cache_internal::no);
+    co_await _qp.execute_internal(format("UPDATE {}.{} SET shares = ? WHERE service_level = ?;", NAME, SERVICE_LEVELS),
+                db::consistency_level::ONE,
+                internal_distributed_query_state(),
+                {to_data_value_g(slo.shares), service_level_name},
                 cql3::query_processor::cache_internal::no);
 }
 

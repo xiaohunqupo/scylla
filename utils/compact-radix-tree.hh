@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <bitset>
 #include <fmt/core.h>
+#include "utils/assert.hh"
 #include "utils/allocation_strategy.hh"
 #include "utils/array-search.hh"
 #include <boost/intrusive/parent_from_member.hpp>
@@ -180,7 +181,7 @@ private:
     }
 
     /*
-     * Finds the number of leading elements that coinside for two
+     * Finds the number of leading elements that coincide for two
      * indices. Needed on insertion, when a short-cut node gets
      * expanded back.
      */
@@ -255,7 +256,7 @@ private:
     /*
      * Allocation returns a slot pointer and a boolean denoting
      * if the allocation really took place (false if the slot
-     * is aleady occupied)
+     * is already occupied)
      */
     using allocate_res = std::pair<T*, bool>;
 
@@ -297,7 +298,7 @@ private:
         }
 
         node_head(const node_head&) = delete;
-        ~node_head() { assert(_size == 0); }
+        ~node_head() { SCYLLA_ASSERT(_size == 0); }
 
         /*
          * Helpers to cast header to the actual node class or to the
@@ -563,7 +564,7 @@ private:
     };
 
     /*
-     * This helper wraps several layouts into one and preceeds them with
+     * This helper wraps several layouts into one and precedes them with
      * the header. It does nothing but provides a polymorphic calls to the
      * lower/inner layouts depending on the head.base_layout value.
      */
@@ -1022,8 +1023,8 @@ private:
         }
 
         void append(node_head& head, node_index_t ni, Slot&& val) noexcept {
-            assert(check_capacity(head, ni));
-            assert(!_data.has(ni));
+            SCYLLA_ASSERT(check_capacity(head, ni));
+            SCYLLA_ASSERT(!_data.has(ni));
             _data.add(head, ni);
             new (&_data._slots[ni]) Slot(std::move(val));
         }
@@ -1079,7 +1080,7 @@ private:
             while (want_ni >= next_cap) {
                 next_cap <<= 1;
             }
-            assert(next_cap > head._capacity);
+            SCYLLA_ASSERT(next_cap > head._capacity);
 
             NT* nn = NT::allocate(head._prefix, layout::direct_dynamic, next_cap);
             move_slots(_data._slots, head._capacity, head._capacity + 1, nn->_base,
@@ -1145,7 +1146,7 @@ private:
             if constexpr (this_layout == layout::direct_static) {
                 return sizeof(direct_layout) + node_index_limit * sizeof(Slot);
             } else {
-                assert(capacity != 0);
+                SCYLLA_ASSERT(capacity != 0);
                 return sizeof(direct_layout) + capacity * sizeof(Slot);
             }
         }
@@ -1155,7 +1156,7 @@ private:
      * The indirect layout is used to keep small number of sparse keys on
      * small node. To do that it keeps an array of indices and when is
      * asked to get an element searches in this array. This map additionally
-     * works as a presense bitmask from direct layout.
+     * works as a presence bitmask from direct layout.
      *
      * Since indirect layouts of different sizes have slots starting at
      * different addresses in memory, they cannot grow dynamically, but are
@@ -1235,8 +1236,8 @@ private:
 
         void append(node_head& head, node_index_t ni, Slot&& val) noexcept {
             unsigned i = head._size++;
-            assert(i < Size);
-            assert(_idx[i] == unused_node_index);
+            SCYLLA_ASSERT(i < Size);
+            SCYLLA_ASSERT(_idx[i] == unused_node_index);
             _idx[i] = ni;
             new (&_slots[i]) Slot(std::move(val));
         }
@@ -1441,13 +1442,13 @@ private:
 
         /*
          * The plen is the level at which current node and desired
-         * index still coinside
+         * index still coincide
          */
         unsigned plen = common_prefix_len(key, n_prefix);
-        assert(plen >= depth);
+        SCYLLA_ASSERT(plen >= depth);
         plen -= depth;
         depth += plen;
-        assert(n.prefix_len() > plen);
+        SCYLLA_ASSERT(n.prefix_len() > plen);
 
         node_index_t ni = node_index(n_prefix, depth);
         node_head* nn = inner_node::allocate_initial(make_prefix(key, plen), ni);
@@ -1466,7 +1467,7 @@ private:
     static node_head* squash(node_head* n, unsigned depth) noexcept {
         const node_head_ptr np = n->pop_lower();
         node_head* kid = np.raw();
-        assert(kid != nullptr);
+        SCYLLA_ASSERT(kid != nullptr);
         // Kid has n and it's prefix squashed
         kid->bump_prefix(n->prefix_len() + 1);
         return kid;
@@ -1537,7 +1538,7 @@ private:
             n->free(depth);
             n = nn;
             ret = nn->alloc(key, depth);
-            assert(ret.first != nullptr);
+            SCYLLA_ASSERT(ret.first != nullptr);
         }
         return ret;
     }
@@ -1547,11 +1548,11 @@ private:
 
     static void populate_slot(node_head_ptr& np, key_t key, unsigned depth) {
         /*
-         * Allocate leaf immediatelly with the prefix
+         * Allocate leaf immediately with the prefix
          * len big enough to cover all skipped node
          * up to the current depth
          */
-        assert(leaf_depth >= depth);
+        SCYLLA_ASSERT(leaf_depth >= depth);
         np = leaf_node::allocate_initial(make_prefix(key, leaf_depth - depth));
     }
 
@@ -1610,7 +1611,7 @@ private:
 
     static bool erase_from_slot(node_head_ptr* np, key_t key, unsigned depth, erase_mode erm) noexcept {
         node_head* n = np->raw();
-        assert(n->check_prefix(key, depth));
+        SCYLLA_ASSERT(n->check_prefix(key, depth));
 
         erase_result er = n->erase(key, depth, erm);
         if (erm == erase_mode::cleanup) {
@@ -1846,7 +1847,7 @@ public:
     template <typename Cloner>
     requires std::is_invocable_r<T, Cloner, key_t, const T&>::value
     void clone_from(const tree& tree, Cloner&& cloner) {
-        assert(_root.is(nil_root));
+        SCYLLA_ASSERT(_root.is(nil_root));
         if (!tree._root.is(nil_root)) {
             clone_res cres = tree._root->clone(cloner, 0);
             if (cres.first != nullptr) {
@@ -1991,7 +1992,6 @@ public:
         reference operator*() const noexcept { return *_value; }
 
         bool operator==(const iterator_base& o) const noexcept { return _value == o._value; }
-        bool operator!=(const iterator_base& o) const noexcept { return !(*this == o); }
     };
 
     using iterator = iterator_base<false>;

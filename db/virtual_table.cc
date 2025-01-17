@@ -4,15 +4,17 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "db/virtual_table.hh"
 #include "db/chained_delegating_reader.hh"
 #include "readers/queue.hh"
 #include "readers/reversing_v2.hh"
+#include "readers/filtering.hh"
 #include "readers/forwardable_v2.hh"
 #include "readers/slicing_filtering.hh"
+#include "dht/i_partitioner.hh"
 
 namespace db {
 
@@ -28,7 +30,7 @@ void virtual_table::set_cell(row& cr, const bytes& column_name, data_value value
 }
 
 bool virtual_table::this_shard_owns(const dht::decorated_key& dk) const {
-    return dht::shard_of(*_s, dk.token()) == this_shard_id();
+    return dht::static_shard_of(*_s, dk.token()) == this_shard_id();
 }
 
 bool virtual_table::contains_key(const dht::partition_range& pr, const dht::decorated_key& dk) const {
@@ -40,7 +42,6 @@ mutation_source memtable_filling_virtual_table::as_mutation_source() {
         reader_permit permit,
         const dht::partition_range& range,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr) {
@@ -54,15 +55,15 @@ mutation_source memtable_filling_virtual_table::as_mutation_source() {
 
         auto units = make_lw_shared<my_units>(permit.consume_memory(0));
 
-        auto populate = [this, mt = make_lw_shared<replica::memtable>(schema()), s, units, range, slice, pc, trace_state, fwd, fwd_mr] () mutable {
+        auto populate = [this, mt = make_lw_shared<replica::memtable>(schema()), s, units, range, slice, trace_state, fwd, fwd_mr] () mutable {
             auto mutation_sink = [units, mt] (mutation m) mutable {
                 mt->apply(m);
                 units->units.add(units->units.permit().consume_memory(mt->occupancy().used_space() - units->memory_used));
                 units->memory_used = mt->occupancy().used_space();
             };
 
-            return execute(mutation_sink).then([this, mt, s, units, &range, &slice, &pc, &trace_state, &fwd, &fwd_mr] () {
-                auto rd = mt->as_data_source().make_reader_v2(s, units->units.permit(), range, slice, pc, trace_state, fwd, fwd_mr);
+            return execute(mutation_sink).then([this, mt, s, units, &range, &slice, &trace_state, &fwd, &fwd_mr] () {
+                auto rd = mt->as_data_source().make_reader_v2(s, units->units.permit(), range, slice, trace_state, fwd, fwd_mr);
 
                 if (!_shard_aware) {
                     rd = make_filtering_reader(std::move(rd), [this] (const dht::decorated_key& dk) -> bool {
@@ -75,16 +76,15 @@ mutation_source memtable_filling_virtual_table::as_mutation_source() {
         };
 
         // populate keeps the memtable alive.
-        return make_flat_mutation_reader_v2<chained_delegating_reader>(s, std::move(populate), units->units.permit());
+        return make_mutation_reader<chained_delegating_reader>(s, std::move(populate), units->units.permit());
     });
 }
 
 mutation_source streaming_virtual_table::as_mutation_source() {
-    return mutation_source([this] (schema_ptr s,
+    return mutation_source([this] (schema_ptr query_schema,
         reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& query_slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr) {
@@ -92,10 +92,10 @@ mutation_source streaming_virtual_table::as_mutation_source() {
         std::unique_ptr<query::partition_slice> unreversed_slice;
         bool reversed = query_slice.is_reversed();
         if (reversed) {
-            s = s->make_reversed();
-            unreversed_slice = std::make_unique<query::partition_slice>(query::half_reverse_slice(*s, query_slice));
+            unreversed_slice = std::make_unique<query::partition_slice>(query::reverse_slice(*query_schema, query_slice));
         }
         const auto& slice = reversed ? *unreversed_slice : query_slice;
+        auto table_schema = reversed ? query_schema->make_reversed() : query_schema;
 
         // We cannot pass the partition_range directly to execute()
         // because it is not guaranteed to be alive until execute() resolves.
@@ -130,8 +130,8 @@ mutation_source streaming_virtual_table::as_mutation_source() {
             }
         };
 
-        auto reader_and_handle = make_queue_reader_v2(s, permit);
-        auto consumer = std::make_unique<my_result_collector>(s, permit, &pr, std::move(reader_and_handle.second));
+        auto reader_and_handle = make_queue_reader_v2(table_schema, permit);
+        auto consumer = std::make_unique<my_result_collector>(table_schema, permit, &pr, std::move(reader_and_handle.second));
         auto f = execute(permit, *consumer, *consumer);
 
         // It is safe to discard this future because:

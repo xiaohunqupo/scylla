@@ -3,16 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <unordered_set>
 #include <memory>
-#include <seastar/core/shared_ptr.hh>
 #include "sstables/shared_sstable.hh"
-#include "sstables/progress_monitor.hh"
 #include "timestamp.hh"
 
 class compaction_backlog_manager;
@@ -60,18 +58,20 @@ public:
     using ongoing_compactions = std::unordered_map<sstables::shared_sstable, backlog_read_progress_manager*>;
 
     struct impl {
-        virtual void replace_sstables(std::vector<sstables::shared_sstable> old_ssts, std::vector<sstables::shared_sstable> new_ssts) = 0;
+        // FIXME: Should provide strong exception safety guarantees
+        virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) = 0;
         virtual double backlog(const ongoing_writes& ow, const ongoing_compactions& oc) const = 0;
         virtual ~impl() { }
     };
 
     compaction_backlog_tracker(std::unique_ptr<impl> impl) : _impl(std::move(impl)) {}
     compaction_backlog_tracker(compaction_backlog_tracker&&);
-    compaction_backlog_tracker& operator=(compaction_backlog_tracker&&) noexcept;
+    compaction_backlog_tracker& operator=(compaction_backlog_tracker&&) = delete;
     compaction_backlog_tracker(const compaction_backlog_tracker&) = delete;
     ~compaction_backlog_tracker();
 
     double backlog() const;
+    // FIXME: Should provide strong exception safety guarantees
     void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts);
     void register_partially_written_sstable(sstables::shared_sstable sst, backlog_write_progress_manager& wp);
     void register_compacting_sstable(sstables::shared_sstable sst, backlog_read_progress_manager& rp);

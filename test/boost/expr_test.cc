@@ -1,7 +1,10 @@
+// Copyright (C) 2023-present ScyllaDB
+// SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
+
 #include "cql3/column_identifier.hh"
 #include "cql3/util.hh"
-#include "seastar/core/shared_ptr.hh"
-#include "types.hh"
+#include <seastar/core/shared_ptr.hh>
+#include "types/types.hh"
 #include "types/list.hh"
 #include "types/map.hh"
 #include <boost/test/tools/old/interface.hpp>
@@ -9,13 +12,18 @@
 
 #include <boost/test/unit_test.hpp>
 #include <utility>
+#include <fmt/ranges.h>
 #include "cql3/expr/expression.hh"
 #include "utils/overloaded_functor.hh"
+#include "utils/to_string.hh"
 #include <cassert>
 #include "cql3/query_options.hh"
 #include "types/set.hh"
 #include "types/user.hh"
 #include "test/lib/expr_test_utils.hh"
+#include "test/lib/test_utils.hh"
+#include "cql3/expr/evaluate.hh"
+#include "cql3/expr/expr-utils.hh"
 
 using namespace cql3;
 using namespace cql3::expr;
@@ -110,6 +118,13 @@ static unresolved_identifier make_column(const char* col_name) {
     return unresolved_identifier{::make_shared<column_identifier_raw>(col_name, true)};
 }
 
+static function_call make_token(std::vector<expression> args) {
+    return function_call {
+        .func = functions::function_name::native_function("token"),
+        .args = args
+    };
+}
+
 BOOST_AUTO_TEST_CASE(expr_printer_test) {
     expression col_eq_1234 = binary_operator(
         make_column("col"),
@@ -119,7 +134,7 @@ BOOST_AUTO_TEST_CASE(expr_printer_test) {
     BOOST_REQUIRE_EQUAL(expr_print(col_eq_1234), "col = 1234");
 
     expression token_p1_p2_lt_min_56 = binary_operator(
-        token({
+        make_token({
             unresolved_identifier{::make_shared<column_identifier_raw>("p1", true)},
             unresolved_identifier{::make_shared<column_identifier_raw>("p2", true)},
         }),
@@ -150,7 +165,7 @@ BOOST_AUTO_TEST_CASE(expr_printer_timestamp_test) {
         raw_value::make_value(timestamp_type->from_string("2011-03-02T03:05:00+0000")),
         timestamp_type
     );
-    BOOST_REQUIRE_EQUAL(expr_print(timestamp_const), "'2011-03-02T03:05:00+0000'");
+    BOOST_REQUIRE_EQUAL(expr_print(timestamp_const), "'2011-03-02T03:05:00.000Z'");
 }
 
 BOOST_AUTO_TEST_CASE(expr_printer_time_test) {
@@ -166,7 +181,7 @@ BOOST_AUTO_TEST_CASE(expr_printer_date_test) {
         raw_value::make_value(date_type->from_string("2011-02-03+0000")),
         date_type
     };
-    BOOST_REQUIRE_EQUAL(expr_print(date_const), "'2011-02-03T00:00:00+0000'");
+    BOOST_REQUIRE_EQUAL(expr_print(date_const), "'2011-02-03T00:00:00.000Z'");
 }
 
 BOOST_AUTO_TEST_CASE(expr_printer_duration_test) {
@@ -330,7 +345,7 @@ BOOST_AUTO_TEST_CASE(expr_printer_parse_and_print_test) {
     };
 
     for(const char* test : tests) {
-        expression parsed_where = cql3::util::where_clause_to_relations(test);
+        expression parsed_where = cql3::util::where_clause_to_relations(test, cql3::dialect{});
         sstring printed_where = cql3::util::relations_to_where_clause(parsed_where);
 
         BOOST_REQUIRE_EQUAL(sstring(test), printed_where);
@@ -401,6 +416,20 @@ BOOST_AUTO_TEST_CASE(evaluate_constant_int) {
 static schema_ptr make_simple_test_schema() {
     return schema_builder("test_ks", "test_cf")
         .with_column("pk", int32_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("r", int32_type, column_kind::regular_column)
+        .with_column("s", int32_type, column_kind::static_column)
+        .build();
+}
+
+// Creates a schema_ptr with three partition key columns can be used for testing
+// The schema corresponds to a table created by:
+// CREATE TABLE test_ks.test_cf (pk1 int, pk2 int, pk3 int, ck int, r int, s int static, primary key (pk, ck));
+static schema_ptr make_three_pk_schema() {
+    return schema_builder("test_ks", "test_cf")
+        .with_column("pk1", int32_type, column_kind::partition_key)
+        .with_column("pk2", int32_type, column_kind::partition_key)
+        .with_column("pk3", int32_type, column_kind::partition_key)
         .with_column("ck", int32_type, column_kind::clustering_key)
         .with_column("r", int32_type, column_kind::regular_column)
         .with_column("s", int32_type, column_kind::static_column)
@@ -1318,21 +1347,23 @@ BOOST_AUTO_TEST_CASE(prepare_token) {
                                   .build();
     auto [db, db_data] = make_data_dictionary_database(table_schema);
 
-    expression tok =
-        token({::make_shared<column_identifier_raw>("p1", true), ::make_shared<column_identifier_raw>("p2", true),
-               ::make_shared<column_identifier_raw>("p3", true)});
+    expression tok = make_token({unresolved_identifier{::make_shared<column_identifier_raw>("p1", true)},
+                            unresolved_identifier{::make_shared<column_identifier_raw>("p2", true)},
+                            unresolved_identifier{::make_shared<column_identifier_raw>("p3", true)}});
 
     expression prepared = prepare_expression(tok, db, "test_ks", table_schema.get(), nullptr);
 
-    expression expected = token({column_value(table_schema->get_column_definition("p1")),
+    std::vector<expression> expected_args = {column_value(table_schema->get_column_definition("p1")),
                                  column_value(table_schema->get_column_definition("p2")),
-                                 column_value(table_schema->get_column_definition("p3"))});
+                                 column_value(table_schema->get_column_definition("p3"))};
 
-    BOOST_REQUIRE_EQUAL(prepared, expected);
+    const function_call* token_fun_call = as_if<function_call>(&prepared);
+    BOOST_REQUIRE(token_fun_call != nullptr);
+    BOOST_REQUIRE(is_token_function(*token_fun_call));
+    BOOST_REQUIRE(std::holds_alternative<shared_ptr<db::functions::function>>(token_fun_call->func));
+    BOOST_REQUIRE_EQUAL(token_fun_call->args, expected_args);
 }
 
-// prepare_expression(token) doesn't validate its arguments,
-// validation is done in a different place
 BOOST_AUTO_TEST_CASE(prepare_token_no_args) {
     schema_ptr table_schema = schema_builder("test_ks", "test_cf")
                                   .with_column("p1", int32_type, column_kind::partition_key)
@@ -1341,11 +1372,10 @@ BOOST_AUTO_TEST_CASE(prepare_token_no_args) {
                                   .build();
     auto [db, db_data] = make_data_dictionary_database(table_schema);
 
-    expression tok = token(std::vector<expression>());
+    expression tok = make_token(std::vector<expression>());
 
-    expression prepared = prepare_expression(tok, db, "test_ks", table_schema.get(), nullptr);
-
-    BOOST_REQUIRE_EQUAL(tok, prepared);
+    BOOST_REQUIRE_THROW(prepare_expression(tok, db, "test_ks", table_schema.get(), nullptr),
+                        exceptions::invalid_request_exception);
 }
 
 BOOST_AUTO_TEST_CASE(prepare_cast_int_int) {
@@ -1391,6 +1421,102 @@ BOOST_AUTO_TEST_CASE(prepare_cast_text_int) {
     ::lw_shared_ptr<column_specification> receiver = make_receiver(short_type);
 
     BOOST_REQUIRE_THROW(prepare_expression(cast_expr, db, "test_ks", table_schema.get(), receiver),
+                        exceptions::invalid_request_exception);
+}
+
+// Test that preparing `(text)?` without a receiver works.
+// Here (text) serves as a type hint that specifies the type of the bind variable.
+// This syntax is useful for passing bind variables in places where it's impossible
+// to infer the type from context, for example as an argument for a function
+// with multiple overloads.
+BOOST_AUTO_TEST_CASE(prepare_cast_bind_var_no_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression cast_expr =
+        cast{.arg = bind_variable{.bind_index = 0, .receiver = nullptr}, .type = cql3_type::raw::from(utf8_type)};
+
+    expression prepared = prepare_expression(cast_expr, db, "test_ks", table_schema.get(), nullptr);
+
+    // Can't do a direct comparison because we don't have prepared.arg.receiver
+    BOOST_REQUIRE(is<cast>(prepared) && is<bind_variable>(as<cast>(prepared).arg));
+    ::lw_shared_ptr<column_specification> bind_var_receiver = as<bind_variable>(as<cast>(prepared).arg).receiver;
+    BOOST_REQUIRE(bind_var_receiver->type == utf8_type);
+
+    expression expected = cast{.arg = bind_variable{.bind_index = 0, .receiver = bind_var_receiver}, .type = utf8_type};
+    BOOST_REQUIRE_EQUAL(prepared, expected);
+
+    BOOST_REQUIRE(expr::type_of(prepared) == utf8_type);
+}
+
+// Test preparing (text)? with a known text receiver.
+// Corresponds to `text_col = (text)?`
+BOOST_AUTO_TEST_CASE(prepare_cast_bind_var_text_type_hint_and_text_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression cast_expr =
+        cast{.arg = bind_variable{.bind_index = 0, .receiver = nullptr}, .type = cql3_type::raw::from(utf8_type)};
+
+    expression prepared = prepare_expression(cast_expr, db, "test_ks", table_schema.get(), make_receiver(utf8_type));
+
+    // Can't do a direct comparison because we don't have prepared.arg.receiver
+    BOOST_REQUIRE(is<cast>(prepared) && is<bind_variable>(as<cast>(prepared).arg));
+    ::lw_shared_ptr<column_specification> bind_var_receiver = as<bind_variable>(as<cast>(prepared).arg).receiver;
+    BOOST_REQUIRE(bind_var_receiver->type == utf8_type);
+
+    expression expected = cast{.arg = bind_variable{.bind_index = 0, .receiver = bind_var_receiver}, .type = utf8_type};
+    BOOST_REQUIRE_EQUAL(prepared, expected);
+
+    BOOST_REQUIRE(expr::type_of(prepared) == utf8_type);
+}
+
+// Test preparing (int)? with a known int receiver.
+// Corresponds to `int_col = (int)?`
+BOOST_AUTO_TEST_CASE(prepare_cast_bind_var_int_type_hint_and_int_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression cast_expr =
+        cast{.arg = bind_variable{.bind_index = 0, .receiver = nullptr}, .type = cql3_type::raw::from(int32_type)};
+
+    expression prepared = prepare_expression(cast_expr, db, "test_ks", table_schema.get(), make_receiver(int32_type));
+
+    // Can't do a direct comparison because we don't have prepared.arg.receiver
+    BOOST_REQUIRE(is<cast>(prepared) && is<bind_variable>(as<cast>(prepared).arg));
+    ::lw_shared_ptr<column_specification> bind_var_receiver = as<bind_variable>(as<cast>(prepared).arg).receiver;
+    BOOST_REQUIRE(bind_var_receiver->type == int32_type);
+
+    expression expected =
+        cast{.arg = bind_variable{.bind_index = 0, .receiver = bind_var_receiver}, .type = int32_type};
+    BOOST_REQUIRE_EQUAL(prepared, expected);
+
+    BOOST_REQUIRE(expr::type_of(prepared) == int32_type);
+}
+
+// Test preparing (text)? with a known int receiver.
+// Corresponds to `int_col = (text)?`
+BOOST_AUTO_TEST_CASE(prepare_cast_bind_var_text_type_hint_and_int_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression cast_expr =
+        cast{.arg = bind_variable{.bind_index = 0, .receiver = nullptr}, .type = cql3_type::raw::from(utf8_type)};
+
+    BOOST_REQUIRE_THROW(prepare_expression(cast_expr, db, "test_ks", table_schema.get(), make_receiver(int32_type)),
+                        exceptions::invalid_request_exception);
+}
+
+// Test preparing (int)? with a known text receiver.
+// Corresponds to `text_col = (int)?`
+BOOST_AUTO_TEST_CASE(prepare_cast_bind_var_int_type_hint_and_text_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression cast_expr =
+        cast{.arg = bind_variable{.bind_index = 0, .receiver = nullptr}, .type = cql3_type::raw::from(int32_type)};
+
+    BOOST_REQUIRE_THROW(prepare_expression(cast_expr, db, "test_ks", table_schema.get(), make_receiver(utf8_type)),
                         exceptions::invalid_request_exception);
 }
 
@@ -2297,7 +2423,7 @@ BOOST_AUTO_TEST_CASE(prepare_usertype_constructor_with_bind_variable) {
     BOOST_REQUIRE(prepared_constructor->elements.contains(column_identifier("field2", true)));
 
     bind_variable* prepared_bind_var =
-        as_if<bind_variable>(&prepared_constructor->elements[column_identifier("field2", true)]);
+        as_if<bind_variable>(&prepared_constructor->elements.at(column_identifier("field2", true)));
     BOOST_REQUIRE(prepared_bind_var != nullptr);
 
     ::lw_shared_ptr<column_specification> bind_var_receiver = prepared_bind_var->receiver;
@@ -2342,7 +2468,7 @@ BOOST_AUTO_TEST_CASE(prepare_usertype_constructor_with_bind_variable_and_missing
     BOOST_REQUIRE(prepared_constructor->elements.contains(column_identifier("field2", true)));
 
     bind_variable* prepared_bind_var =
-        as_if<bind_variable>(&prepared_constructor->elements[column_identifier("field2", true)]);
+        as_if<bind_variable>(&prepared_constructor->elements.at(column_identifier("field2", true)));
     BOOST_REQUIRE(prepared_bind_var != nullptr);
 
     ::lw_shared_ptr<column_specification> bind_var_receiver = prepared_bind_var->receiver;
@@ -2359,6 +2485,83 @@ BOOST_AUTO_TEST_CASE(prepare_usertype_constructor_with_bind_variable_and_missing
 
     BOOST_REQUIRE_EQUAL(prepared, expected);
 }
+
+BOOST_AUTO_TEST_CASE(prepare_constant_no_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression int_const = make_int_const(1234);
+    expression prepared_int_const = prepare_expression(int_const, db, "test_ks", table_schema.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(int_const, prepared_int_const);
+
+    expression text_const = make_text_const("helo");
+    expression prepared_text_const = prepare_expression(text_const, db, "test_ks", table_schema.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(text_const, prepared_text_const);
+}
+
+BOOST_AUTO_TEST_CASE(prepare_constant_with_receiver) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression int_const = make_int_const(1234);
+    expression prepared_int_const =
+        prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(int32_type));
+
+    BOOST_REQUIRE_EQUAL(int_const, prepared_int_const);
+
+    // Preparing an int32 with int64 receiver fails
+    BOOST_REQUIRE_THROW(prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(long_type)),
+                        exceptions::invalid_request_exception);
+
+    // Preparing an int32 with text receiver fails
+    BOOST_REQUIRE_THROW(prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(utf8_type)),
+                        exceptions::invalid_request_exception);
+
+    // Preparing an int32 with blob receiver works - ints can be implicitly converted to blobs
+    expression prepared_int_blob =
+        prepare_expression(int_const, db, "test_ks", table_schema.get(), make_receiver(bytes_type));
+    expression expected_blob = constant(make_int_const(1234).value, bytes_type);
+
+    BOOST_REQUIRE_EQUAL(prepared_int_blob, expected_blob);
+}
+
+BOOST_AUTO_TEST_CASE(prepare_writetime_ttl) {
+    schema_ptr table_schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    auto prep = [&, db = db] (const expression& e, std::optional<data_type> receiver_type = std::nullopt) {
+        auto receiver = receiver_type
+                ? make_lw_shared<column_specification>("foo", "bar", make_shared<column_identifier>("ci", false), *receiver_type)
+                : nullptr;
+        return prepare_expression(e, db, "test_ks", table_schema.get(), receiver);
+    };
+
+    for (auto kind : {column_mutation_attribute::attribute_kind::ttl, column_mutation_attribute::attribute_kind::writetime}) {
+        auto expected_type = kind == column_mutation_attribute::attribute_kind::ttl ? int32_type : long_type;
+
+        auto ok1 = prep(column_mutation_attribute{kind, make_column("r")});
+        BOOST_REQUIRE_EQUAL(ok1, (column_mutation_attribute{kind, column_value{&table_schema->regular_column_at(0)}}));
+        BOOST_REQUIRE(type_of(ok1) == expected_type);
+
+        // now try with a receiver
+        auto ok2 = prep(column_mutation_attribute{kind, make_column("r")}, expected_type);
+        BOOST_REQUIRE_EQUAL(ok1, (column_mutation_attribute{kind, column_value{&table_schema->regular_column_at(0)}}));
+        BOOST_REQUIRE(type_of(ok1) == expected_type);
+
+        // now try with a receiver of the wrong type
+        BOOST_REQUIRE_THROW(prep(column_mutation_attribute{kind, make_column("r")}, utf8_type), exceptions::invalid_request_exception);
+
+        // Try a partition key component
+        BOOST_REQUIRE_THROW(prep(column_mutation_attribute{kind, make_column("p")}), exceptions::invalid_request_exception);
+        BOOST_REQUIRE_THROW(prep(column_mutation_attribute{kind, make_column("c")}), exceptions::invalid_request_exception);
+
+        // Try something that isn't a column_value
+        BOOST_REQUIRE_THROW(prep(column_mutation_attribute{kind, bind_variable{}}), exceptions::invalid_request_exception);
+    }
+}
+
 
 // Test how evaluating a given binary operator behaves when null is present.
 // A binary with null on either side should evaluate to null.
@@ -2619,6 +2822,33 @@ BOOST_AUTO_TEST_CASE(evaluate_binary_operator_in) {
     test_evaluate_binop_null(oper_t::IN, make_int_const(5), in_list);
 }
 
+BOOST_AUTO_TEST_CASE(evaluate_binary_operator_not_in) {
+    // IN expects a list as its rhs, sets are not allowed
+    expression in_list = make_int_list_const({1, 3, 5});
+
+    expression false_not_in_binop = binary_operator(make_int_const(3), oper_t::NOT_IN, in_list);
+    BOOST_REQUIRE_EQUAL(evaluate(false_not_in_binop, evaluation_inputs{}), make_bool_raw(false));
+
+    expression true_not_in_binop = binary_operator(make_int_const(2), oper_t::NOT_IN, in_list);
+    BOOST_REQUIRE_EQUAL(evaluate(true_not_in_binop, evaluation_inputs{}), make_bool_raw(true));
+
+    expression empty_not_in_list = binary_operator(make_empty_const(int32_type), oper_t::NOT_IN, in_list);
+    BOOST_REQUIRE_EQUAL(evaluate(empty_not_in_list, evaluation_inputs{}), make_bool_raw(true));
+
+    expression list_with_empty =
+        make_list_const({make_int_const(1), make_empty_const(int32_type), make_int_const(3)}, int32_type);
+    expression empty_not_in_list_with_empty = binary_operator(make_empty_const(int32_type), oper_t::NOT_IN, list_with_empty);
+    BOOST_REQUIRE_EQUAL(evaluate(empty_not_in_list_with_empty, evaluation_inputs{}), make_bool_raw(false));
+
+    expression existing_int_not_in_list_with_empty = binary_operator(make_int_const(3), oper_t::NOT_IN, list_with_empty);
+    BOOST_REQUIRE_EQUAL(evaluate(existing_int_not_in_list_with_empty, evaluation_inputs{}), make_bool_raw(false));
+
+    expression nonexisting_not_int_in_list_with_empty = binary_operator(make_int_const(321), oper_t::NOT_IN, list_with_empty);
+    BOOST_REQUIRE_EQUAL(evaluate(nonexisting_not_int_in_list_with_empty, evaluation_inputs{}), make_bool_raw(true));
+
+    test_evaluate_binop_null(oper_t::NOT_IN, make_int_const(5), in_list);
+}
+
 // Tests `<int_value> IN (123, ?, 789)` where the bind variable has value 456
 BOOST_AUTO_TEST_CASE(evaluate_binary_operator_in_list_with_bind_variable) {
     schema_ptr table_schema =
@@ -2640,6 +2870,29 @@ BOOST_AUTO_TEST_CASE(evaluate_binary_operator_in_list_with_bind_variable) {
 
     expression empty_in_list = binary_operator(make_empty_const(int32_type), oper_t::IN, in_list);
     BOOST_REQUIRE_EQUAL(evaluate(empty_in_list, inputs), make_bool_raw(false));
+}
+
+// Tests `<int_value> IN (123, ?, 789)` where the bind variable has value 456
+BOOST_AUTO_TEST_CASE(evaluate_binary_operator_not_in_list_with_bind_variable) {
+    schema_ptr table_schema =
+        schema_builder("test_ks", "test_cf").with_column("pk", int32_type, column_kind::partition_key).build();
+
+    expression in_list = collection_constructor{
+        .style = collection_constructor::style_type::list,
+        .elements = {make_int_const(123), bind_variable{.bind_index = 0, .receiver = make_receiver(int32_type)},
+                     make_int_const(789)},
+        .type = list_type_impl::get_instance(int32_type, true)};
+
+    auto [inputs, inputs_data] = make_evaluation_inputs(table_schema, {{"pk", make_int_raw(111)}}, {make_int_raw(456)});
+
+    expression false_not_in_binop = binary_operator(make_int_const(456), oper_t::NOT_IN, in_list);
+    BOOST_REQUIRE_EQUAL(evaluate(false_not_in_binop, inputs), make_bool_raw(false));
+
+    expression true_not_in_binop = binary_operator(make_int_const(-100), oper_t::NOT_IN, in_list);
+    BOOST_REQUIRE_EQUAL(evaluate(true_not_in_binop, inputs), make_bool_raw(true));
+
+    expression empty_not_in_list = binary_operator(make_empty_const(int32_type), oper_t::NOT_IN, in_list);
+    BOOST_REQUIRE_EQUAL(evaluate(empty_not_in_list, inputs), make_bool_raw(true));
 }
 
 BOOST_AUTO_TEST_CASE(evaluate_binary_operator_list_contains) {
@@ -2832,7 +3085,7 @@ raw_value eval_conj(std::vector<raw_value> elements) {
     return evaluate(conjunction{.children = conj_children}, evaluation_inputs{});
 };
 
-// Evaluate all possible two-element conjunctions containting true, false and null.
+// Evaluate all possible two-element conjunctions containing true, false and null.
 BOOST_AUTO_TEST_CASE(evaluate_conjunction_two_elements) {
     raw_value true_val = make_bool_raw(true);
     raw_value false_val = make_bool_raw(false);
@@ -2851,7 +3104,7 @@ BOOST_AUTO_TEST_CASE(evaluate_conjunction_two_elements) {
     BOOST_REQUIRE_EQUAL(eval_conj({null_val, null_val}), null_val);
 }
 
-// Evaluate all possible three-element conjunctions containting true, false and null.
+// Evaluate all possible three-element conjunctions containing true, false and null.
 BOOST_AUTO_TEST_CASE(evaluate_conjunction_three_elements) {
     raw_value true_val = make_bool_raw(true);
     raw_value false_val = make_bool_raw(false);
@@ -2933,7 +3186,7 @@ BOOST_AUTO_TEST_CASE(evaluate_conjunction_one_empty) {
     BOOST_REQUIRE_THROW(evaluate(conj_one_empty, evaluation_inputs{}), exceptions::invalid_request_exception);
 }
 
-// Evaluating 'true AND true AND true AND EMPTY AND ...' should throw an erorr
+// Evaluating 'true AND true AND true AND EMPTY AND ...' should throw an error
 BOOST_AUTO_TEST_CASE(evaluate_conjunction_with_empty) {
     expression conj_with_empty =
         conjunction{.children = {make_bool_const(true), make_bool_const(true), make_bool_const(true),
@@ -3044,6 +3297,134 @@ BOOST_AUTO_TEST_CASE(evaluate_conjunction_of_conjunctions_with_invalid) {
     expression conj_of_conjs = conjunction{.children = {conj1, conj2, conj3, conj4}};
 
     BOOST_REQUIRE_THROW(evaluate(conj_of_conjs, inputs), exceptions::invalid_request_exception);
+}
+
+BOOST_AUTO_TEST_CASE(evaluate_field_selection) {
+    auto schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(schema);
+
+    // The user defined type has 5 fields:
+    // CREATE TYPE test_ks.my_type (
+    //   int_field int,
+    //   float_field float,
+    //   text_field text,
+    //   bigint_field bigint,
+    //   int_field2 int,
+    // )
+    shared_ptr<const user_type_impl> udt_type = user_type_impl::get_instance(
+        "test_ks", "my_type", {"int_field", "float_field", "text_field", "bigint_field", "int_field2"},
+        {int32_type, float_type, utf8_type, long_type, int32_type}, true);
+
+    // Create a UDT value:
+    // {int_field: 123, float_field: null, text_field: 'abcdef', bigint_field: blobasbigint(0x), int_field2: 1337}
+    usertype_constructor::elements_map_type udt_value_elements;
+    udt_value_elements.emplace(column_identifier("int_field", false), make_int_const(123));
+    udt_value_elements.emplace(column_identifier("float_field", false), constant::make_null(float_type));
+    udt_value_elements.emplace(column_identifier("text_field", false), make_text_const("abcdef"));
+    udt_value_elements.emplace(column_identifier("bigint_field", false), make_empty_const(long_type));
+    udt_value_elements.emplace(column_identifier("int_field2", false), make_int_const(1337));
+    expression udt_value =
+        constant(evaluate(usertype_constructor{.elements = std::move(udt_value_elements), .type = udt_type},
+                          evaluation_inputs{}),
+                 udt_type);
+
+    auto make_field_selection = [&](expression value, const char* selected_field, data_type field_type) -> expression {
+        return field_selection{
+            .structure = value, .field = make_shared<column_identifier_raw>(selected_field, true), .type = field_type};
+    };
+
+
+    auto prepare_and_evaluate = [&,db = db] (const expression& e, const evaluation_inputs& inputs) {
+        auto prepared = prepare_expression(e, db, "", schema.get(), nullptr);
+        return evaluate(prepared, inputs);
+    };
+
+    // Evaluate the fields, check that field values are correct
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(udt_value, "int_field", int32_type), evaluation_inputs{}), make_int_raw(123));
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(udt_value, "float_field", float_type), evaluation_inputs{}),
+                        cql3::raw_value::make_null());
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(udt_value, "text_field", utf8_type), evaluation_inputs{}),
+                        make_text_raw("abcdef"));
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(udt_value, "bigint_field", long_type), evaluation_inputs{}),
+                        make_empty_raw());
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(udt_value, "int_field2", int32_type), evaluation_inputs{}),
+                        make_int_raw(1337));
+
+    // Evaluate a nonexistent field, should throw an exception
+    BOOST_REQUIRE_THROW(prepare_and_evaluate(make_field_selection(udt_value, "field_testing", int32_type), evaluation_inputs{}),
+                        exceptions::invalid_request_exception);
+
+    // Create a UDT value with values for the first 3 fields.
+    // There's no value for the 4th and 5th field, so they should be NULL.
+    // This is normal behavior, some fields might not have a value if the UDT value was serialized before
+    // adding new fields to the type.
+    // {int_field: 123, float_field: null, text_field: ''}
+    expression short_udt_value =
+        constant(make_tuple_raw({make_int_raw(123), cql3::raw_value::make_null(), make_text_raw("")}), udt_type);
+
+    // Evaluate the first 3 fields, check that the value is correct
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(short_udt_value, "int_field", int32_type), evaluation_inputs{}),
+                        make_int_raw(123));
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(short_udt_value, "float_field", float_type), evaluation_inputs{}),
+                        cql3::raw_value::make_null());
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(short_udt_value, "text_field", utf8_type), evaluation_inputs{}),
+                        make_text_raw(""));
+
+    // The serialized value doesn't contain any data for the 4th or 5th field, so they should be NULL.
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(short_udt_value, "bigint_field", long_type), evaluation_inputs{}),
+                        cql3::raw_value::make_null());
+    BOOST_REQUIRE_EQUAL(prepare_and_evaluate(make_field_selection(short_udt_value, "int_field2", int32_type), evaluation_inputs{}),
+                        cql3::raw_value::make_null());
+
+    // Evaluate a nonexistent field, should throw an exception
+    BOOST_REQUIRE_THROW(prepare_and_evaluate(make_field_selection(short_udt_value, "field_testing", int32_type), evaluation_inputs{}),
+                        exceptions::invalid_request_exception);
+}
+
+BOOST_AUTO_TEST_CASE(evaluate_column_mutation_attribute) {
+    auto s = make_simple_test_schema();
+    auto ttls = std::array{ int32_t(1), int32_t(2) };
+    auto timestamps = std::array{ int64_t(12345), int64_t(23456) };
+    auto ttl_of_s = column_mutation_attribute{
+        .kind = column_mutation_attribute::attribute_kind::ttl,
+        .column = column_value(&s->static_column_at(0)),
+    };
+    auto writetime_of_s = column_mutation_attribute{
+        .kind = column_mutation_attribute::attribute_kind::writetime,
+        .column = column_value(&s->static_column_at(0)),
+    };
+    auto ttl_of_r = column_mutation_attribute{
+        .kind = column_mutation_attribute::attribute_kind::ttl,
+        .column = column_value(&s->regular_column_at(0)),
+    };
+    auto writetime_of_r = column_mutation_attribute{
+        .kind = column_mutation_attribute::attribute_kind::writetime,
+        .column = column_value(&s->regular_column_at(0)),
+    };
+
+    auto null = cql3::raw_value::make_null();
+
+    auto [inputs1, inputs_data1] = make_evaluation_inputs(s, {
+        {"pk", mutation_column_value{make_int_raw(3)}},
+        {"ck", mutation_column_value{make_int_raw(4)}},
+        {"s", mutation_column_value{make_int_raw(3), 12345, 7}},
+        {"r", mutation_column_value{make_int_raw(3), 23456, 8}}});
+    BOOST_REQUIRE_EQUAL(evaluate(ttl_of_s, inputs1), make_int_raw(7));
+    BOOST_REQUIRE_EQUAL(evaluate(writetime_of_s, inputs1), make_bigint_raw(12345));
+    BOOST_REQUIRE_EQUAL(evaluate(ttl_of_r, inputs1), make_int_raw(8));
+    BOOST_REQUIRE_EQUAL(evaluate(writetime_of_r, inputs1), make_bigint_raw(23456));
+
+    auto [inputs2, inputs_data2] = make_evaluation_inputs(s, {
+        {"pk", make_int_raw(3)},
+        {"ck", make_int_raw(4)},
+        {"s", null},
+        {"r", null}});
+
+    BOOST_REQUIRE_EQUAL(evaluate(ttl_of_s, inputs2), null);
+    BOOST_REQUIRE_EQUAL(evaluate(writetime_of_s, inputs2), null);
+    BOOST_REQUIRE_EQUAL(evaluate(ttl_of_r, inputs2), null);
+    BOOST_REQUIRE_EQUAL(evaluate(writetime_of_r, inputs2), null);
+
 }
 
 // It should be possible to prepare an empty conjunction
@@ -3292,7 +3673,7 @@ enum struct expected_rhs_type {
     float_in_list,
     // list<tuple<float, int, text, double>
     multi_column_tuple_in_list,
-    // IS_NOT alows only NULL as the RHS, everything else is invalid
+    // IS_NOT allows only NULL as the RHS, everything else is invalid
     is_not_null_rhs
 };
 
@@ -3311,7 +3692,7 @@ std::vector<expression> get_invalid_rhs_values(expected_rhs_type expected_rhs) {
                                   make_float_untyped("45.67"),
                               }},
         // A tuple with too many elements for multi_column_tuple.
-        // A tuple with too little elements doesn't cause an error - CQL accepts it, the missing fields are assummed to
+        // A tuple with too little elements doesn't cause an error - CQL accepts it, the missing fields are assumed to
         // be null.
         tuple_constructor{.elements =
                               {
@@ -4072,4 +4453,273 @@ BOOST_AUTO_TEST_CASE(optimized_constant_like) {
             // repeated for simplicity
             binary_operator(target_var, oper_t::LIKE, make_text_const("xx%")));
     BOOST_REQUIRE(check(std::move(complex), "xxyyz", true));
+}
+
+BOOST_AUTO_TEST_CASE(prepare_token_func_without_receiver) {
+    schema_ptr table_schema = make_three_pk_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    expression token_fun_call = function_call{
+        .func = functions::function_name::native_function("token"),
+        .args = {column_value(table_schema->get_column_definition("pk1")), make_column("pk2"), make_int_const(1234)}};
+
+    expression prepared_no_receiver = prepare_expression(token_fun_call, db, "test_ks", table_schema.get(), nullptr);
+    expression prepared_with_receiver =
+        prepare_expression(token_fun_call, db, "test_ks", table_schema.get(), make_receiver(long_type));
+
+    auto check_prepared = [&](const expression& prepared) {
+        const function_call* prepared_token = as_if<function_call>(&prepared);
+        BOOST_REQUIRE(prepared_token != nullptr);
+
+        const seastar::shared_ptr<functions::function>* token_fun =
+            std::get_if<shared_ptr<functions::function>>(&prepared_token->func);
+        BOOST_REQUIRE(token_fun != nullptr);
+        BOOST_REQUIRE((*token_fun)->name() == functions::function_name::native_function("token"));
+
+        std::vector<expression> expected_args = {column_value(table_schema->get_column_definition("pk1")),
+                                                 column_value(table_schema->get_column_definition("pk2")),
+                                                 make_int_const(1234)};
+        BOOST_REQUIRE_EQUAL(prepared_token->args, expected_args);
+    };
+
+    check_prepared(prepared_no_receiver);
+    check_prepared(prepared_with_receiver);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_valid_call) {
+    function_call token_fun_call{.func = functions::function_name::native_function("token"), .args = {}};
+    BOOST_REQUIRE_EQUAL(is_token_function(token_fun_call), true);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_invalid_call) {
+    function_call token_fun_call{.func = functions::function_name::native_function("invalid_function"), .args = {}};
+    BOOST_REQUIRE_EQUAL(is_token_function(token_fun_call), false);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_valid_call_with_keyspace) {
+    function_call token_fun_call{.func = functions::function_name("system", "token"), .args = {}};
+    BOOST_REQUIRE_EQUAL(is_token_function(token_fun_call), true);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_invalid_call_with_keyspace) {
+    function_call token_fun_call{.func = functions::function_name("system", "invalid_token"),
+                                                       .args = {}};
+    BOOST_REQUIRE_EQUAL(is_token_function(token_fun_call), false);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_invalid_call_with_invalid_keyspace) {
+    function_call token_fun_call{
+        .func = functions::function_name("invalid_keyspace", "token"), .args = {}};
+    BOOST_REQUIRE_EQUAL(is_token_function(token_fun_call), false);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_prepared_token) {
+    schema_ptr table_schema = make_three_pk_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    function_call token_fun{
+        .func = functions::function_name::native_function("token"),
+        .args = {make_int_untyped("123"), make_int_untyped("443"), make_bind_variable(0, int32_type)}};
+
+    expression prepared = prepare_expression(token_fun, db, "test_ks", table_schema.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_token_function(prepared), true);
+}
+
+BOOST_AUTO_TEST_CASE(is_token_function_prepared_nontoken) {
+    schema_ptr table_schema = make_three_pk_schema();
+    auto [db, db_data] = make_data_dictionary_database(table_schema);
+
+    function_call now_fun{.func = functions::function_name::native_function("now"), .args = {}};
+
+    expression prepared = prepare_expression(now_fun, db, "test_ks", table_schema.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_token_function(prepared), false);
+}
+
+// Test the function expr::is_partition_token_for_schema
+BOOST_AUTO_TEST_CASE(is_partition_token_for_schema_test) {
+    schema_ptr schema1 = make_simple_test_schema();  // partition key: (pk)
+    schema_ptr schema2 = make_three_pk_schema();     // partition key: (pk1, pk2, pk3)
+    schema_ptr schema3 = make_three_pk_schema();     // partition key: (pk1, pk2, pk3)
+
+    auto [db1, db1_data] = make_data_dictionary_database(schema1);
+    auto [db2, db2_data] = make_data_dictionary_database(schema2);
+    auto [db3, db3_data] = make_data_dictionary_database(schema3);
+
+    // Prepare token(pk)
+    expression unprepared_token_one_pk =
+        function_call{.func = functions::function_name::native_function("token"), .args = {make_column("pk")}};
+    expression prepared_token_one_pk =
+        prepare_expression(unprepared_token_one_pk, db1, "test_ks", schema1.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_one_pk, *schema1), true);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_one_pk, *schema2), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_one_pk, *schema3), false);
+
+    // Prepare token(pk1, pk2, pk3)
+    expression unprepared_token_three_pk =
+        function_call{.func = functions::function_name::native_function("token"),
+                      .args = {make_column("pk1"), make_column("pk2"), make_column("pk3")}};
+    expression prepared_token_three_pk =
+        prepare_expression(unprepared_token_three_pk, db2, "test_ks", schema2.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_one_pk, *schema1), true);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_one_pk, *schema2), false);
+
+    // Same columns, but different schema!
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_one_pk, *schema3), false);
+
+    // Try preparing token(pk1, pk2), fail
+    expression unprepared_token_two_pk = function_call{.func = functions::function_name::native_function("token"),
+                                                       .args = {make_column("pk1"), make_column("pk2")}};
+    BOOST_REQUIRE_THROW(prepare_expression(unprepared_token_two_pk, db2, "test_ks", schema2.get(), nullptr),
+                        exceptions::invalid_request_exception);
+
+    // Prepare token(pk1, pk3, pk2) - wrong order of pk columns
+    expression unprepared_token_pk1_pk3_pk2 =
+        function_call{.func = functions::function_name::native_function("token"),
+                      .args = {make_column("pk1"), make_column("pk3"), make_column("pk2")}};
+    expression prepared_token_pk1_pk3_pk2 =
+        prepare_expression(unprepared_token_pk1_pk3_pk2, db2, "test_ks", schema2.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_pk1_pk3_pk2, *schema1), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_pk1_pk3_pk2, *schema2), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_pk1_pk3_pk2, *schema3), false);
+
+    // Prepare token(pk1, pk1, pk3) - duplicate column
+    expression unprepared_token_pk1_pk1_pk2 =
+        function_call{.func = functions::function_name::native_function("token"),
+                      .args = {make_column("pk1"), make_column("pk1"), make_column("pk3")}};
+    expression prepared_token_pk1_pk1_pk2 =
+        prepare_expression(unprepared_token_pk1_pk1_pk2, db2, "test_ks", schema2.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_pk1_pk1_pk2, *schema1), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_pk1_pk1_pk2, *schema2), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_pk1_pk1_pk2, *schema3), false);
+
+    // Prepare token(ck)
+    expression unprepared_token_ck =
+        function_call{.func = functions::function_name::native_function("token"), .args = {make_column("ck")}};
+    expression prepared_token_ck = prepare_expression(unprepared_token_ck, db1, "test_ks", schema1.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_ck, *schema1), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_ck, *schema2), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_ck, *schema3), false);
+
+    // Prepare token(1, 2, ?) - not a partition token
+    // The bind variable is there to prevent the prepared expression from turning into an expr::constant
+    expression unprepared_token_other =
+        function_call{.func = functions::function_name::native_function("token"),
+                      .args = {make_int_untyped("1"), make_int_untyped("2"), make_bind_variable(0, int32_type)}};
+
+    expression prepared_token_other =
+        prepare_expression(unprepared_token_other, db2, "test_ks", schema2.get(), nullptr);
+
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_other, *schema1), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_other, *schema2), false);
+    BOOST_REQUIRE_EQUAL(is_partition_token_for_schema(prepared_token_other, *schema3), false);
+}
+
+BOOST_AUTO_TEST_CASE(test_aggregation_depth) {
+    BOOST_REQUIRE_EQUAL(aggregation_depth(make_bigint_const(7)), 0);
+    auto schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(schema);
+    auto avg_sum_r = expression(
+            function_call{
+                    .func = functions::function_name("", "avg"),
+                    .args = {
+                            function_call{
+                                    .func = functions::function_name("", "sum"),
+                                    .args = {
+                                            unresolved_identifier{
+                                                    .ident = ::make_shared<column_identifier_raw>("r", false),
+                                            },
+                                    },
+                            },
+                    },
+            }
+    );
+    avg_sum_r = prepare_expression(avg_sum_r, db, "test_ks", schema.get(), nullptr);
+    
+    BOOST_REQUIRE_EQUAL(aggregation_depth(avg_sum_r), 2);
+
+
+    // Now test something with an imbalance
+    auto avg_r = function_call{
+            .func = functions::function_name("", "avg"),
+            .args = {
+                    unresolved_identifier{
+                            .ident = ::make_shared<column_identifier_raw>("r", false),
+                    },
+            },
+    };
+    auto compared = expression(binary_operator(avg_r, oper_t::EQ, avg_sum_r));
+    compared = prepare_expression(compared, db, "test_ks", schema.get(), nullptr);
+ 
+    BOOST_REQUIRE_EQUAL(aggregation_depth(compared), 2);
+}
+
+static
+shared_ptr<functions::function>
+make_two_arg_aggregate_function() {
+    return make_shared<db::functions::aggregate_function>(db::functions::stateless_aggregate_function{
+            .name = functions::function_name("foo", "my_agg"),
+            .result_type = int32_type,
+            .argument_types = { int32_type, int32_type },
+            // THe other fields are important, but not for test_levellize_aggregation_depth
+    });
+}
+
+BOOST_AUTO_TEST_CASE(test_levellize_aggregation_depth) {
+    auto schema = make_simple_test_schema();
+    auto [db, db_data] = make_data_dictionary_database(schema);
+    // my_agg(sum(r), r))
+    auto e = expression(
+            function_call{
+                    .func = make_two_arg_aggregate_function(),
+                    .args = {
+                            function_call{
+                                    .func = functions::function_name::native_function("sum"),
+                                    .args = {
+                                            column_value(&schema->regular_column_at(0)),
+                                    },
+                            },
+                            column_value(&schema->regular_column_at(0)),
+                    },
+            }
+    );
+    e = prepare_expression(e, db, "test_ks", schema.get(), nullptr);
+    BOOST_REQUIRE_EQUAL(aggregation_depth(e), 2);
+    e = levellize_aggregation_depth(e, 3); // Note: aggregation_depth(e) == 2 before the call
+    BOOST_REQUIRE_EQUAL(aggregation_depth(e), 3);
+    // Somewhat fragile, but easiest way to test entire structure
+    BOOST_REQUIRE_EQUAL(fmt::format("{:debug}", e), "foo.my_agg(system.sum(system.$$first$$(r)), system.$$first$$(system.$$first$$(r)))");
+
+    // Repeat the test, but for writetime(r) rather than r, to make sure we
+    // get first(writetime(r)) rather than writetime(first(r)) (#14715).
+    // my_agg(sum(r), writetime(r)))
+    auto e2 = expression(
+            function_call{
+                    .func = make_two_arg_aggregate_function(),
+                    .args = {
+                            function_call{
+                                    .func = functions::function_name::native_function("sum"),
+                                    .args = {
+                                            column_value(&schema->regular_column_at(0)),
+                                    },
+                            },
+                            column_mutation_attribute{
+                                .kind = column_mutation_attribute::attribute_kind::ttl, // conveniently returns int32_type like r
+                                .column = column_value(&schema->regular_column_at(0)),
+                            },
+                    },
+            }
+    );
+    e2 = prepare_expression(e2, db, "test_ks", schema.get(), nullptr);
+    BOOST_REQUIRE_EQUAL(aggregation_depth(e2), 2);
+    e2 = levellize_aggregation_depth(e2, 3); // Note: aggregation_depth(e) == 2 before the call
+    BOOST_REQUIRE_EQUAL(aggregation_depth(e2), 3);
+    // Somewhat fragile, but easiest way to test entire structure
+    BOOST_REQUIRE_EQUAL(fmt::format("{:debug}", e2), "foo.my_agg(system.sum(system.$$first$$(r)), system.$$first$$(system.$$first$$(TTL(r))))");
 }

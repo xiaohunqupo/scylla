@@ -3,32 +3,31 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/range/algorithm/heap_algorithm.hpp>
-#include <boost/range/algorithm/remove.hpp>
-#include <boost/range/algorithm.hpp>
 #include <boost/intrusive/list.hpp>
 #include <boost/intrusive/set.hpp>
 #include <boost/intrusive/slist.hpp>
-#include <boost/range/adaptors.hpp>
 #include <stack>
+#include <ranges>
 
 #include <seastar/core/memory.hh>
 #include <seastar/core/align.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/later.hh>
 
+#include "utils/assert.hh"
 #include "utils/logalloc.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "utils/dynamic_bitset.hh"
 #include "utils/log_heap.hh"
 #include "utils/preempt.hh"
@@ -41,9 +40,9 @@
 using namespace std::chrono_literals;
 
 #ifdef SEASTAR_ASAN_ENABLED
-#include "sanitizer/asan_interface.h"
+#include <sanitizer/asan_interface.h>
 // For each aligned 8 byte segment, the algorithm used by address
-// sanitizer can represent any addressable prefix followd by a
+// sanitizer can represent any addressable prefix followed by a
 // poisoned suffix. The details are at:
 // https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm
 // For us this means that:
@@ -53,9 +52,6 @@ using namespace std::chrono_literals;
 // * Each value must be at least 8 byte aligned. If it was not, making
 //   the value addressable would also make the end of the descriptor
 //   addressable.
-namespace debug {
-constexpr size_t logalloc_alignment = 8;
-}
 template<typename T>
 [[nodiscard]] static T align_up_for_asan(T val) {
     return align_up(val, size_t(8));
@@ -63,7 +59,7 @@ template<typename T>
 template<typename T>
 void poison(const T* addr, size_t size) {
     // Both values and descriptors must be aligned.
-    assert(uintptr_t(addr) % 8 == 0);
+    SCYLLA_ASSERT(uintptr_t(addr) % 8 == 0);
     // This can be followed by
     // * 8 byte aligned descriptor (this is a value)
     // * 8 byte aligned value
@@ -77,9 +73,6 @@ void unpoison(const char *addr, size_t size) {
     ASAN_UNPOISON_MEMORY_REGION(addr, size);
 }
 #else
-namespace debug {
-constexpr size_t logalloc_alignment = 1;
-}
 template<typename T>
 [[nodiscard]] static T align_up_for_asan(T val) { return val; }
 template<typename T>
@@ -200,7 +193,7 @@ migrate_fn_type::register_migrator(migrate_fn_type* m) {
     auto& migrators = *debug::static_migrators;
     auto idx = migrators.add(m);
     // object_descriptor encodes 2 * index() + 1
-    assert(idx * 2 + 1 < utils::uleb64_express_supreme);
+    SCYLLA_ASSERT(idx * 2 + 1 < utils::uleb64_express_supreme);
     m->_migrators = migrators.shared_from_this();
     return idx;
 }
@@ -210,7 +203,49 @@ migrate_fn_type::unregister_migrator(uint32_t index) {
     static_migrators().remove(index);
 }
 
+
+namespace {
+
+// for printing extra message in reclaim_timer::report() when stall is detected.
+//
+// this helper struct is deliberately introduced to ensure no dynamic
+// allocations in reclaim_timer::report(), which is involved in handling OOMs.
+struct extra_msg_when_stall_detected {
+    bool stall_detected;
+    saved_backtrace backtrace;
+    extra_msg_when_stall_detected(bool detected, saved_backtrace&& backtrace)
+        : stall_detected{detected}
+        , backtrace{std::move(backtrace)}
+    {}
+};
+
+}
+
+template <>
+struct fmt::formatter<extra_msg_when_stall_detected> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const extra_msg_when_stall_detected& msg, fmt::format_context& ctx) const {
+        if (msg.stall_detected) {
+            return fmt::format_to(ctx.out(), ", at {}", msg.backtrace);
+        } else {
+            return ctx.out();
+        }
+    }
+};
+
+
 namespace logalloc {
+
+// LSA-specific bad_alloc variant which allows adding additional information on
+// why the allocation failed.
+class bad_alloc : public std::bad_alloc {
+    sstring _what;
+public:
+    bad_alloc(sstring what) : _what(std::move(what)) { }
+    virtual const char* what() const noexcept override {
+        return _what.c_str();
+    }
+};
 
 #ifdef DEBUG_LSA_SANITIZER
 
@@ -504,7 +539,7 @@ public:
     void enable_abort_on_bad_alloc() noexcept { _abort_on_bad_alloc = true; }
     bool should_abort_on_bad_alloc() const noexcept { return _abort_on_bad_alloc; }
     void setup_background_reclaim(scheduling_group sg) {
-        assert(!_background_reclaimer);
+        SCYLLA_ASSERT(!_background_reclaimer);
         _background_reclaimer.emplace(sg, [this] (size_t target) {
             reclaim(target, is_preemptible::yes);
         });
@@ -891,14 +926,14 @@ public:
         if (_delegate_store) {
             return _delegate_store->segment_from_idx(idx);
         }
-        assert(idx < _segments.size());
+        SCYLLA_ASSERT(idx < _segments.size());
         return _segments[idx];
     }
     segment* segment_from_idx(size_t idx) noexcept {
         if (_delegate_store) {
             return _delegate_store->segment_from_idx(idx);
         }
-        assert(idx < _segments.size());
+        SCYLLA_ASSERT(idx < _segments.size());
         return _segments[idx];
     }
     size_t idx_from_segment(const segment* seg) const noexcept {
@@ -922,7 +957,7 @@ public:
         auto seg = new (p) segment;
         poison(seg, sizeof(segment));
         auto i = find_empty();
-        assert(i != _segments.end());
+        SCYLLA_ASSERT(i != _segments.end());
         *i = seg;
         size_t ret = i - _segments.begin();
         _segment_indexes[seg] = ret;
@@ -971,7 +1006,17 @@ class segment_pool {
     utils::dynamic_bitset _lsa_owned_segments_bitmap; // owned by this
     utils::dynamic_bitset _lsa_free_segments_bitmap;  // owned by this, but not in use
     size_t _free_segments = 0;
+
+    // Invariant: _free_segments > _current_emergency_reserve_goal.
+    // Used to ensure that some critical allocations won't fail.
+    // (We grow _current_emergency_reserve_goal in advance and shrink it right
+    // before the critical allocations, which allows them to utilize the pre-reserved
+    // segments).
     size_t _current_emergency_reserve_goal = 1;
+    // Used by allocating_section to request a certain number of free segments
+    // to be prepared for usage when the section is entered.
+    // This is more of a side-channel argument to refill_emergency_reserve() than a real piece of state.
+    // Passing it via a variable makes it easier to debug.
     size_t _emergency_reserve_max = 30;
     bool _allocation_failure_flag = false;
     bool _allocation_enabled = true;
@@ -1052,11 +1097,12 @@ public:
     void clear_allocation_failure_flag() noexcept { _allocation_failure_flag = false; }
     bool allocation_failure_flag() const noexcept { return _allocation_failure_flag; }
     void refill_emergency_reserve();
+    void ensure_free_segments(size_t n_segments);
     void add_non_lsa_memory_in_use(size_t n) noexcept {
         _non_lsa_memory_in_use += n;
     }
     void subtract_non_lsa_memory_in_use(size_t n) noexcept {
-        assert(_non_lsa_memory_in_use >= n);
+        SCYLLA_ASSERT(_non_lsa_memory_in_use >= n);
         _non_lsa_memory_in_use -= n;
     }
     size_t non_lsa_memory_in_use() const noexcept {
@@ -1288,14 +1334,22 @@ segment* segment_pool::allocate_segment(size_t reserve)
 
 void segment_pool::deallocate_segment(segment* seg) noexcept
 {
-    assert(_lsa_owned_segments_bitmap.test(idx_from_segment(seg)));
+    SCYLLA_ASSERT(_lsa_owned_segments_bitmap.test(idx_from_segment(seg)));
     _lsa_free_segments_bitmap.set(idx_from_segment(seg));
     _free_segments++;
 }
 
 void segment_pool::refill_emergency_reserve() {
-    while (_free_segments < _emergency_reserve_max) {
-        auto seg = allocate_segment(_emergency_reserve_max);
+    try {
+        ensure_free_segments(_emergency_reserve_max);
+    } catch (const std::bad_alloc&) {
+        throw bad_alloc(format("failed to refill emergency reserve of {} (have {} free segments)", _emergency_reserve_max, _free_segments));
+    }
+}
+
+void segment_pool::ensure_free_segments(size_t n_segments) {
+    while (_free_segments < n_segments) {
+        auto seg = allocate_segment(n_segments);
         if (!seg) {
             throw std::bad_alloc();
         }
@@ -1323,7 +1377,7 @@ segment_pool::containing_segment(const void* obj) noexcept {
 
 segment*
 segment_pool::segment_from(const segment_descriptor& desc) noexcept {
-    assert(desc._region);
+    SCYLLA_ASSERT(desc._region);
     auto index = &desc - &_segments[0];
     return segment_from_idx(index);
 }
@@ -1333,7 +1387,7 @@ segment_pool::allocate_or_fallback_to_reserve() {
     auto seg = allocate_segment(_current_emergency_reserve_goal);
     if (!seg) {
         _allocation_failure_flag = true;
-        throw std::bad_alloc();
+        throw bad_alloc(format("failed to allocate segment (_current_emergency_reserve_goal={})", _current_emergency_reserve_goal));
     }
     return seg;
 }
@@ -1405,6 +1459,7 @@ inline void segment_pool::on_segment_compaction(size_t used_size) noexcept {
 
 inline void segment_pool::on_memory_allocation(size_t size) noexcept {
     _stats.memory_allocated += size;
+    ++_stats.num_allocations;
 }
 
 inline void segment_pool::on_memory_deallocation(size_t size) noexcept {
@@ -1445,7 +1500,7 @@ reclaim_timer::reclaim_timer(const char* name, is_preemptible preemptible, size_
             // the hardware clock -- no effort is made to round the values to
             // resolution. Therefore, tick durations vary slightly in both
             // directions. We subtract something slightly bigger than these
-            // variations, to accomodate blocked-reactor-notify-ms values which
+            // variations, to accommodate blocked-reactor-notify-ms values which
             // are multiplies of resolution.
             // E.g. with kernel CONFIG_HZ=250, coarse clock resolution is 4ms.
             // If also we also have blocked-reactor-notify-ms=4, then we would
@@ -1506,7 +1561,8 @@ void reclaim_timer::report() const noexcept {
     auto time_level = _stall_detected ? log_level::warn : log_level::debug;
     auto info_level = _stall_detected ? log_level::info : log_level::debug;
     auto MiB = 1024*1024;
-    auto msg_extra = _stall_detected ? fmt::format(", at {}", current_backtrace()) : "";
+    auto msg_extra = extra_msg_when_stall_detected(_stall_detected,
+                                                   _stall_detected ? current_backtrace() : saved_backtrace{});
 
     timing_logger.log(time_level, "{} took {} us, trying to release {:.3f} MiB {}preemptibly, reserve: {{goal: {}, max: {}}}{}",
                         _name, (_duration + 500ns) / 1us, (float)_memory_to_release / MiB, _preemptible ? "" : "non-",
@@ -1841,7 +1897,7 @@ private:
 
         if (seg != _buf_active) {
             if (desc.is_empty()) {
-                assert(desc._buf_pointers.empty());
+                SCYLLA_ASSERT(desc._buf_pointers.empty());
                 _segment_descs.erase(desc);
                 desc._buf_pointers = std::vector<entangled>();
                 free_segment(seg, desc);
@@ -1867,7 +1923,7 @@ private:
             for (entangled& e : _buf_ptrs_for_compact_segment) {
                 if (e) {
                     lsa_buffer* old_ptr = e.get(&lsa_buffer::_link);
-                    assert(&desc == old_ptr->_desc);
+                    SCYLLA_ASSERT(&desc == old_ptr->_desc);
                     lsa_buffer dst = alloc_buf(old_ptr->_size);
                     memcpy(dst._buf, old_ptr->_buf, dst._size);
                     old_ptr->_link = std::move(dst._link);
@@ -1902,7 +1958,7 @@ private:
             // Memory allocation above could allocate active buffer during segment compaction.
             close_buf_active();
         }
-        assert((uintptr_t)new_active->at(0) % buf_align == 0);
+        SCYLLA_ASSERT((uintptr_t)new_active->at(0) % buf_align == 0);
         segment_descriptor& desc = segment_pool().descriptor(new_active);
         desc._buf_pointers = std::move(ptrs);
         desc.set_kind(segment_kind::bufs);
@@ -1947,17 +2003,17 @@ public:
         while (!_segment_descs.empty()) {
             auto& desc = _segment_descs.one_of_largest();
             _segment_descs.pop_one_of_largest();
-            assert(desc.is_empty());
+            SCYLLA_ASSERT(desc.is_empty());
             free_segment(desc);
         }
         _closed_occupancy = {};
         if (_active) {
-            assert(segment_pool().descriptor(_active).is_empty());
+            SCYLLA_ASSERT(segment_pool().descriptor(_active).is_empty());
             free_segment(_active);
             _active = nullptr;
         }
         if (_buf_active) {
-            assert(segment_pool().descriptor(_buf_active).is_empty());
+            SCYLLA_ASSERT(segment_pool().descriptor(_buf_active).is_empty());
             free_segment(_buf_active);
             _buf_active = nullptr;
         }
@@ -2074,7 +2130,7 @@ private:
     void on_non_lsa_free(void* obj) noexcept {
         auto allocated_size = malloc_usable_size(obj);
         auto cookie = (non_lsa_object_cookie*)((char*)obj + allocated_size) - 1;
-        assert(cookie->value == non_lsa_object_cookie().value);
+        SCYLLA_ASSERT(cookie->value == non_lsa_object_cookie().value);
         _non_lsa_occupancy -= occupancy_stats(0, allocated_size);
         if (_listener) {
             _evictable_space -= allocated_size;
@@ -2201,6 +2257,21 @@ public:
         other._sanitizer = region_sanitizer(_tracker.get_impl().sanitizer_report_backtrace());
     }
 
+    std::unordered_map<std::string, uint64_t> collect_stats() const {
+        std::unordered_map<std::string, uint64_t> sizes;
+        for (auto& desc : _segment_descs) {
+            const_cast<region_impl&>(*this).for_each_live(segment_pool().segment_from(desc), [&sizes] (const object_descriptor* desc, void* obj, size_t size) {
+                auto n = desc->migrator()->name();
+                if (sizes.contains(n)) {
+                    sizes[n] += size;
+                } else {
+                    sizes.emplace(n, size);
+                }
+            });
+        }
+        return sizes;
+    }
+
     // Returns occupancy of the sparsest compactible segment.
     occupancy_stats min_occupancy() const noexcept {
         if (_segment_descs.empty()) {
@@ -2283,6 +2354,44 @@ public:
 
     const eviction_fn& evictor() const noexcept {
         return _eviction_fn;
+    }
+
+    // LSA holds an internal "emergency reserve" of free segments that
+    // is only "opened" for usage before some critical allocations
+    // (in particular: the ones performed during memory compaction)
+    // to ensure that they won't fail.
+    //
+    // Here we hijack this mechanism to let the rest of the application implement
+    // some critical sections with infallible LSA allocations.
+    //
+    // reserve() increments the size of the internal emergency reserve,
+    // unreserve() decrements it.
+    //
+    // When you want to have some critical section that has to do some LSA 
+    // allocations infallibly (e.g. to restore some invariants
+    // of a LSA-managed data structure in a destructor), you can call reserve()
+    // beforehand to ensure that some extra memory will be held unused,
+    // and then call unreserve() (with reserve()'s return value as the argument)
+    // to make the reserved free segments available to the critical section.
+    // 
+    uintptr_t reserve(size_t memory) override {
+        // We round up the requested reserve to full segments.
+        size_t n_segments = (memory + segment::size - 1) >> segment::size_shift;
+
+        auto& pool = segment_pool();
+        size_t new_goal = pool.current_emergency_reserve_goal() + n_segments;
+        pool.ensure_free_segments(new_goal);
+        pool.set_current_emergency_reserve_goal(new_goal);
+
+        static_assert(sizeof(uintptr_t) >= sizeof(size_t));
+        return n_segments;
+    }
+
+    void unreserve(uintptr_t n_segments) noexcept override {
+        auto& pool = segment_pool();
+        SCYLLA_ASSERT(pool.current_emergency_reserve_goal() >= n_segments);
+        size_t new_goal = pool.current_emergency_reserve_goal() - n_segments;
+        pool.set_current_emergency_reserve_goal(new_goal);
     }
 
     friend class region;
@@ -2427,9 +2536,8 @@ uint64_t region::id() const noexcept {
     return get_impl().id();
 }
 
-std::ostream& operator<<(std::ostream& out, const occupancy_stats& stats) {
-    return out << format("{:.2f}%, {:d} / {:d} [B]",
-        stats.used_fraction() * 100, stats.used_space(), stats.total_space());
+std::unordered_map<std::string, uint64_t> region::collect_stats() const {
+    return get_impl().collect_stats();
 }
 
 occupancy_stats tracker::impl::global_occupancy() const noexcept {
@@ -2556,10 +2664,10 @@ idle_cpu_handler_result tracker::impl::compact_on_idle(work_waiting_on_reactor c
         return c2->min_occupancy() < c1->min_occupancy();
     };
 
-    boost::range::make_heap(_regions, cmp);
+    std::ranges::make_heap(_regions, cmp);
 
     while (!check_for_work()) {
-        boost::range::pop_heap(_regions, cmp);
+        std::ranges::pop_heap(_regions, cmp);
         region::impl* r = _regions.back();
 
         if (!r->is_idle_compactible()) {
@@ -2568,7 +2676,7 @@ idle_cpu_handler_result tracker::impl::compact_on_idle(work_waiting_on_reactor c
 
         r->compact();
 
-        boost::range::push_heap(_regions, cmp);
+        std::ranges::push_heap(_regions, cmp);
     }
     return idle_cpu_handler_result::interrupted_by_higher_priority_task;
 }
@@ -2664,7 +2772,7 @@ size_t tracker::impl::compact_and_evict_locked(size_t reserve_segments, size_t m
         return c2->min_occupancy() < c1->min_occupancy();
     };
 
-    boost::range::make_heap(_regions, cmp);
+    std::ranges::make_heap(_regions, cmp);
 
     if (llogger.is_enabled(logging::log_level::debug)) {
         llogger.debug("Occupancy of regions:");
@@ -2680,7 +2788,7 @@ size_t tracker::impl::compact_and_evict_locked(size_t reserve_segments, size_t m
                               regions, evictable_regions, regions - evictable_regions);
         });
         while (_segment_pool->total_memory_in_use() > target_mem) {
-            boost::range::pop_heap(_regions, cmp);
+            std::ranges::pop_heap(_regions, cmp);
             region::impl* r = _regions.back();
 
             if (!r->is_compactible()) {
@@ -2700,7 +2808,7 @@ size_t tracker::impl::compact_and_evict_locked(size_t reserve_segments, size_t m
                 r->compact();
             }
 
-            boost::range::push_heap(_regions, cmp);
+            std::ranges::push_heap(_regions, cmp);
 
             if (preempt && need_preempt()) {
                 break;
@@ -2882,14 +2990,14 @@ void allocating_section::reserve(tracker::impl& tracker) {
             break;
         }
         if (!tracker.reclaim(_std_reserve - free, is_preemptible::no)) {
-            throw std::bad_alloc();
+            throw bad_alloc(format("failed to reclaim {} bytes of memory, while attempting to ensure an std reserve of {}", _std_reserve - free, _std_reserve));
         }
     }
 
     pool.clear_allocation_failure_flag();
-  } catch (const std::bad_alloc&) {
+  } catch (const std::bad_alloc& ex) {
         if (tracker.should_abort_on_bad_alloc()) {
-            llogger.error("Aborting due to allocation failure");
+            llogger.error("Aborting due to allocation failure: {}", ex.what());
             abort();
         }
         throw;
@@ -2900,10 +3008,10 @@ void allocating_section::on_alloc_failure(logalloc::region& r) {
     r.allocator().invalidate_references();
     if (r.get_tracker().get_impl().segment_pool().allocation_failure_flag()) {
         _lsa_reserve *= 2;
-        llogger.debug("LSA allocation failure, increasing reserve in section {} to {} segments", fmt::ptr(this), _lsa_reserve);
+        llogger.info("LSA allocation failure, increasing reserve in section {} to {} segments; trace: {}", fmt::ptr(this), _lsa_reserve, current_backtrace());
     } else {
         _std_reserve *= 2;
-        llogger.debug("Standard allocator failure, increasing head-room in section {} to {} [B]", fmt::ptr(this), _std_reserve);
+        llogger.info("Standard allocator failure, increasing head-room in section {} to {} [B]; trace: {}", fmt::ptr(this), _std_reserve, current_backtrace());
     }
     reserve(r.get_tracker().get_impl());
 }

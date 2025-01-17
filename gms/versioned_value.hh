@@ -5,20 +5,21 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
-#include "utils/serialization.hh"
 #include "locator/host_id.hh"
 #include "version_generator.hh"
 #include "gms/inet_address.hh"
-#include "dht/i_partitioner.hh"
-#include "to_string.hh"
+#include "dht/token.hh"
+#include "schema/schema_fwd.hh"
+#include "service/state_id.hh"
 #include "version.hh"
 #include "cdc/generation_id.hh"
+#include <set>
 #include <unordered_set>
 
 namespace gms {
@@ -36,39 +37,32 @@ namespace gms {
  */
 
 class versioned_value {
+    version_type _version;
+    sstring _value;
 public:
     // this must be a char that cannot be present in any token
-    static constexpr char DELIMITER = ',';
-    static constexpr const char DELIMITER_STR[] = { DELIMITER, 0 };
+    static constexpr std::string_view DELIMITER{","};
 
     // values for ApplicationState.STATUS
-    static constexpr const char* STATUS_UNKNOWN = "UNKNOWN";
-    static constexpr const char* STATUS_BOOTSTRAPPING = "BOOT";
-    static constexpr const char* STATUS_NORMAL = "NORMAL";
-    static constexpr const char* STATUS_LEAVING = "LEAVING";
-    static constexpr const char* STATUS_LEFT = "LEFT";
-    static constexpr const char* STATUS_MOVING = "MOVING";
+    static constexpr std::string_view STATUS_UNKNOWN{"UNKNOWN"};
+    static constexpr std::string_view STATUS_BOOTSTRAPPING{"BOOT"};
+    static constexpr std::string_view STATUS_NORMAL{"NORMAL"};
+    static constexpr std::string_view STATUS_LEFT{"LEFT"};
 
-    static constexpr const char* REMOVING_TOKEN = "removing";
-    static constexpr const char* REMOVED_TOKEN = "removed";
+    static constexpr std::string_view REMOVED_TOKEN{"removed"};
 
-    static constexpr const char* HIBERNATE = "hibernate";
-    static constexpr const char* SHUTDOWN = "shutdown";
+    static constexpr std::string_view SHUTDOWN{"shutdown"};
 
-    // values for ApplicationState.REMOVAL_COORDINATOR
-    static constexpr const char* REMOVAL_COORDINATOR = "REMOVER";
+    [[nodiscard]] version_type version() const noexcept { return _version; };
+    [[nodiscard]] const sstring& value() const noexcept { return _value; };
 
-    int version;
-    sstring value;
-public:
     bool operator==(const versioned_value& other) const noexcept {
-        return version == other.version &&
-               value   == other.value;
+        return _version == other._version &&
+               _value   == other._value;
     }
 
-public:
-    versioned_value(const sstring& value, int version = version_generator::get_next_version())
-        : version(version), value(value) {
+    explicit versioned_value(const sstring& value, version_type version = version_generator::get_next_version())
+        : _version(version), _value(value) {
 #if 0
         // blindly interning everything is somewhat suboptimal -- lots of VersionedValues are unique --
         // but harmless, and interning the non-unique ones saves significant memory.  (Unfortunately,
@@ -78,24 +72,16 @@ public:
 #endif
     }
 
-    versioned_value(sstring&& value, int version = version_generator::get_next_version()) noexcept
-        : version(version), value(std::move(value)) {
+    explicit versioned_value(sstring&& value, version_type version = version_generator::get_next_version()) noexcept
+        : _version(version), _value(std::move(value)) {
     }
 
     versioned_value() noexcept
-        : version(-1) {
-    }
-
-    int compare_to(const versioned_value &value) const noexcept {
-        return version - value.version;
-    }
-
-    friend inline std::ostream& operator<<(std::ostream& os, const versioned_value& x) {
-        return os << "Value(" << x.value << "," << x.version <<  ")";
+        : _version(-1) {
     }
 
     static sstring version_string(const std::initializer_list<sstring>& args) {
-        return ::join(sstring(versioned_value::DELIMITER_STR), args);
+        return fmt::to_string(fmt::join(args, versioned_value::DELIMITER));
     }
 
     static sstring make_full_token_string(const std::unordered_set<dht::token>& tokens);
@@ -109,7 +95,7 @@ public:
     static std::optional<cdc::generation_id> cdc_generation_id_from_string(const sstring&);
 
     static versioned_value clone_with_higher_version(const versioned_value& value) noexcept {
-        return versioned_value(value.value);
+        return versioned_value(value.value());
     }
 
     static versioned_value bootstrapping(const std::unordered_set<dht::token>& tokens) {
@@ -130,21 +116,10 @@ public:
         return versioned_value(new_version.to_sstring());
     }
 
-    static versioned_value leaving(const std::unordered_set<dht::token>& tokens) {
-        return versioned_value(version_string({sstring(versioned_value::STATUS_LEAVING),
-                                               make_token_string(tokens)}));
-    }
-
     static versioned_value left(const std::unordered_set<dht::token>& tokens, int64_t expire_time) {
         return versioned_value(version_string({sstring(versioned_value::STATUS_LEFT),
                                                make_token_string(tokens),
                                                std::to_string(expire_time)}));
-    }
-
-    static versioned_value moving(dht::token t) {
-        std::unordered_set<dht::token> tokens = {t};
-        return versioned_value(version_string({sstring(versioned_value::STATUS_MOVING),
-                                               make_token_string(tokens)}));
     }
 
     static versioned_value host_id(const locator::host_id& host_id) {
@@ -159,23 +134,12 @@ public:
         return versioned_value(make_cdc_generation_id_string(gen_id));
     }
 
-    static versioned_value removing_nonlocal(const locator::host_id& host_id) {
-        return versioned_value(sstring(REMOVING_TOKEN) +
-            sstring(DELIMITER_STR) + host_id.to_sstring());
-    }
-
     static versioned_value removed_nonlocal(const locator::host_id& host_id, int64_t expire_time) {
-        return versioned_value(sstring(REMOVED_TOKEN) + sstring(DELIMITER_STR) +
-            host_id.to_sstring() + sstring(DELIMITER_STR) + to_sstring(expire_time));
-    }
-
-    static versioned_value removal_coordinator(const locator::host_id& host_id) {
-        return versioned_value(sstring(REMOVAL_COORDINATOR) +
-            sstring(DELIMITER_STR) + host_id.to_sstring());
+        return versioned_value(sstring(REMOVED_TOKEN) + sstring(DELIMITER) + host_id.to_sstring() + sstring(DELIMITER) + to_sstring(expire_time));
     }
 
     static versioned_value shutdown(bool value) {
-        return versioned_value(sstring(SHUTDOWN) + sstring(DELIMITER_STR) + (value ? "true" : "false"));
+        return versioned_value(sstring(SHUTDOWN) + sstring(DELIMITER) + (value ? "true" : "false"));
     }
 
     static versioned_value datacenter(const sstring& dc_id) {
@@ -217,7 +181,7 @@ public:
     }
 
     static versioned_value supported_features(const std::set<std::string_view>& features) {
-        return versioned_value(::join(",", features));
+        return versioned_value(fmt::to_string(fmt::join(features, ",")));
     }
 
     static versioned_value cache_hitrates(const sstring& hitrates) {
@@ -227,6 +191,17 @@ public:
     static versioned_value cql_ready(bool value) {
         return versioned_value(to_sstring(int(value)));
     };
+
+    static versioned_value state_id(const service::state_id& state_id) {
+        return versioned_value(state_id.to_sstring());
+    }
+
 }; // class versioned_value
 
 } // namespace gms
+
+template <> struct fmt::formatter<gms::versioned_value> : fmt::formatter<string_view> {
+    static auto format(const gms::versioned_value& v, fmt::format_context& ctx) {
+        return fmt::format_to(ctx.out(), "Value({},{})", v.value(), v.version());
+    }
+};

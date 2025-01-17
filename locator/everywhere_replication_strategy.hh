@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -16,16 +16,14 @@
 namespace locator {
 class everywhere_replication_strategy : public abstract_replication_strategy {
 public:
-    everywhere_replication_strategy(const replication_strategy_config_options& config_options);
+    everywhere_replication_strategy(replication_strategy_params params);
 
-    virtual bool natural_endpoints_depend_on_token() const noexcept override { return false; }
+    virtual future<host_id_set> calculate_natural_endpoints(const token& search_token, const token_metadata& tm) const override;
 
-    virtual future<endpoint_set> calculate_natural_endpoints(const token& search_token, const token_metadata& tm) const override;
-
-    virtual void validate_options() const override { /* noop */ }
+    virtual void validate_options(const gms::feature_service&) const override;
 
     std::optional<std::unordered_set<sstring>> recognized_options(const topology&) const override {
-        // We explicitely allow all options
+        // We explicitly allow all options
         return std::nullopt;
     }
 
@@ -35,11 +33,6 @@ public:
         return true;
     }
 
-    /**
-     * We need to override this because the default implementation depends
-     * on token calculations but everywhere_replication_strategy may be used before tokens are set up.
-     */
-    virtual inet_address_vector_replica_set get_natural_endpoints(const token&, const effective_replication_map&) const override;
-    virtual stop_iteration for_each_natural_endpoint_until(const token&, const effective_replication_map&, const noncopyable_function<stop_iteration(const inet_address&)>& func) const override;
+    [[nodiscard]] sstring sanity_check_read_replicas(const effective_replication_map& erm, const host_id_vector_replica_set& read_replicas) const override;
 };
 }

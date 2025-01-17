@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "utils/UUID.hh"
 #include "schema/schema_fwd.hh"
-#include "query-request.hh"
+#include "query_id.hh"
 #include "locator/host_id.hh"
 #include "tasks/types.hh"
 
@@ -42,4 +42,3 @@ class host_id final {
 };
 
 } // namespace locator
-

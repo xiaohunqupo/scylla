@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "auth/passwords.hh"
 
 #include <cerrno>
-#include <optional>
 
 extern "C" {
 #include <crypt.h>
@@ -18,7 +17,7 @@ extern "C" {
 
 namespace auth::passwords {
 
-static thread_local crypt_data tlcrypt = { 0, };
+static thread_local crypt_data tlcrypt = {};
 
 namespace detail {
 
@@ -47,14 +46,13 @@ sstring hash_with_salt(const sstring& pass, const sstring& salt) {
     return res;
 }
 
-const char* prefix_for_scheme(scheme c) noexcept {
+std::string_view prefix_for_scheme(scheme c) noexcept {
     switch (c) {
     case scheme::bcrypt_y: return "$2y$";
     case scheme::bcrypt_a: return "$2a$";
     case scheme::sha_512: return "$6$";
     case scheme::sha_256: return "$5$";
     case scheme::md5: return "$1$";
-    default: return nullptr;
     }
 }
 
@@ -68,4 +66,4 @@ bool check(const sstring& pass, const sstring& salted_hash) {
     return detail::hash_with_salt(pass, salted_hash) == salted_hash;
 }
 
-} // namespace auth::paswords
+} // namespace auth::passwords

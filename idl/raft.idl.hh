@@ -3,8 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include "raft/raft.hh"
+
+#include "idl/raft_storage.idl.hh"
 
 namespace raft {
 
@@ -97,8 +101,8 @@ struct entry_id {
     raft::index_t idx;
 };
 
-verb [[with_client_info, with_timeout]] raft_send_snapshot (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::install_snapshot) -> raft::snapshot_reply;
-verb [[with_client_info, with_timeout, one_way]] raft_append_entries (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::append_request);
+verb [[with_client_info, with_timeout]] raft_send_snapshot (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::install_snapshot snap [[ref]]) -> raft::snapshot_reply;
+verb [[with_client_info, with_timeout, one_way]] raft_append_entries (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::append_request req [[ref]]);
 verb [[with_client_info, with_timeout, one_way]] raft_append_entries_reply (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::append_reply);
 verb [[with_client_info, with_timeout, one_way]] raft_vote_request (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::vote_request);
 verb [[with_client_info, with_timeout, one_way]] raft_vote_reply (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::vote_reply);
@@ -106,8 +110,8 @@ verb [[with_client_info, with_timeout, one_way]] raft_timeout_now (raft::group_i
 verb [[with_client_info, with_timeout, one_way]] raft_read_quorum (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::read_quorum);
 verb [[with_client_info, with_timeout, one_way]] raft_read_quorum_reply (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::read_quorum_reply);
 verb [[with_client_info, with_timeout]] raft_execute_read_barrier_on_leader (raft::group_id, raft::server_id from_id, raft::server_id dst_id) -> raft::read_barrier_reply;
-verb [[with_client_info, with_timeout]] raft_add_entry (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::command cmd) -> raft::add_entry_reply;
-verb [[with_client_info, with_timeout]] raft_modify_config (raft::group_id gid, raft::server_id from_id, raft::server_id dst_id, std::vector<raft::config_member> add, std::vector<raft::server_id> del) -> raft::add_entry_reply;
+verb [[with_client_info, with_timeout]] raft_add_entry (raft::group_id, raft::server_id from_id, raft::server_id dst_id, raft::command cmd [[ref]]) -> raft::add_entry_reply;
+verb [[with_client_info, with_timeout]] raft_modify_config (raft::group_id gid, raft::server_id from_id, raft::server_id dst_id, std::vector<raft::config_member> add [[ref]], std::vector<raft::server_id> del [[ref]]) -> raft::add_entry_reply;
 
 } // namespace raft
 
@@ -117,8 +121,12 @@ struct wrong_destination {
     raft::server_id reached_id;
 };
 
+struct group_liveness_info {
+    bool group0_alive;
+};
+
 struct direct_fd_ping_reply {
-    std::variant<std::monostate, service::wrong_destination> result;
+    std::variant<std::monostate, service::wrong_destination, service::group_liveness_info> result;
 };
 
 verb [[with_client_info, cancellable]] direct_fd_ping (raft::server_id dst_id) -> service::direct_fd_ping_reply;

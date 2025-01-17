@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -20,7 +20,7 @@ class role_name;
 
 namespace statements {
 
-class permission_altering_statement : public authorization_statement {
+class permission_altering_statement : public authorization_altering_statement {
 protected:
     auth::permission_set _permissions;
     mutable auth::resource _resource;
@@ -29,7 +29,6 @@ protected:
 public:
     permission_altering_statement(auth::permission_set, auth::resource, const cql3::role_name&);
 
-    void validate(query_processor&, const service::client_state&) const override;
     future<> check_access(query_processor& qp, const service::client_state&) const override;
 };
 

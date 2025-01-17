@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -33,7 +33,7 @@ future<> drop_view_statement::check_access(query_processor& qp, const service::c
         const data_dictionary::database db = qp.db();
         auto&& s = db.find_schema(keyspace(), column_family());
         if (s->is_view()) {
-            return state.has_column_family_access(db, keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
+            return state.has_column_family_access(keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
         }
     } catch (const data_dictionary::no_such_column_family& e) {
         // Will be validated afterwards.
@@ -41,18 +41,13 @@ future<> drop_view_statement::check_access(query_processor& qp, const service::c
     return make_ready_future<>();
 }
 
-void drop_view_statement::validate(query_processor&, const service::client_state& state) const
-{
-    // validated in migration_manager::announce_view_drop()
-}
-
-future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>>
-drop_view_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
+drop_view_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     ::shared_ptr<cql_transport::event::schema_change> ret;
     std::vector<mutation> m;
 
     try {
-        m = co_await qp.get_migration_manager().prepare_view_drop_announcement(keyspace(), column_family(), ts);
+        m = co_await service::prepare_view_drop_announcement(qp.proxy(), keyspace(), column_family(), ts);
 
         using namespace cql_transport;
         ret = ::make_shared<event::schema_change>(
@@ -66,12 +61,12 @@ drop_view_statement::prepare_schema_mutations(query_processor& qp, api::timestam
         }
     }
 
-    co_return std::make_pair(std::move(ret), std::move(m));
+    co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 drop_view_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<drop_view_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<drop_view_statement>(*this));
 }
 
 }

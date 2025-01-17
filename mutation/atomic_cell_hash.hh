@@ -3,15 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 // Not part of atomic_cell.hh to avoid cyclic dependency between types.hh and atomic_cell.hh
 
-#include "types.hh"
-#include "types/collection.hh"
+#include "types/types.hh"
 #include "atomic_cell.hh"
 #include "atomic_cell_or_collection.hh"
 #include "utils/hashing.hh"

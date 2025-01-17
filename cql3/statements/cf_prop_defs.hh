@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -36,8 +36,6 @@ namespace statements {
 class cf_prop_defs : public property_definitions {
 public:
     static const sstring KW_COMMENT;
-    static const sstring KW_READREPAIRCHANCE;
-    static const sstring KW_DCLOCALREADREPAIRCHANCE;
     static const sstring KW_GCGRACESECONDS;
     static const sstring KW_PAXOSGRACESECONDS;
     static const sstring KW_MINCOMPACTIONTHRESHOLD;
@@ -66,6 +64,9 @@ public:
     static constexpr int32_t DEFAULT_DEFAULT_TIME_TO_LIVE = 0;
     static constexpr int32_t DEFAULT_MIN_INDEX_INTERVAL = 128;
     static constexpr int32_t DEFAULT_MAX_INDEX_INTERVAL = 2048;
+    static constexpr int32_t DEFAULT_MEMTABLE_FLUSH_PERIOD = 0;
+
+    static constexpr int32_t DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE = 60000;
 
 private:
     mutable std::optional<sstables::compaction_strategy_type> _compaction_strategy_class;
@@ -103,7 +104,7 @@ public:
     std::optional<table_id> get_id() const;
     bool get_synchronous_updates_flag() const;
 
-    void apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions) const;
+    void apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions, const data_dictionary::database& db, sstring ks_name) const;
     void validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const;
 };
 

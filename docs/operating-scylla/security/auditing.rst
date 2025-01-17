@@ -17,11 +17,11 @@ Enable ScyllaDB :doc:`Authentication </operating-scylla/security/authentication>
 Enabling Audit
 ---------------
 
-Enabling auditing is controlled by the ``audit:`` parameter in the ``scylla.yaml`` file. 
+By default, auditing is **disabled**. Enabling auditing is controlled by the ``audit:`` parameter in the ``scylla.yaml`` file.
 You can set the following options:
 
-* ``none`` - Audit is disabled.
-* ``table`` - Audit is enabled, and messages are stored in a Scylla table (default).
+* ``none`` - Audit is disabled (default).
+* ``table`` - Audit is enabled, and messages are stored in a Scylla table.
 * ``syslog`` - Audit is enabled, and messages are sent to Syslog.
 
 Configuring any other value results in an error at Scylla startup.
@@ -148,6 +148,11 @@ For example:
          error boolean,
          PRIMARY KEY ((date, node), event_time));
 
+.. note:: The schema of ``audit.audit_log`` has been migrated in the 2024.2 version from ``SimpleStrategy RF=1`` to ``NetworkTopologyStrategy RF=3``:
+
+   * By default every DC will contain 3 audit replicas. If a new DC is added, in order for it to also contain audit replicas, audit's schema has to be manually altered.
+   * CL for writes is still equal to ``1``, which implies that reading audit rows with CL=Quorum may fail, which is especially true for clusters with less than 3 nodes.
+
 **Procedure**
 
 #. Set the ``audit`` parameter in the ``scylla.yaml`` file to ``table``.
@@ -191,8 +196,24 @@ For example:
       2018-03-18 00:00:00+0000 | 10.143.2.108 | 3429b1a5-2a94-11e8-8f4e-000000000001 |      DDL |         ONE | False |           nba | DROP TABLE nba.team_roster ; | 127.0.0.1       | team_roster | Scylla   | 
       (1 row)
 
+Handling Audit Failures
+---------------------------
+
+In some cases, auditing may not be possible, for example, when:
+
+* A table is used as the audit’s backend, and the audit partition where the audit row is saved is not available because the node that holds this partition is down.
+* Syslog is used as the audit’s backend, and the Syslog sink (a regular unix socket) is unresponsive/unavailable.
+
+If the audit fails and audit messages are not stored in the configured audit’s backend, you can still review the audit log in the regular ScyllaDB logs.
+
+The following example shows audit information in the regular ScyllaDB logs in the case when the Syslog backend is broken (for example, because the socket was closed) and you tried to connect to a node with incorrect credentials:
+
+   .. code-block:: shell
+
+      ERROR 2024-01-15 14:09:41,516 [shard 0:sl:d] audit - Unexpected exception when writing login log with: node_ip <IP:port> client_ip <IP:port> username <username> error true exception audit::audit_exception (Starting syslog audit backend failed (sending a message to <socket_path> resulted in sendto: No such file or directory).)
+
 Additional Resources
-====================
+-----------------------------------
 
 * :doc:`Authorization</operating-scylla/security/authorization>` 
 

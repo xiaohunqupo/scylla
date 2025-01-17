@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -15,19 +15,19 @@
 #include "service/storage_proxy.hh"
 #include "lang/lua.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "replica/database.hh" // for wasm
+#include "lang/manager.hh"
 #include "cql3/query_processor.hh"
-#include "db/config.hh"
 
 namespace cql3 {
 
 namespace statements {
 
-shared_ptr<functions::function> create_function_statement::create(query_processor& qp, functions::function* old) const {
+
+seastar::future<shared_ptr<functions::function>> create_function_statement::create(query_processor& qp, functions::function* old) const {
     if (old && !dynamic_cast<functions::user_function*>(old)) {
         throw exceptions::invalid_request_exception(format("Cannot replace '{}' which is not a user defined function", *old));
     }
-    if (_language != "lua" && _language != "xwasm") {
+    if (_language != "lua" && _language != "wasm") {
         throw exceptions::invalid_request_exception(format("Language '{}' is not supported", _language));
     }
     data_type return_type = prepare_type(qp, *_return_type);
@@ -36,47 +36,41 @@ shared_ptr<functions::function> create_function_statement::create(query_processo
         arg_names.push_back(arg_name->to_string());
     }
 
-    auto&& db = qp.db();
-    if (_language == "lua") {
-        auto cfg = lua::make_runtime_config(db.get_config());
-        functions::user_function::context ctx = functions::user_function::lua_context {
-            .bitcode = lua::compile(cfg, arg_names, _body),
-            .cfg = cfg,
-        };
-
-        return ::make_shared<functions::user_function>(_name, _arg_types, std::move(arg_names), _body, _language,
-            std::move(return_type), _called_on_null_input, std::move(ctx));
-    } else if (_language == "xwasm") {
-       // FIXME: need better way to test wasm compilation without real_database()
-       wasm::context ctx{db.real_database().wasm_engine(), _name.name, qp.get_wasm_instance_cache(), db.get_config().wasm_udf_yield_fuel(), db.get_config().wasm_udf_total_fuel()};
-       try {
-            wasm::precompile(ctx, arg_names, _body);
-            return ::make_shared<functions::user_function>(_name, _arg_types, std::move(arg_names), _body, _language,
-                std::move(return_type), _called_on_null_input, std::move(ctx));
-       } catch (const wasm::exception& we) {
-           throw exceptions::invalid_request_exception(we.what());
-       }
+    auto ctx = co_await qp.lang().create(_language, _name.name, arg_names, _body);
+    if (!ctx) {
+        co_return nullptr;
     }
-    return nullptr;
+    co_return ::make_shared<functions::user_function>(_name, _arg_types, std::move(arg_names), _body, _language,
+        std::move(return_type), _called_on_null_input, std::move(*ctx));
+}
+
+audit::statement_category
+create_function_statement::category() const {
+    return audit::statement_category::DDL;
+}
+
+audit::audit_info_ptr
+create_function_statement::audit_info() const {
+    return audit::audit::create_audit_info(category(), sstring(), sstring());
 }
 
 std::unique_ptr<prepared_statement> create_function_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<create_function_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_function_statement>(*this));
 }
 
-future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>>
-create_function_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>>
+create_function_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     ::shared_ptr<cql_transport::event::schema_change> ret;
     std::vector<mutation> m;
 
-    auto func = dynamic_pointer_cast<functions::user_function>(validate_while_executing(qp));
+    auto func = dynamic_pointer_cast<functions::user_function>(co_await validate_while_executing(qp));
 
     if (func) {
-        m = co_await qp.get_migration_manager().prepare_new_function_announcement(func, ts);
+        m = co_await service::prepare_new_function_announcement(qp.proxy(), func, ts);
         ret = create_schema_change(*func, true);
     }
 
-    co_return std::make_pair(std::move(ret), std::move(m));
+    co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
 }
 
 create_function_statement::create_function_statement(functions::function_name name, sstring language, sstring body,

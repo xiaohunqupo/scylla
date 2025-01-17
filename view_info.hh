@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "dht/i_partitioner.hh"
 #include "query-request.hh"
 #include "schema/schema_fwd.hh"
 #include "db/view/view.hh"
@@ -25,6 +24,10 @@ class view_info final {
     mutable std::optional<query::partition_slice> _partition_slice;
     db::view::base_info_ptr _base_info;
     mutable bool _has_computed_column_depending_on_base_non_primary_key;
+
+    // True if the partition key columns of the view are the same as the
+    // partition key columns of the base, maybe in a different order.
+    mutable bool _is_partition_key_permutation_of_base_partition_key;
 public:
     view_info(const schema& schema, const raw_view_info& raw_view_info);
 
@@ -48,13 +51,17 @@ public:
         return _raw.where_clause();
     }
 
-    cql3::statements::select_statement& select_statement() const;
-    const query::partition_slice& partition_slice() const;
+    cql3::statements::select_statement& select_statement(data_dictionary::database) const;
+    const query::partition_slice& partition_slice(data_dictionary::database) const;
     const column_definition* view_column(const schema& base, column_kind kind, column_id base_id) const;
     const column_definition* view_column(const column_definition& base_def) const;
     bool has_base_non_pk_columns_in_view_pk() const;
     bool has_computed_column_depending_on_base_non_primary_key() const {
         return _has_computed_column_depending_on_base_non_primary_key;
+    }
+
+    bool is_partition_key_permutation_of_base_partition_key() const {
+        return _is_partition_key_permutation_of_base_partition_key;
     }
 
     /// Returns a pointer to the base_dependent_view_info which matches the current
@@ -75,7 +82,11 @@ public:
     friend bool operator==(const view_info& x, const view_info& y) {
         return x._raw == y._raw;
     }
-    friend std::ostream& operator<<(std::ostream& os, const view_info& view) {
-        return os << view._raw;
+    friend fmt::formatter<view_info>;
+};
+
+template <> struct fmt::formatter<view_info> : fmt::formatter<string_view> {
+    auto format(const view_info& view, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", view._raw);
     }
 };

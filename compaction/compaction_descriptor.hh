@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,23 +12,10 @@
 #include <functional>
 #include <optional>
 #include <variant>
-#include <seastar/core/smp.hh>
-#include <seastar/core/file.hh>
 #include "sstables/types_fwd.hh"
 #include "sstables/sstable_set.hh"
-#include "utils/UUID.hh"
-#include "dht/i_partitioner.hh"
-#include "compaction_weight_registration.hh"
-
-namespace compaction {
-
-using owned_ranges_ptr = lw_shared_ptr<const dht::token_range_vector>;
-
-inline owned_ranges_ptr make_owned_ranges_ptr(dht::token_range_vector&& ranges) {
-    return make_lw_shared<const dht::token_range_vector>(std::move(ranges));
-}
-
-} // namespace compaction
+#include "compaction_fwd.hh"
+#include "mutation_writer/token_group_based_splitting_writer.hh"
 
 namespace sstables {
 
@@ -41,9 +28,8 @@ enum class compaction_type {
     Reshard = 5,
     Upgrade = 6,
     Reshape = 7,
+    Split = 8,
 };
-
-std::ostream& operator<<(std::ostream& os, compaction_type type);
 
 struct compaction_completion_desc {
     // Old, existing SSTables that should be deleted and removed from the SSTable set.
@@ -64,10 +50,8 @@ public:
     struct regular {
     };
     struct cleanup {
-        compaction::owned_ranges_ptr owned_ranges;
     };
     struct upgrade {
-        compaction::owned_ranges_ptr owned_ranges;
     };
     struct scrub {
         enum class mode {
@@ -84,13 +68,22 @@ public:
             only, // scrub only quarantined sstables
         };
         quarantine_mode quarantine_operation_mode = quarantine_mode::include;
+
+        using quarantine_invalid_sstables = bool_class<class quarantine_invalid_sstables_tag>;
+
+        // Should invalid sstables be moved into quarantine.
+        // Only applies to validate-mode.
+        quarantine_invalid_sstables quarantine_sstables = quarantine_invalid_sstables::yes;
     };
     struct reshard {
     };
     struct reshape {
     };
+    struct split {
+        mutation_writer::classify_by_token_group classifier;
+    };
 private:
-    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape>;
+    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape, split>;
 
 private:
     options_variant _options;
@@ -112,21 +105,30 @@ public:
         return compaction_type_options(regular{});
     }
 
-    static compaction_type_options make_cleanup(compaction::owned_ranges_ptr owned_ranges) {
-        return compaction_type_options(cleanup{std::move(owned_ranges)});
+    static compaction_type_options make_cleanup() {
+        return compaction_type_options(cleanup{});
     }
 
-    static compaction_type_options make_upgrade(compaction::owned_ranges_ptr owned_ranges) {
-        return compaction_type_options(upgrade{std::move(owned_ranges)});
+    static compaction_type_options make_upgrade() {
+        return compaction_type_options(upgrade{});
     }
 
-    static compaction_type_options make_scrub(scrub::mode mode) {
-        return compaction_type_options(scrub{mode});
+    static compaction_type_options make_scrub(scrub::mode mode, scrub::quarantine_invalid_sstables quarantine_sstables = scrub::quarantine_invalid_sstables::yes) {
+        return compaction_type_options(scrub{.operation_mode = mode, .quarantine_sstables = quarantine_sstables});
+    }
+
+    static compaction_type_options make_split(mutation_writer::classify_by_token_group classifier) {
+        return compaction_type_options(split{std::move(classifier)});
     }
 
     template <typename... Visitor>
     auto visit(Visitor&&... visitor) const {
         return std::visit(std::forward<Visitor>(visitor)..., _options);
+    }
+
+    template <typename OptionType>
+    const auto& as() const {
+        return std::get<OptionType>(_options);
     }
 
     const options_variant& options() const { return _options; }
@@ -135,10 +137,8 @@ public:
 };
 
 std::string_view to_string(compaction_type_options::scrub::mode);
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::mode scrub_mode);
 
 std::string_view to_string(compaction_type_options::scrub::quarantine_mode);
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::quarantine_mode quarantine_mode);
 
 class dummy_tag {};
 using has_only_fully_expired = seastar::bool_class<dummy_tag>;
@@ -160,14 +160,26 @@ struct compaction_descriptor {
     // The options passed down to the compaction code.
     // This also selects the kind of compaction to do.
     compaction_type_options options = compaction_type_options::make_regular();
+    // If engaged, compaction will cleanup the input sstables by skipping non-owned ranges.
+    compaction::owned_ranges_ptr owned_ranges;
+    // Required for reshard compaction.
+    const dht::sharder* sharder;
 
     compaction_sstable_creator_fn creator;
     compaction_sstable_replacer_fn replacer;
 
-    ::io_priority_class io_priority = default_priority_class();
-
     // Denotes if this compaction task is comprised solely of completely expired SSTables
     sstables::has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
+
+    // If set to true, gc will check only the compacting sstables to collect tombstones.
+    // If set to false, gc will check the memtables, commit log and other uncompacting
+    // sstables to decide if a tombstone can be collected. Note that these checks are
+    // not perfect. W.r.to memtables and uncompacted SSTables, if their minimum timestamp
+    // is less than that of the tombstone and they contain the key, the tombstone will
+    // not be collected. No row-level, cell-level check takes place. W.r.to the commit
+    // log, there is currently no way to check if the key exists; only the minimum
+    // timestamp comparison, similar to memtables, is performed.
+    bool gc_check_only_compacting_sstables = false;
 
     compaction_descriptor() = default;
 
@@ -175,28 +187,26 @@ struct compaction_descriptor {
     static constexpr uint64_t default_max_sstable_bytes = std::numeric_limits<uint64_t>::max();
 
     explicit compaction_descriptor(std::vector<sstables::shared_sstable> sstables,
-                                   ::io_priority_class io_priority,
                                    int level = default_level,
                                    uint64_t max_sstable_bytes = default_max_sstable_bytes,
                                    run_id run_identifier = run_id::create_random_id(),
-                                   compaction_type_options options = compaction_type_options::make_regular())
+                                   compaction_type_options options = compaction_type_options::make_regular(),
+                                   compaction::owned_ranges_ptr owned_ranges_ = {})
         : sstables(std::move(sstables))
         , level(level)
         , max_sstable_bytes(max_sstable_bytes)
         , run_identifier(run_identifier)
         , options(options)
-        , io_priority(io_priority)
+        , owned_ranges(std::move(owned_ranges_))
     {}
 
     explicit compaction_descriptor(sstables::has_only_fully_expired has_only_fully_expired,
-                                   std::vector<sstables::shared_sstable> sstables,
-                                   ::io_priority_class io_priority)
+                                   std::vector<sstables::shared_sstable> sstables)
         : sstables(std::move(sstables))
         , level(default_level)
         , max_sstable_bytes(default_max_sstable_bytes)
         , run_identifier(run_id::create_random_id())
         , options(compaction_type_options::make_regular())
-        , io_priority(io_priority)
         , has_only_fully_expired(has_only_fully_expired)
     {}
 
@@ -209,3 +219,16 @@ struct compaction_descriptor {
 };
 
 }
+
+template <>
+struct fmt::formatter<sstables::compaction_type> : fmt::formatter<string_view> {
+    auto format(sstables::compaction_type, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <>
+struct fmt::formatter<sstables::compaction_type_options::scrub::mode> : fmt::formatter<string_view> {
+    auto format(sstables::compaction_type_options::scrub::mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <>
+struct fmt::formatter<sstables::compaction_type_options::scrub::quarantine_mode> : fmt::formatter<string_view> {
+    auto format(sstables::compaction_type_options::scrub::quarantine_mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

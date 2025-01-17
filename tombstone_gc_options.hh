@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <map>
 #include <chrono>
+#include <fmt/core.h>
 #include <seastar/core/sstring.hh>
 
 enum class tombstone_gc_mode : uint8_t { timeout, disabled, immediate, repair };
@@ -27,8 +28,9 @@ public:
     }
     std::map<seastar::sstring, seastar::sstring> to_map() const;
     seastar::sstring to_sstring() const;
-    bool operator==(const tombstone_gc_options& other) const;
-    bool operator!=(const tombstone_gc_options& other) const;
+    bool operator==(const tombstone_gc_options&) const = default;
 };
 
-std::ostream& operator<<(std::ostream& os, const tombstone_gc_mode& m);
+template <> struct fmt::formatter<tombstone_gc_mode> : fmt::formatter<string_view> {
+    auto format(tombstone_gc_mode mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

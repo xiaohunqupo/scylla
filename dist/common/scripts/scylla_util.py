@@ -1,6 +1,6 @@
 #  Copyright (C) 2017-present ScyllaDB
 
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 import configparser
 import glob
@@ -12,8 +12,10 @@ import shutil
 import subprocess
 import yaml
 import sys
+import time
 from pathlib import Path, PurePath
-from subprocess import run, DEVNULL
+from subprocess import run, DEVNULL, PIPE, CalledProcessError
+from datetime import datetime, timedelta
 
 import distro
 from scylla_sysconfdir import SYSCONFDIR
@@ -24,7 +26,6 @@ from multiprocessing import cpu_count
 import traceback
 import traceback_with_variables
 import logging
-
 
 def scylla_excepthook(etype, value, tb):
     os.makedirs('/var/tmp/scylla', mode=0o755, exist_ok=True)
@@ -229,7 +230,7 @@ def parse_scylla_dirs_with_default(conf='/etc/scylla/scylla.yaml'):
             not len(y['data_file_directories']) or \
             not " ".join(y['data_file_directories']).strip():
         y['data_file_directories'] = [os.path.join(y['workdir'], 'data')]
-    for t in [ "commitlog", "hints", "view_hints", "saved_caches" ]:
+    for t in [ "commitlog", "schema_commitlog", "hints", "view_hints", "saved_caches" ]:
         key = "%s_directory" % t
         if key not in y or not y[key]:
             y[key] = os.path.join(y['workdir'], t)
@@ -246,6 +247,7 @@ def get_scylla_dirs():
     dirs = []
     dirs.extend(y['data_file_directories'])
     dirs.append(y['commitlog_directory'])
+    dirs.append(y['schema_commitlog_directory'])
 
     if 'hints_directory' in y and y['hints_directory']:
         dirs.append(y['hints_directory'])
@@ -291,30 +293,66 @@ def swap_exists():
     swaps = out('swapon --noheadings --raw')
     return True if swaps != '' else False
 
-def pkg_error_exit(pkg):
+def pkg_error_exit(pkg, offline_exit=True):
     print(f'Package "{pkg}" required.')
-    sys.exit(1)
+    if offline_exit:
+        sys.exit(1)
 
-def yum_install(pkg):
+def yum_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
     return run(f'yum install -y {pkg}', shell=True, check=True)
 
-def apt_install(pkg):
+def apt_is_updated():
+    if os.path.exists('/var/lib/apt/periodic/update-success-stamp'):
+        cache_mtime = os.stat('/var/lib/apt/periodic/update-success-stamp').st_mtime
+    elif os.path.exists('/var/lib/apt/lists'):
+        cache_mtime = os.stat('/var/lib/apt/lists').st_mtime
+    else:
+        return False
+    return datetime.now() - datetime.fromtimestamp(cache_mtime) <= timedelta(days=1)
+
+APT_GET_UPDATE_NUM_RETRY = 30
+APT_GET_UPDATE_RETRY_INTERVAL = 10
+def apt_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
+
+    # The lock for update and install/remove are different, and
+    # DPkg::Lock::Timeout will only wait for install/remove lock.
+    # So we need to manually retry apt-get update.
+    for i in range(APT_GET_UPDATE_NUM_RETRY):
+        if apt_is_updated():
+            break
+        try:
+            res = run('apt-get update', shell=True, check=True, stderr=PIPE, encoding='utf-8')
+            break
+        except CalledProcessError as e:
+            print(e.stderr, end='')
+            # if error is "Could not get lock", wait a while and retry
+            match = re.match('^E: Could not get lock ', e.stderr, re.MULTILINE)
+            if match:
+                print('Sleep 10 seconds to wait for apt lock...')
+                time.sleep(APT_GET_UPDATE_RETRY_INTERVAL)
+                # if this is last time to retry, re-raise exception
+                if i == APT_GET_UPDATE_NUM_RETRY - 1:
+                    raise
+            # if error is not "Could not get lock", re-raise Exception
+            else:
+                raise
+
     apt_env = os.environ.copy()
     apt_env['DEBIAN_FRONTEND'] = 'noninteractive'
-    return run(f'apt-get install -y {pkg}', shell=True, check=True, env=apt_env)
+    return run(f'apt-get -o DPkg::Lock::Timeout=300 install -y {pkg}', shell=True, check=True, env=apt_env)
 
-def emerge_install(pkg):
+def emerge_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
     return run(f'emerge -uq {pkg}', shell=True, check=True)
 
-def zypper_install(pkg):
+def zypper_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
     return run(f'zypper install -y {pkg}', shell=True, check=True)
 
 def pkg_distro():
@@ -327,18 +365,20 @@ def pkg_distro():
     else:
         return distro.id()
 
-pkg_xlat = {'cpupowerutils': {'debian': 'linux-cpupower', 'gentoo':'sys-power/cpupower', 'arch':'cpupower', 'suse': 'cpupower'}}
-def pkg_install(pkg):
+pkg_xlat = {'cpupowerutils': {'debian': 'linux-cpupower', 'gentoo':'sys-power/cpupower', 'arch':'cpupower', 'suse': 'cpupower'},
+            'policycoreutils-python-utils': {'amzn2': 'policycoreutils-python'}}
+
+def pkg_install(pkg, offline_exit=True):
     if pkg in pkg_xlat and pkg_distro() in pkg_xlat[pkg]:
         pkg = pkg_xlat[pkg][pkg_distro()]
     if is_redhat_variant():
-        return yum_install(pkg)
+        return yum_install(pkg, offline_exit)
     elif is_debian_variant():
-        return apt_install(pkg)
+        return apt_install(pkg, offline_exit)
     elif is_gentoo():
-        return emerge_install(pkg)
+        return emerge_install(pkg, offline_exit)
     elif is_suse_variant():
-        return zypper_install(pkg)
+        return zypper_install(pkg, offline_exit)
     else:
         pkg_error_exit(pkg)
 
@@ -348,7 +388,7 @@ def yum_uninstall(pkg):
 def apt_uninstall(pkg):
     apt_env = os.environ.copy()
     apt_env['DEBIAN_FRONTEND'] = 'noninteractive'
-    return run(f'apt-get remove -y {pkg}', shell=True, check=True, env=apt_env)
+    return run(f'apt-get -o DPkg::Lock::Timeout=300 remove -y {pkg}', shell=True, check=True, env=apt_env)
 
 def emerge_uninstall(pkg):
     return run(f'emerge --deselect {pkg}', shell=True, check=True)
@@ -421,7 +461,7 @@ class sysconfig_parser:
         f = io.StringIO('[global]\n{}'.format(self._data))
         self._cfg = configparser.ConfigParser()
         self._cfg.optionxform = str
-        self._cfg.readfp(f)
+        self._cfg.read_file(f)
 
     def __escape(self, val):
         return re.sub(r'"', r'\"', val)

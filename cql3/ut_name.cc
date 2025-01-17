@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "cql3/ut_name.hh"
@@ -39,8 +39,8 @@ sstring ut_name::get_string_type_name() const
     return _ut_name->to_string();
 }
 
-sstring ut_name::to_string() const {
-    return (has_keyspace() ? (_ks_name.value() + ".") : "") + _ut_name->to_string();
+sstring ut_name::to_cql_string() const {
+    return (has_keyspace() ? (_ks_name.value() + ".") : "") + _ut_name->to_cql_string();
 }
 
 }

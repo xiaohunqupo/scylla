@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 // This class is the parts of java.util.UUID that we need
@@ -17,9 +17,8 @@
 #include <compare>
 
 #include <seastar/core/sstring.hh>
-#include <seastar/core/print.hh>
-#include <seastar/net/byteorder.hh>
-#include "bytes.hh"
+#include "bytes_fwd.hh"
+#include "utils/assert.hh"
 #include "utils/hashing.hh"
 #include "utils/serialization.hh"
 
@@ -35,9 +34,9 @@ public:
         : most_sig_bits(most_sig_bits), least_sig_bits(least_sig_bits) {}
 
     // May throw marshal_exception is failed to parse uuid string.
-    explicit UUID(const sstring& uuid_string) : UUID(sstring_view(uuid_string)) { }
-    explicit UUID(const char * s) : UUID(sstring_view(s)) {}
-    explicit UUID(sstring_view uuid_string);
+    explicit UUID(const sstring& uuid_string) : UUID(std::string_view(uuid_string)) { }
+    explicit UUID(const char * s) : UUID(std::string_view(s)) {}
+    explicit UUID(std::string_view uuid_string);
 
     int64_t get_most_significant_bits() const noexcept {
         return most_sig_bits;
@@ -57,7 +56,7 @@ public:
         //if (version() != 1) {
         //     throw new UnsupportedOperationException("Not a time-based UUID");
         //}
-        assert(is_timestamp());
+        SCYLLA_ASSERT(is_timestamp());
 
         return ((most_sig_bits & 0xFFF) << 48) |
                (((most_sig_bits >> 16) & 0xFFFF) << 32) |
@@ -65,53 +64,27 @@ public:
 
     }
 
-    // This matches Java's UUID.toString() actual implementation. Note that
-    // that method's documentation suggest something completely different!
-    sstring to_sstring() const {
-        return format("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-                ((uint64_t)most_sig_bits >> 32),
-                ((uint64_t)most_sig_bits >> 16 & 0xffff),
-                ((uint64_t)most_sig_bits & 0xffff),
-                ((uint64_t)least_sig_bits >> 48 & 0xffff),
-                ((uint64_t)least_sig_bits & 0xffffffffffffLL));
-    }
+    friend ::fmt::formatter<UUID>;
 
     friend std::ostream& operator<<(std::ostream& out, const UUID& uuid);
 
-    bool operator==(const UUID& v) const noexcept {
-        return most_sig_bits == v.most_sig_bits
-                && least_sig_bits == v.least_sig_bits
-                ;
-    }
-    bool operator!=(const UUID& v) const noexcept {
-        return !(*this == v);
-    }
+    bool operator==(const UUID& v) const noexcept = default;
 
     // Please note that this comparator does not preserve timeuuid
     // monotonicity. For this reason you should avoid using it for
     // UUIDs that could store timeuuids, otherwise bugs like
     // https://github.com/scylladb/scylla/issues/7729 may happen.
-    bool operator<(const UUID& v) const noexcept {
-         if (most_sig_bits != v.most_sig_bits) {
-             return uint64_t(most_sig_bits) < uint64_t(v.most_sig_bits);
-         } else {
-             return uint64_t(least_sig_bits) < uint64_t(v.least_sig_bits);
-         }
+    //
+    // For comparing timeuuids, you can use `timeuuid_tri_compare`
+    // functions from this file.
+    std::strong_ordering operator<=>(const UUID& v) const noexcept {
+        auto cmp = uint64_t(most_sig_bits) <=> uint64_t(v.most_sig_bits);
+        if (cmp != 0) {
+            return cmp;
+        }
+        return uint64_t(least_sig_bits) <=> uint64_t(v.least_sig_bits);
     }
 
-    bool operator>(const UUID& v) const noexcept {
-        return v < *this;
-    }
-
-    bool operator<=(const UUID& v) const noexcept {
-        return !(*this > v);
-    }
-
-    bool operator>=(const UUID& v) const noexcept {
-        return !(*this < v);
-    }
-
-    // Valid (non-null) UUIDs always have their version
     // nibble set to a non-zero value
     bool is_null() const noexcept {
         return !most_sig_bits && !least_sig_bits;
@@ -128,7 +101,7 @@ public:
         return b;
     }
 
-    static size_t serialized_size() noexcept {
+    constexpr static size_t serialized_size() noexcept {
         return 16;
     }
 
@@ -139,15 +112,15 @@ public:
     }
 };
 
-inline UUID null_uuid() noexcept {
+// Convert the uuid to a uint32_t using xor.
+// It is useful to get a uint32_t number from the uuid.
+uint32_t uuid_xor_to_uint32(const UUID& uuid);
+
+inline constexpr UUID null_uuid() noexcept {
     return UUID();
 }
 
 UUID make_random_uuid() noexcept;
-
-inline std::strong_ordering uint64_t_tri_compare(uint64_t a, uint64_t b) noexcept {
-    return a <=> b;
-}
 
 // Read 8 most significant bytes of timeuuid from serialized bytes
 inline uint64_t timeuuid_read_msb(const int8_t *b) noexcept {
@@ -182,15 +155,33 @@ inline uint64_t uuid_read_lsb(const int8_t *b) noexcept {
 // To avoid breaking ordering in existing sstables, Scylla preserves
 // Cassandra compare order.
 //
-inline std::strong_ordering timeuuid_tri_compare(bytes_view o1, bytes_view o2) noexcept {
-    auto timeuuid_read_lsb = [](bytes_view o) -> uint64_t {
-        return uuid_read_lsb(o.begin()) ^ 0x8080808080808080;
+inline std::strong_ordering timeuuid_tri_compare(const int8_t* o1, const int8_t* o2) noexcept {
+    auto timeuuid_read_lsb = [](const int8_t* o) -> uint64_t {
+        return uuid_read_lsb(o) ^ 0x8080808080808080;
     };
-    auto res = uint64_t_tri_compare(timeuuid_read_msb(o1.begin()), timeuuid_read_msb(o2.begin()));
+    auto res = timeuuid_read_msb(o1) <=> timeuuid_read_msb(o2);
     if (res == 0) {
-        res = uint64_t_tri_compare(timeuuid_read_lsb(o1), timeuuid_read_lsb(o2));
+        res = timeuuid_read_lsb(o1) <=> timeuuid_read_lsb(o2);
     }
     return res;
+}
+
+inline std::strong_ordering timeuuid_tri_compare(bytes_view o1, bytes_view o2) noexcept {
+    return timeuuid_tri_compare(o1.begin(), o2.begin());
+}
+
+inline std::strong_ordering timeuuid_tri_compare(const UUID& u1, const UUID& u2) noexcept {
+    std::array<int8_t, UUID::serialized_size()> buf1;
+    {
+        auto i = buf1.begin();
+        u1.serialize(i);
+    }
+    std::array<int8_t, UUID::serialized_size()> buf2;
+    {
+        auto i = buf2.begin();
+        u2.serialize(i);
+    }
+    return timeuuid_tri_compare(buf1.begin(), buf2.begin());
 }
 
 // Compare two values of UUID type, if they happen to be
@@ -201,9 +192,9 @@ inline std::strong_ordering timeuuid_tri_compare(bytes_view o1, bytes_view o2) n
 // to @timeuuid_tri_compare() used for all new features.
 //
 inline std::strong_ordering uuid_tri_compare_timeuuid(bytes_view o1, bytes_view o2) noexcept {
-    auto res = uint64_t_tri_compare(timeuuid_read_msb(o1.begin()), timeuuid_read_msb(o2.begin()));
+    auto res = timeuuid_read_msb(o1.begin()) <=> timeuuid_read_msb(o2.begin());
     if (res == 0) {
-        res = uint64_t_tri_compare(uuid_read_lsb(o1.begin()), uuid_read_lsb(o2.begin()));
+        res = uuid_read_lsb(o1.begin()) <=> uuid_read_lsb(o2.begin());
     }
     return res;
 }
@@ -211,37 +202,23 @@ inline std::strong_ordering uuid_tri_compare_timeuuid(bytes_view o1, bytes_view 
 template<typename Tag>
 struct tagged_uuid {
     utils::UUID id;
-    bool operator==(const tagged_uuid& o) const noexcept {
-        return id == o.id;
-    }
-    bool operator<(const tagged_uuid& o) const noexcept {
-        return id < o.id;
-    }
-    bool operator>(const tagged_uuid& o) const noexcept {
-        return id > o.id;
-    }
-    bool operator<=(const tagged_uuid& o) const noexcept {
-        return id <= o.id;
-    }
-    bool operator>=(const tagged_uuid& o) const noexcept {
-        return id >= o.id;
-    }
+    std::strong_ordering operator<=>(const tagged_uuid&) const noexcept = default;
     explicit operator bool() const noexcept {
         // The default constructor sets the id to nil, which is
         // guaranteed to not match any valid id.
         return bool(id);
     }
     static tagged_uuid create_random_id() noexcept { return tagged_uuid{utils::make_random_uuid()}; }
-    static tagged_uuid create_null_id() noexcept { return tagged_uuid{utils::null_uuid()}; }
-    explicit tagged_uuid(const utils::UUID& uuid) noexcept : id(uuid) {}
-    tagged_uuid() = default;
+    static constexpr tagged_uuid create_null_id() noexcept { return tagged_uuid{}; }
+    explicit constexpr tagged_uuid(const utils::UUID& uuid) noexcept : id(uuid) {}
+    constexpr tagged_uuid() = default;
 
     const utils::UUID& uuid() const noexcept {
         return id;
     }
 
     sstring to_sstring() const {
-        return id.to_sstring();
+        return fmt::to_string(id);
     }
 };
 } // namespace utils
@@ -285,3 +262,27 @@ std::ostream& operator<<(std::ostream& os, const utils::tagged_uuid<Tag>& id) {
     return os << id.id;
 }
 } // namespace std
+
+template <>
+struct fmt::formatter<utils::UUID> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const utils::UUID& id, FormatContext& ctx) const {
+        // This matches Java's UUID.toString() actual implementation. Note that
+        // that method's documentation suggest something completely different!
+        return fmt::format_to(ctx.out(),
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                ((uint64_t)id.most_sig_bits >> 32),
+                ((uint64_t)id.most_sig_bits >> 16 & 0xffff),
+                ((uint64_t)id.most_sig_bits & 0xffff),
+                ((uint64_t)id.least_sig_bits >> 48 & 0xffff),
+                ((uint64_t)id.least_sig_bits & 0xffffffffffffLL));
+    }
+};
+
+template <typename Tag>
+struct fmt::formatter<utils::tagged_uuid<Tag>> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const utils::tagged_uuid<Tag>& id, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", id.id);
+    }
+};

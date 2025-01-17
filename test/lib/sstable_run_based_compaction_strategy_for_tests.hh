@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#pragma once
 
 #include <vector>
 #include <map>
@@ -22,13 +24,13 @@ class sstable_run_based_compaction_strategy_for_tests : public compaction_strate
 public:
     sstable_run_based_compaction_strategy_for_tests();
 
-    virtual compaction_descriptor get_sstables_for_compaction(table_state& table_s, strategy_control& control, std::vector<sstables::shared_sstable> uncompacting_sstables) override;
+    virtual compaction_descriptor get_sstables_for_compaction(table_state& table_s, strategy_control& control) override;
 
     virtual int64_t estimated_pending_compactions(table_state& table_s) const override;
 
     virtual compaction_strategy_type type() const override;
 
-    virtual std::unique_ptr<compaction_backlog_tracker::impl> make_backlog_tracker() override;
+    virtual std::unique_ptr<compaction_backlog_tracker::impl> make_backlog_tracker() const override;
 };
 
 }

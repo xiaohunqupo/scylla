@@ -5,40 +5,40 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
+#include <tuple>
 #include "cql3/statements/schema_altering_statement.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "mutation/mutation.hh"
 #include "cql3/query_processor.hh"
-#include "transport/messages/result_message.hh"
-#include "service/raft/raft_group_registry.hh"
-#include "service/migration_manager.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace cql3 {
 
 namespace statements {
 
-static logging::logger mylogger("schema_altering_statement");
+static logging::logger logger("schema_altering_statement");
 
 schema_altering_statement::schema_altering_statement(timeout_config_selector timeout_selector)
     : cf_statement(cf_name())
     , cql_statement_no_metadata(timeout_selector)
-    , _is_column_family_level{false}
-{
+    , _is_column_family_level{false} {
 }
 
 schema_altering_statement::schema_altering_statement(cf_name name, timeout_config_selector timeout_selector)
     : cf_statement{std::move(name)}
     , cql_statement_no_metadata(timeout_selector)
-    , _is_column_family_level{true}
-{
+    , _is_column_family_level{true} {
 }
 
-future<> schema_altering_statement::grant_permissions_to_creator(const service::client_state&) const {
+bool schema_altering_statement::needs_guard(query_processor&, service::query_state&) const {
+    return true;
+}
+
+future<> schema_altering_statement::grant_permissions_to_creator(const service::client_state&, service::group0_batch&) const {
     return make_ready_future<>();
 }
 
@@ -60,51 +60,7 @@ void schema_altering_statement::prepare_keyspace(const service::client_state& st
 }
 
 future<::shared_ptr<messages::result_message>>
-schema_altering_statement::execute0(query_processor& qp, service::query_state& state, const query_options& options) const {
-    auto& mm = qp.get_migration_manager();
-    ::shared_ptr<cql_transport::event::schema_change> ce;
-
-    if (this_shard_id() != 0) {
-        // execute all schema altering statements on a shard zero since this is where raft group 0 is
-        co_return ::make_shared<cql_transport::messages::result_message::bounce_to_shard>(0,
-                    std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()));
-    }
-
-    auto retries = mm.get_concurrent_ddl_retries();
-    while (true) {
-        try {
-            auto group0_guard = co_await mm.start_group0_operation();
-
-            auto [ret, m] = co_await prepare_schema_mutations(qp, group0_guard.write_timestamp());
-
-            if (!m.empty()) {
-                auto description = format("CQL DDL statement: \"{}\"", raw_cql_statement);
-                co_await mm.announce(std::move(m), std::move(group0_guard), description);
-            }
-
-            ce = std::move(ret);
-        } catch (const service::group0_concurrent_modification&) {
-            mylogger.warn("Failed to execute DDL statement \"{}\" due to concurrent group 0 modification.{}.",
-                    raw_cql_statement, retries ? " Retrying" : " Number of retries exceeded, giving up");
-            if (retries--) {
-                continue;
-            }
-            throw;
-        }
-        break;
-    }
-
-    // If an IF [NOT] EXISTS clause was used, this may not result in an actual schema change.  To avoid doing
-    // extra work in the drivers to handle schema changes, we return an empty message in this case. (CASSANDRA-7600)
-    if (!ce) {
-        co_return ::make_shared<messages::result_message::void_message>();
-    } else {
-        co_return ::make_shared<messages::result_message::schema_change>(ce);
-    }
-}
-
-future<::shared_ptr<messages::result_message>>
-schema_altering_statement::execute(query_processor& qp, service::query_state& state, const query_options& options) const {
+schema_altering_statement::execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
     bool internal = state.get_client_state().is_internal();
     if (internal) {
         auto replication_type = locator::replication_strategy_type::everywhere_topology;
@@ -118,15 +74,26 @@ schema_altering_statement::execute(query_processor& qp, service::query_state& st
             throw std::logic_error(format("Attempted to modify {} via internal query: such schema changes are not propagated and thus illegal", info));
         }
     }
+    service::group0_batch mc{std::move(guard)};
+    auto result = co_await qp.execute_schema_statement(*this, state, options, mc);
+    co_await qp.announce_schema_statement(*this, mc);
+    co_return std::move(result);
+}
 
-    return execute0(qp, state, options).then([this, &state, internal](::shared_ptr<messages::result_message> result) {
-        auto permissions_granted_fut = internal
-                ? make_ready_future<>()
-                : grant_permissions_to_creator(state.get_client_state());
-        return permissions_granted_fut.then([result = std::move(result)] {
-           return result;
-        });
-    });
+future<std::tuple<::shared_ptr<schema_altering_statement::event_t>, std::vector<mutation>, cql3::cql_warnings_vec>> schema_altering_statement::prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const {
+    // derived class must implement one of prepare_schema_mutations overloads
+    on_internal_error(logger, "not implemented");
+    co_return std::make_tuple(::shared_ptr<event_t>(nullptr), std::vector<mutation>{}, cql3::cql_warnings_vec{});
+}
+
+future<std::tuple<::shared_ptr<schema_altering_statement::event_t>, cql3::cql_warnings_vec>> schema_altering_statement::prepare_schema_mutations(query_processor& qp, service::query_state& state, const query_options& options, service::group0_batch& mc) const {
+    auto [ret, muts, cql_warnings] = co_await prepare_schema_mutations(qp, options, mc.write_timestamp());
+    mc.add_mutations(std::move(muts));
+    co_return std::make_tuple(ret, cql_warnings);
+}
+
+audit::statement_category schema_altering_statement::category() const {
+    return audit::statement_category::DDL;
 }
 
 }

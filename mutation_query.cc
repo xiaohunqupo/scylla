@@ -3,14 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <seastar/coroutine/maybe_yield.hh>
+
 #include "mutation_query.hh"
-#include "gc_clock.hh"
-#include "mutation/mutation_partition_serializer.hh"
-#include "service/priority_manager.hh"
-#include "query-result-writer.hh"
+#include "schema/schema_registry.hh"
+
+#include <boost/range/algorithm/equal.hpp>
 
 reconcilable_result::~reconcilable_result() {}
 
@@ -46,27 +47,50 @@ reconcilable_result::operator==(const reconcilable_result& other) const {
     return boost::equal(_partitions, other._partitions);
 }
 
-bool reconcilable_result::operator!=(const reconcilable_result& other) const {
-    return !(*this == other);
+void
+reconcilable_result::merge_disjoint(schema_ptr schema, const reconcilable_result& other) {
+    std::copy(other._partitions.begin(), other._partitions.end(), std::back_inserter(_partitions));
+    _short_read = _short_read || other._short_read;
+    uint64_t row_count = this->row_count() + other.row_count();
+    _row_count_low_bits = static_cast<uint32_t>(row_count);
+    _row_count_high_bits = static_cast<uint32_t>(row_count >> 32);
 }
 
-std::ostream& operator<<(std::ostream& out, const reconcilable_result::printer& pr) {
-    out << "{rows=" << pr.self.row_count() << ", short_read="
-        << pr.self.is_short_read() << ", [";
+auto fmt::formatter<reconcilable_result::printer>::format(
+    const reconcilable_result::printer& pr,
+    fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    out = fmt::format_to(out,
+                         "{{rows={}, short_read={}, ",
+                         pr.self.row_count(),
+                         pr.self.is_short_read());
     bool first = true;
     for (const partition& p : pr.self.partitions()) {
         if (!first) {
-            out << ", ";
+            out = fmt::format_to(out, ", ");
         }
         first = false;
-        out << "{rows=" << p.row_count() << ", ";
-        out << p._m.pretty_printer(pr.schema);
-        out << "}";
+        out = fmt::format_to(out,
+                             "{{rows={}, {}}}",
+                             p.row_count(),
+                             p._m.pretty_printer(pr.schema));
     }
-    out << "]}";
-    return out;
+    return fmt::format_to(out, "]}}");
 }
 
 reconcilable_result::printer reconcilable_result::pretty_printer(schema_ptr s) const {
     return { *this, std::move(s) };
+}
+
+future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> reversed(foreign_ptr<lw_shared_ptr<reconcilable_result>> result)
+{
+    for (auto& partition : result->partitions())
+    {
+        auto& m = partition.mut();
+        auto schema = local_schema_registry().get(m.schema_version());
+        m = frozen_mutation(reverse(m.unfreeze(schema)));
+        co_await coroutine::maybe_yield();
+    }
+
+    co_return std::move(result);
 }

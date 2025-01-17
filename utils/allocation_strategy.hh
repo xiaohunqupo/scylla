@@ -3,14 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <any>
+#include <memory>
 #include <cstdlib>
-#include <seastar/core/memory.hh>
+#include <string>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <malloc.h>
 
@@ -40,6 +41,7 @@ public:
     virtual size_t size(const void* obj) const = 0;
     size_t align() const { return _align; }
     uint32_t index() const { return _index; }
+    virtual std::string name() const = 0;
 };
 
 // Non-constant-size classes (ending with `char data[0]`) must provide
@@ -74,6 +76,10 @@ public:
     }
     virtual size_t size(const void* obj) const override {
         return size_for_allocation_strategy(*static_cast<const T*>(obj));
+    }
+
+    virtual std::string name() const override {
+        return typeid(T).name();
     }
 };
 
@@ -183,6 +189,24 @@ public:
     void invalidate_references() noexcept {
         ++_invalidate_counter;
     }
+
+    // Asks the allocator to set aside some free memory,
+    // preventing it from being allocated until the matching
+    // unreserve() call. Can be used to preallocate some memory
+    // for a critical section where allocations can't fail.
+    //
+    // This is hack designed with the implementation details of the
+    // log-structured allocator in mind. In other allocators,
+    // it doesn't do anything useful.
+    //
+    // Don't use this unless you understand exactly what you are doing.
+    virtual uintptr_t reserve(size_t memory) {
+        return 0;
+    }
+
+    // As the argument to this function, you must pass the *return value* of the matching reserve().
+    virtual void unreserve(uintptr_t opaque) noexcept {
+    }
 };
 
 class standard_allocation_strategy : public allocation_strategy {
@@ -252,6 +276,16 @@ struct alloc_strategy_deleter {
     }
 };
 
+// RAII for allocation_strategy::reserve().
+class hold_reserve {
+    uintptr_t _opaque;
+public:
+    hold_reserve(size_t memory) : _opaque(current_allocator().reserve(memory)) {}
+    ~hold_reserve() { current_allocator().unreserve(_opaque); }
+    // Disallow copying and moving. They *could* be implemented, but I just didn't bother.
+    hold_reserve(hold_reserve&&) = delete;
+};
+
 // std::unique_ptr which can be used for owning an object allocated using allocation_strategy.
 // Must be destroyed before the pointer is invalidated. For compacting allocators, that
 // means it must not escape outside allocating_section or reclaim lock.
@@ -276,7 +310,7 @@ using alloc_strategy_unique_ptr = std::unique_ptr<T, alloc_strategy_deleter<T>>;
 // time. That seems to be the case in current uses, so a simplified scheme of
 // passing allocators will do. Allocation strategy is set in a thread-local
 // context, as shown below. From there, aware objects pick up the allocation
-// strategy. The code controling the objects must ensure that object allocated
+// strategy. The code controlling the objects must ensure that object allocated
 // in one regime is also freed in the same regime.
 //
 // with_allocator() provides a way to set the current allocation strategy used

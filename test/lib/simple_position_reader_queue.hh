@@ -3,18 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#pragma once
+
 #include "readers/clustering_combined.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 
 /*
  * Single-partition reader, a lower bound and an upper bound for the set of positions
  * of fragments returned by the reader. The bounds don't need to be exact.
  */
 struct reader_bounds {
-    flat_mutation_reader_v2 r;
+    mutation_reader r;
     position_in_partition lower;
     position_in_partition upper;
 };
@@ -59,7 +61,7 @@ struct simple_position_reader_queue : public position_reader_queue {
     }
 
     virtual future<> close() noexcept override {
-        return do_for_each(_it, _rs.end(), [this] (reader_bounds& rb) {
+        return do_for_each(_it, _rs.end(), [] (reader_bounds& rb) {
             auto r = std::move(rb.r);
             return r.close();
         }).finally([this] {

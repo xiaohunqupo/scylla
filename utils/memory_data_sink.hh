@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/iostream.hh>
@@ -23,6 +23,7 @@ class memory_data_sink_buffers {
 public:
     size_t size() const { return _size; }
     buffers_type& buffers() { return _bufs; }
+    const buffers_type& buffers() const { return _bufs; }
 
     // Strong exception guarantees
     void put(temporary_buffer<char>&& buf) {
@@ -34,6 +35,14 @@ public:
     void clear() {
         _bufs.clear();
         _size = 0;
+    }
+
+    memory_data_sink_buffers() = default;
+
+    memory_data_sink_buffers(memory_data_sink_buffers&& other)
+            : _bufs(std::move(other._bufs))
+            , _size(std::exchange(other._size, 0))
+    {
     }
 };
 

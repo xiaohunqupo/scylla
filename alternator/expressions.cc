@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expressions.hh"
@@ -17,19 +17,16 @@
 
 #include "seastarx.hh"
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/util/log.hh>
-
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/algorithm/cxx11/all_of.hpp>
 
 #include <functional>
 #include <unordered_map>
 
 namespace alternator {
 
-template <typename Func, typename Result = std::result_of_t<Func(expressionsParser&)>>
-Result do_with_parser(std::string_view input, Func&& f) {
+template <typename Func, typename Result = std::invoke_result_t<Func, expressionsParser&>>
+static Result do_with_parser(std::string_view input, Func&& f) {
     expressionsLexer::InputStreamType input_stream{
         reinterpret_cast<const ANTLR_UINT8*>(input.data()),
         ANTLR_ENC_UTF8,
@@ -43,31 +40,41 @@ Result do_with_parser(std::string_view input, Func&& f) {
     return result;
 }
 
+template <typename Func, typename Result = std::invoke_result_t<Func, expressionsParser&>>
+static Result parse(const char* input_name, std::string_view input, Func&& f) {
+    if (input.length() > 4096) {
+        throw expressions_syntax_error(format("{} expression size {} exceeds allowed maximum 4096.",
+            input_name, input.length()));
+    }
+    try {
+        return do_with_parser(input, f);
+    } catch (expressions_syntax_error& e) {
+        // If already an expressions_syntax_error, don't print the type's
+        // name (it's just ugly), just the message.
+        // TODO: displayRecognitionError could set a position inside the
+        // expressions_syntax_error in throws, and we could use it here to
+        // mark the broken position in 'input'.
+        throw expressions_syntax_error(fmt::format("Failed parsing {} '{}': {}",
+            input_name, input, e.what()));
+    } catch (...) {
+        throw expressions_syntax_error(fmt::format("Failed parsing {} '{}': {}",
+            input_name, input, std::current_exception()));
+    }
+}
+
 parsed::update_expression
 parse_update_expression(std::string_view query) {
-    try {
-        return do_with_parser(query,  std::mem_fn(&expressionsParser::update_expression));
-    } catch (...) {
-        throw expressions_syntax_error(format("Failed parsing UpdateExpression '{}': {}", query, std::current_exception()));
-    }
+    return parse("UpdateExpression", query,  std::mem_fn(&expressionsParser::update_expression));
 }
 
 std::vector<parsed::path>
 parse_projection_expression(std::string_view query) {
-    try {
-        return do_with_parser(query,  std::mem_fn(&expressionsParser::projection_expression));
-    } catch (...) {
-        throw expressions_syntax_error(format("Failed parsing ProjectionExpression '{}': {}", query, std::current_exception()));
-    }
+    return parse ("ProjectionExpression", query,  std::mem_fn(&expressionsParser::projection_expression));
 }
 
 parsed::condition_expression
-parse_condition_expression(std::string_view query) {
-    try {
-        return do_with_parser(query,  std::mem_fn(&expressionsParser::condition_expression));
-    } catch (...) {
-        throw expressions_syntax_error(format("Failed parsing ConditionExpression '{}': {}", query, std::current_exception()));
-    }
+parse_condition_expression(std::string_view query, const char* caller) {
+    return parse(caller, query,  std::mem_fn(&expressionsParser::condition_expression));
 }
 
 namespace parsed {
@@ -123,21 +130,6 @@ void path::check_depth_limit() {
     }
 }
 
-std::ostream& operator<<(std::ostream& os, const path& p) {
-    os << p.root();
-    for (const auto& op : p.operators()) {
-        std::visit(overloaded_functor {
-            [&] (const std::string& member) {
-                os << '.' << member;
-            },
-            [&] (unsigned index) {
-                os << '[' << index << ']';
-            }
-        }, op);
-    }
-    return os;
-}
-
 } // namespace parsed
 
 // The following resolve_*() functions resolve references in parsed
@@ -165,12 +157,12 @@ static std::optional<std::string> resolve_path_component(const std::string& colu
     if (column_name.size() > 0 && column_name.front() == '#') {
         if (!expression_attribute_names) {
             throw api_error::validation(
-                    format("ExpressionAttributeNames missing, entry '{}' required by expression", column_name));
+                    fmt::format("ExpressionAttributeNames missing, entry '{}' required by expression", column_name));
         }
         const rjson::value* value = rjson::find(*expression_attribute_names, column_name);
         if (!value || !value->IsString()) {
             throw api_error::validation(
-                    format("ExpressionAttributeNames missing entry '{}' required by expression", column_name));
+                    fmt::format("ExpressionAttributeNames missing entry '{}' required by expression", column_name));
         }
         used_attribute_names.emplace(column_name);
         return std::string(rjson::to_string_view(*value));
@@ -207,16 +199,16 @@ static void resolve_constant(parsed::constant& c,
         [&] (const std::string& valref) {
             if (!expression_attribute_values) {
                 throw api_error::validation(
-                        format("ExpressionAttributeValues missing, entry '{}' required by expression", valref));
+                        fmt::format("ExpressionAttributeValues missing, entry '{}' required by expression", valref));
             }
             const rjson::value* value = rjson::find(*expression_attribute_values, valref);
             if (!value) {
                 throw api_error::validation(
-                        format("ExpressionAttributeValues missing entry '{}' required by expression", valref));
+                        fmt::format("ExpressionAttributeValues missing entry '{}' required by expression", valref));
             }
             if (value->IsNull()) {
                 throw api_error::validation(
-                        format("ExpressionAttributeValues null value for entry '{}' required by expression", valref));
+                        fmt::format("ExpressionAttributeValues null value for entry '{}' required by expression", valref));
             }
             validate_value(*value, "ExpressionAttributeValues");
             used_attribute_values.emplace(valref);
@@ -418,9 +410,14 @@ void for_condition_expression_on(const parsed::condition_expression& ce, const n
 // calculate_size() is ConditionExpression's size() function, i.e., it takes
 // a JSON-encoded value and returns its "size" as defined differently for the
 // different types - also as a JSON-encoded number.
-// It return a JSON-encoded "null" value if this value's type has no size
-// defined. Comparisons against this non-numeric value will later fail.
-static rjson::value calculate_size(const rjson::value& v) {
+// If the value's type (e.g. number) has no size defined, there are two cases:
+// 1. If from_data (the value came directly from an attribute of the data),
+//    It returns a JSON-encoded "null" value. Comparisons against this
+//    non-numeric value will later fail, so eventually the application will
+//    get a ConditionalCheckFailedException.
+// 2. Otherwise (the value came from a constant in the query or some other
+//    calculation), throw a ValidationException.
+static rjson::value calculate_size(const rjson::value& v, bool from_data) {
     // NOTE: If v is improperly formatted for our JSON value encoding, it
     // must come from the request itself, not from the database, so it makes
     // sense to throw a ValidationException if we see such a problem.
@@ -449,10 +446,12 @@ static rjson::value calculate_size(const rjson::value& v) {
             throw api_error::validation(format("invalid byte string: {}", v));
         }
         ret = base64_decoded_len(rjson::to_string_view(it->value));
-    } else {
+    } else if (from_data) {
         rjson::value json_ret = rjson::empty_object();
         rjson::add(json_ret, "null", rjson::value(true));
         return json_ret;
+    } else {
+        throw api_error::validation(format("Unsupported operand type {} for function size()", it->name));
     }
     rjson::value json_ret = rjson::empty_object();
     rjson::add(json_ret, "N", rjson::from_string(std::to_string(ret)));
@@ -534,7 +533,7 @@ std::unordered_map<std::string_view, function_handler_type*> function_handlers {
                         format("{}: size() accepts 1 parameter, got {}", caller, f._parameters.size()));
             }
             rjson::value v = calculate_value(f._parameters[0], caller, previous_item);
-            return calculate_size(v);
+            return calculate_size(v, f._parameters[0].is_path());
         }
     },
     {"attribute_exists", [] (calculate_value_caller caller, const rjson::value* previous_item, const parsed::value::function_call& f) {
@@ -662,7 +661,7 @@ static rjson::value extract_path(const rjson::value* item,
             // objects. But today Alternator does not validate the structure
             // of nested documents before storing them, so this can happen on
             // read.
-            throw api_error::validation(format("{}: malformed item read: {}", *item));
+            throw api_error::validation(format("{}: malformed item read: {}", caller, *item));
         }
         const char* type = v->MemberBegin()->name.GetString();
         v = &(v->MemberBegin()->value);
@@ -706,7 +705,7 @@ rjson::value calculate_value(const parsed::value& v,
             auto function_it = function_handlers.find(std::string_view(f._function_name));
             if (function_it == function_handlers.end()) {
                 throw api_error::validation(
-                        format("{}: unknown function '{}' called.", caller, f._function_name));
+                        fmt::format("{}: unknown function '{}' called.", caller, f._function_name));
             }
             return function_it->second(caller, previous_item, f);
         },
@@ -739,3 +738,20 @@ rjson::value calculate_value(const parsed::set_rhs& rhs,
 }
 
 } // namespace alternator
+
+auto fmt::formatter<alternator::parsed::path>::format(const alternator::parsed::path& p, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = ctx.out();
+    out = fmt::format_to(out, "{}", p.root());
+    for (const auto& op : p.operators()) {
+        std::visit(overloaded_functor {
+            [&] (const std::string& member) {
+                out = fmt::format_to(out, ".{}", member);
+            },
+            [&] (unsigned index) {
+                out = fmt::format_to(out, "[{}]", index);
+            }
+        }, op);
+    }
+    return out;
+}

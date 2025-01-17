@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/distributed.hh>
@@ -17,7 +17,7 @@
 
 #include "utils/allocation_strategy.hh"
 #include "utils/logalloc.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "test/perf/perf.hh"
 
 class piggie {
@@ -34,7 +34,7 @@ static constexpr unsigned nr_sizes = 32;
 
 int main(int argc, char** argv) {
     app_template app;
-    return app.run(argc, argv, [&app] {
+    return app.run(argc, argv, [] {
         return seastar::async([&] {
             logalloc::prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
             logalloc::region reg;

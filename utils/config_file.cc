@@ -4,17 +4,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <unordered_map>
-#include <regex>
 
 #include <yaml-cpp/yaml.h>
 
 #include <boost/program_options.hpp>
 #include <boost/any.hpp>
-#include <boost/range/adaptor/filtered.hpp>
 
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
@@ -22,11 +20,13 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
 
 #include <seastar/json/json_elements.hh>
+
+#include <ranges>
 
 #include "config_file.hh"
 #include "config_file_impl.hh"
@@ -269,6 +269,17 @@ utils::config_file::add_options(bpo::options_description_easy_init& init) {
     return init;
 }
 
+
+bpo::options_description_easy_init&
+utils::config_file::add_deprecated_options(bpo::options_description_easy_init& init) {
+    for (config_src& src : _cfgs) {
+        if (src.status() == value_status::Deprecated) {
+            src.add_command_line_option(init);
+        }
+    }
+    return init;
+}
+
 void utils::config_file::read_from_yaml(const sstring& yaml, error_handler h) {
     read_from_yaml(yaml.c_str(), std::move(h));
 }
@@ -305,6 +316,9 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
             continue;
         }
         switch (cfg.status()) {
+        case value_status::Deprecated:
+            h(label, "Option is deprecated", cfg.status());
+            continue;
         case value_status::Invalid:
             h(label, "Option is not applicable", cfg.status());
             continue;
@@ -327,9 +341,9 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
 }
 
 utils::config_file::configs utils::config_file::set_values() const {
-    return boost::copy_range<configs>(_cfgs | boost::adaptors::filtered([] (const config_src& cfg) {
+    return _cfgs | std::views::filter([] (const config_src& cfg) {
         return cfg.status() > value_status::Used || cfg.source() > config_source::None;
-    }));
+    }) | std::ranges::to<configs>();
 }
 
 utils::config_file::configs utils::config_file::unset_values() const {

@@ -4,30 +4,37 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <iterator>
-#include <regex>
-
-#include <yaml-cpp/yaml.h>
 #include <boost/any.hpp>
+#include <boost/regex.hpp>
+#include <yaml-cpp/node/convert.h>
 
-#include <seastar/core/coroutine.hh>
 #include <seastar/core/smp.hh>
 
 #include "config_file.hh"
 
-#include <seastar/json/json_elements.hh>
+namespace utils {
+
+template <typename T>
+T config_from_string(std::string_view string_representation) {
+    return boost::lexical_cast<T>(string_representation);
+}
+
+template <>
+bool config_from_string(std::string_view string_representation);
+
+}
 
 namespace YAML {
 
 /*
  * Add converters as needed here...
  *
- * TODO: Maybe we should just define all node conversionas as "lexical_cast".
+ * TODO: Maybe we should just define all node conversions as "lexical_cast".
  * However, vanilla yamp-cpp does some special treatment of scalar types,
  * mainly inf handling etc. Hm.
  */
@@ -84,7 +91,7 @@ std::istream& operator>>(std::istream& is, std::unordered_map<K, V, Args...>& ma
     is >> tmp;
 
     for (auto& p : tmp) {
-        map[boost::lexical_cast<K>(p.first)] = boost::lexical_cast<V>(p.second);
+        map[utils::config_from_string<K>(p.first)] = utils::config_from_string<V>(p.second);
     }
     return is;
 }
@@ -94,7 +101,7 @@ std::istream& operator>>(std::istream& is, std::vector<V, Args...>& dst) {
     std::vector<seastar::sstring> tmp;
     is >> tmp;
     for (auto& v : tmp) {
-        dst.emplace_back(boost::lexical_cast<V>(v));
+        dst.emplace_back(utils::config_from_string<V>(v));
     }
     return is;
 }
@@ -107,11 +114,11 @@ void validate(boost::any& out, const std::vector<std::string>& in, std::unordere
         out = boost::any(map_type());
     }
 
-    static const std::regex key(R"foo((?:^|\:)([^=:]+)=)foo");
+    static const boost::regex key(R"foo((?:^|\:)([^=:]+)=)foo");
 
     auto* p = boost::any_cast<map_type>(&out);
     for (const auto& s : in) {
-        std::sregex_iterator i(s.begin(), s.end(), key), e;
+        boost::sregex_iterator i(s.begin(), s.end(), key), e;
 
         if (i == e) {
             throw boost::program_options::invalid_option_value(s);
@@ -126,7 +133,7 @@ void validate(boost::any& out, const std::vector<std::string>& in, std::unordere
                 ve = s.begin() + i->position();
             }
 
-            (*p)[boost::lexical_cast<K>(k)] = boost::lexical_cast<V>(sstring(vs, ve));
+            (*p)[utils::config_from_string<K>(k)] = utils::config_from_string<V>(sstring(vs, ve));
         }
     }
 }
@@ -134,8 +141,6 @@ void validate(boost::any& out, const std::vector<std::string>& in, std::unordere
 }
 
 namespace utils {
-
-namespace {
 
 /*
  * Our own bpo::typed_valye.
@@ -172,8 +177,6 @@ inline typed_value_ex<T>* value_ex() {
     return r;
 }
 
-}
-
 sstring hyphenate(const std::string_view&);
 
 }
@@ -181,10 +184,16 @@ sstring hyphenate(const std::string_view&);
 template<typename T>
 void utils::config_file::named_value<T>::add_command_line_option(boost::program_options::options_description_easy_init& init) {
     const auto hyphenated_name = hyphenate(name());
-    // NOTE. We are not adding default values. We could, but must in that case manually (in some way) geenrate the textual
+    // NOTE. We are not adding default values. We could, but must in that case manually (in some way) generate the textual
     // version, since the available ostream operators for things like pairs and collections don't match what we can deal with parser-wise.
     // See removed ostream operators above.
-    init(hyphenated_name.data(), value_ex<T>()->notifier([this](T new_val) { set(std::move(new_val), config_source::CommandLine); }), desc().data());
+    init(hyphenated_name.data(), value_ex<T>()->notifier([this](T new_val) {
+        try {
+            set(std::move(new_val), config_source::CommandLine);
+        } catch (const std::invalid_argument& e) {
+            throw bpo::invalid_option_value(e.what());
+        }
+    }), desc().data());
 
     if (!alias().empty()) {
         const auto alias_desc = fmt::format("Alias for {}", hyphenated_name);
@@ -204,11 +213,11 @@ void utils::config_file::named_value<T>::set_value(const YAML::Node& node) {
 
 template<typename T>
 bool utils::config_file::named_value<T>::set_value(sstring value, config_source src) {
-    if (_liveness != liveness::LiveUpdate) {
+    if ((_liveness != liveness::LiveUpdate) || (src == config_source::CQL && !_cf->are_live_updatable_config_params_changeable_via_cql())) {
         return false;
     }
 
-    (*this)(boost::lexical_cast<T>(value), src);
+    (*this)(config_from_string<T>(value), src);
     return true;
 }
 
@@ -226,11 +235,11 @@ future<> utils::config_file::named_value<T>::set_value_on_all_shards(const YAML:
 
 template<typename T>
 future<bool> utils::config_file::named_value<T>::set_value_on_all_shards(sstring value, config_source src) {
-    if (_liveness != liveness::LiveUpdate) {
+    if ((_liveness != liveness::LiveUpdate) || (src == config_source::CQL && !_cf->are_live_updatable_config_params_changeable_via_cql())) {
         co_return false;
     }
 
-    co_await smp::invoke_on_all([this, value = boost::lexical_cast<T>(value), src] () {
+    co_await smp::invoke_on_all([this, value = config_from_string<T>(value), src] () {
         (*this)(value, src);
     });
     co_return true;

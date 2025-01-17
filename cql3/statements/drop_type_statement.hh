@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -27,16 +27,14 @@ public:
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    virtual void validate(query_processor&, const service::client_state& state) const override;
-
     virtual const sstring& keyspace() const override;
 
-    future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
 
     virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
 private:
-    void validate_while_executing(query_processor&) const;
+    bool validate_while_executing(query_processor&) const;
 };
 
 }

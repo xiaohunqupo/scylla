@@ -38,15 +38,11 @@ struct table_for_tests {
     class table_state;
     struct data {
         schema_ptr s;
-        reader_concurrency_semaphore semaphore;
-        cache_tracker tracker;
         replica::cf_stats cf_stats{0};
-        replica::column_family::config cfg;
         cell_locker_stats cl_stats;
-        tasks::task_manager tm;
-        compaction_manager cm{tm, compaction_manager::for_testing_tag{}};
         lw_shared_ptr<replica::column_family> cf;
         std::unique_ptr<table_state> table_s;
+        data_dictionary::storage_options storage;
         data();
         ~data();
     };
@@ -54,9 +50,7 @@ struct table_for_tests {
 
     static schema_ptr make_default_schema();
 
-    explicit table_for_tests(sstables::sstables_manager& sstables_manager);
-
-    explicit table_for_tests(sstables::sstables_manager& sstables_manager, schema_ptr s, std::optional<sstring> datadir = {});
+    explicit table_for_tests(sstables::sstables_manager& sstables_manager, compaction_manager& cm, schema_ptr s, replica::table::config cfg, data_dictionary::storage_options storage = {});
 
     schema_ptr schema() { return _data->s; }
 
@@ -66,14 +60,11 @@ struct table_for_tests {
 
     replica::column_family& operator*() { return *_data->cf; }
     replica::column_family* operator->() { return _data->cf.get(); }
-
-    compaction_manager& get_compaction_manager() noexcept { return _data->cm; }
+    const replica::column_family* operator->() const { return _data->cf.get(); }
 
     compaction::table_state& as_table_state() noexcept;
 
     future<> stop();
 
-    future<> stop_and_keep_alive() {
-        return stop().finally([cf = *this] {});
-    }
+    void set_tombstone_gc_enabled(bool tombstone_gc_enabled) noexcept;
 };

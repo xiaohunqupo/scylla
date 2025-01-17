@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <random>
@@ -91,7 +91,7 @@ public:
 
 int main(int argc, char **argv) {
     app_template app;
-    return app.run(argc, argv, [&app] {
+    return app.run(argc, argv, [] {
         if (smp::count < 2) {
             std::cerr << "Cannot run test with smp::count < 2";
             return make_ready_future<>();
@@ -103,15 +103,15 @@ int main(int argc, char **argv) {
             w.invoke_on_all(&worker::loop).get();
             w.stop().get();
 
-            for (int i = 0; i < smp::count * phases_scale; i++) {
+            for (size_t i = 0; i < smp::count * phases_scale; i++) {
                 sharded<worker> w;
                 w.start(utils::cross_shard_barrier()).get();
                 try {
                     w.invoke_on_all(&worker::loop_with_error).get();
                 } catch (...) {
-                    auto ph = w.invoke_on(0, [] (auto& w) { return w.get_phase(); }).get0();
-                    for (int c = 1; c < smp::count; c++) {
-                        auto ph_2 = w.invoke_on(c, [] (auto& w) { return w.get_phase(); }).get0();
+                    auto ph = w.invoke_on(0, [] (auto& w) { return w.get_phase(); }).get();
+                    for (size_t c = 1; c < smp::count; c++) {
+                        auto ph_2 = w.invoke_on(c, [] (auto& w) { return w.get_phase(); }).get();
                         if (ph_2 != ph) {
                             fmt::print("aborted barrier passed shard through\n");
                             abort();

@@ -77,12 +77,18 @@ private:
      */
     std::optional<cdc::generation_id> _gen_id;
     future<> _cdc_streams_rewrite_complete = make_ready_future<>();
+
+    /* Returns true if raft topology changes are enabled.
+     * Can only be called from shard 0.
+     */
+    std::function<bool()> _raft_topology_change_enabled;
 public:
     generation_service(config cfg, gms::gossiper&,
             sharded<db::system_distributed_keyspace>&,
             sharded<db::system_keyspace>& sys_ks,
             abort_source&, const locator::shared_token_metadata&,
-            gms::feature_service&, replica::database& db);
+            gms::feature_service&, replica::database& db,
+            std::function<bool()> raft_topology_change_enabled);
 
     future<> stop();
     ~generation_service();
@@ -92,25 +98,25 @@ public:
      * that generation timestamp moved in as the `startup_gen_id` parameter.
      * This passes the responsibility of managing generations from the node startup code to this service;
      * until then, the service remains dormant.
-     * At the time of writing this comment, the startup code is in `storage_service::join_token_ring`, hence
+     * The startup code is in `storage_service::join_topology`, hence
      * `after_join` should be called at the end of that function.
      * Precondition: the node has completed bootstrapping and system_distributed_keyspace is initialized.
      * Must be called on shard 0 - that's where the generation management happens.
      */
     future<> after_join(std::optional<cdc::generation_id>&& startup_gen_id);
+    future<> leave_ring();
 
     cdc::metadata& get_cdc_metadata() {
         return _cdc_metadata;
     }
 
-    virtual future<> before_change(gms::inet_address, gms::endpoint_state, gms::application_state, const gms::versioned_value&) override { return make_ready_future(); }
-    virtual future<> on_alive(gms::inet_address, gms::endpoint_state) override { return make_ready_future(); }
-    virtual future<> on_dead(gms::inet_address, gms::endpoint_state) override { return make_ready_future(); }
-    virtual future<> on_remove(gms::inet_address) override { return make_ready_future(); }
-    virtual future<> on_restart(gms::inet_address, gms::endpoint_state) override { return make_ready_future(); }
+    virtual future<> on_alive(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
+    virtual future<> on_dead(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
+    virtual future<> on_remove(gms::inet_address, gms::permit_id) override { return make_ready_future(); }
+    virtual future<> on_restart(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override { return make_ready_future(); }
 
-    virtual future<> on_join(gms::inet_address, gms::endpoint_state) override;
-    virtual future<> on_change(gms::inet_address, gms::application_state, const gms::versioned_value&) override;
+    virtual future<> on_join(gms::inet_address, gms::endpoint_state_ptr, gms::permit_id) override;
+    virtual future<> on_change(gms::inet_address, const gms::application_state_map&, gms::permit_id) override;
 
     future<> check_and_repair_cdc_streams();
 
@@ -132,33 +138,54 @@ public:
      * so that other nodes learn about the generation before their clocks cross the generation's timestamp
      * (not guaranteed in the current implementation, but expected to be the common case;
      *  we assume that `ring_delay` is enough for other nodes to learn about the new generation).
+     *
+     * Legacy: used for gossiper-based topology changes.
      */
-    future<cdc::generation_id> make_new_generation(const std::unordered_set<dht::token>& bootstrap_tokens, bool add_delay);
+    future<cdc::generation_id> legacy_make_new_generation(
+        const std::unordered_set<dht::token>& bootstrap_tokens, bool add_delay);
+
+    /* Retrieve the CDC generation with the given ID from local tables
+     * and start using it for CDC log writes if it's not obsolete.
+     * Precondition: the generation was committed using group 0 and locally applied.
+     */
+    future<> handle_cdc_generation(cdc::generation_id_v2);
 
 private:
     /* Retrieve the CDC generation which starts at the given timestamp (from a distributed table created for this purpose)
      * and start using it for CDC log writes if it's not obsolete.
+     *
+     * Legacy: used for gossiper-based topology changes.
      */
-    future<> handle_cdc_generation(std::optional<cdc::generation_id>);
+    future<> legacy_handle_cdc_generation(std::optional<cdc::generation_id>);
 
-    /* If `handle_cdc_generation` fails, it schedules an asynchronous retry in the background
-     * using `async_handle_cdc_generation`.
+    /* If `legacy_handle_cdc_generation` fails, it schedules an asynchronous retry in the background
+     * using `legacy_async_handle_cdc_generation`.
+     *
+     * Legacy: used for gossiper-based topology changes.
      */
-    void async_handle_cdc_generation(cdc::generation_id);
+    void legacy_async_handle_cdc_generation(cdc::generation_id);
 
-    /* Wrapper around `do_handle_cdc_generation` which intercepts timeout/unavailability exceptions.
-     * Returns: do_handle_cdc_generation(ts). */
-    future<bool> do_handle_cdc_generation_intercept_nonfatal_errors(cdc::generation_id);
+    /* Wrapper around `legacy_do_handle_cdc_generation` which intercepts timeout/unavailability exceptions.
+     * Returns: legacy_do_handle_cdc_generation(ts).
+     *
+     * Legacy: used for gossiper-based topology changes.
+     */
+    future<bool> legacy_do_handle_cdc_generation_intercept_nonfatal_errors(cdc::generation_id);
 
     /* Returns `true` iff we started using the generation (it was not obsolete or already known),
-     * which means that this node might write some CDC log entries using streams from this generation. */
-    future<bool> do_handle_cdc_generation(cdc::generation_id);
+     * which means that this node might write some CDC log entries using streams from this generation.
+     *
+     * Legacy: used for gossiper-based topology changes.
+     */
+    future<bool> legacy_do_handle_cdc_generation(cdc::generation_id);
 
     /* Scan CDC generation timestamps gossiped by other nodes and retrieve the latest one.
      * This function should be called once at the end of the node startup procedure
      * (after the node is started and running normally, it will retrieve generations on gossip events instead).
+     *
+     * Legacy: used for gossiper-based topology changes.
      */
-    future<> scan_cdc_generations();
+    future<> legacy_scan_cdc_generations();
 
     /* generation_service code might be racing with system_distributed_keyspace deinitialization
      * (the deinitialization order is broken).

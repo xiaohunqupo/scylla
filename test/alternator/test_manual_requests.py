@@ -1,18 +1,21 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for manual requests - not necessarily generated
 # by boto3, in order to allow non-validated input to get through
 
+import base64
+import json
+
 import pytest
 import requests
-import json
 import urllib3
-import base64
 from botocore.exceptions import BotoCoreError, ClientError
 from packaging.version import Version
-from util import random_bytes
+
+from test.alternator.util import random_bytes
+
 
 def gen_json(n):
     return '{"":'*n + '{}' + '}'*n
@@ -218,7 +221,7 @@ def test_unknown_operation(dynamodb):
 # Because this test uses boto3, we can reproduce the error, but not really
 # understand what it is. We have another variant of this test below -
 # test_exception_escape_raw() - that does the same thing without boto3
-# so we can see the error happens during the reponse JSON parsing.
+# so we can see the error happens during the response JSON parsing.
 def test_exception_escape(test_table_s):
     # ADD expects its parameter :inc to be an integer. We'll send a string,
     # so expect a ValidationException.

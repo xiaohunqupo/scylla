@@ -3,15 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "wasm.hh"
 #include "wasm_instance_cache.hh"
 #include "concrete_types.hh"
-#include "utils/utf8.hh"
-#include "utils/ascii.hh"
-#include "utils/date.h"
 #include "db/config.hh"
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/coroutine.hh>
@@ -19,12 +16,15 @@
 #include "seastarx.hh"
 #include "rust/cxx.h"
 #include "rust/wasmtime_bindings.hh"
+#include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include "lang/wasm_alien_thread_runner.hh"
 
-static logging::logger wasm_logger("wasm");
+logging::logger wasm_logger("wasm");
 
 namespace wasm {
-context::context(wasmtime::Engine& engine_ptr, std::string name, instance_cache* cache, uint64_t yield_fuel, uint64_t total_fuel)
+
+context::context(wasmtime::Engine& engine_ptr, std::string name, instance_cache& cache, uint64_t yield_fuel, uint64_t total_fuel)
     : engine_ptr(engine_ptr)
     , function_name(name)
     , cache(cache)
@@ -211,14 +211,20 @@ struct from_val_visitor {
             "externref",
         };
         if (val.kind() != expected) {
-            throw wasm::exception(format("Incorrect wasm value kind returned. Expected {}, got {}", kind_str[size_t(expected)], kind_str[size_t(val.kind())]));
+            throw wasm::exception(seastar::format("Incorrect wasm value kind returned. Expected {}, got {}", kind_str[size_t(expected)], kind_str[size_t(val.kind())]));
         }
     }
 };
 
-void precompile(context& ctx, const std::vector<sstring>& arg_names, std::string script) {
+seastar::future<> precompile(alien_thread_runner& alien_runner, context& ctx, const std::vector<sstring>& arg_names, std::string script) {
+    seastar::promise<rust::Box<wasmtime::Module>> done;
+    alien_runner.submit(done, [&engine_ptr = ctx.engine_ptr, script = std::move(script)] {
+        return wasmtime::create_module(engine_ptr, rust::Str(script.data(), script.size()));
+    });
+
+    ctx.module = co_await done.get_future();
+    std::exception_ptr ex;
     try {
-        ctx.module = wasmtime::create_module(ctx.engine_ptr, rust::Str(script.data(), script.size()));
         // After precompiling the module, we try creating a store, an instance and a function with it to make sure it's valid.
         // If we succeed, we drop them and keep the module, knowing that we will be able to create them again for UDF execution.
         ctx.module.value()->compile(ctx.engine_ptr);
@@ -227,10 +233,13 @@ void precompile(context& ctx, const std::vector<sstring>& arg_names, std::string
         create_func(*inst, *store, ctx.function_name);
         ctx.module.value()->release();
     } catch (const rust::Error& e) {
-        throw wasm::exception(e.what());
+        ex = std::make_exception_ptr(wasm::exception(format("Compilation failed: {}", e.what())));
+    }
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
     }
 }
-seastar::future<bytes_opt> run_script(context& ctx, wasmtime::Store& store, wasmtime::Instance& instance, wasmtime::Func& func, const std::vector<data_type>& arg_types, const std::vector<bytes_opt>& params, data_type return_type, bool allow_null_input) {
+seastar::future<bytes_opt> run_script(context& ctx, wasmtime::Store& store, wasmtime::Instance& instance, wasmtime::Func& func, const std::vector<data_type>& arg_types, std::span<const bytes_opt> params, data_type return_type, bool allow_null_input) {
     wasm_logger.debug("Running function {}", ctx.function_name);
 
     rust::Box<wasmtime::ValVec> argv = wasmtime::get_val_vec();
@@ -244,7 +253,7 @@ seastar::future<bytes_opt> run_script(context& ctx, wasmtime::Store& store, wasm
         } else if (param) {
             visit(type, init_arg_visitor{param, *argv, store, instance});
         } else {
-            co_await coroutine::return_exception(wasm::exception(format("Function {} cannot be called on null values", ctx.function_name)));
+            co_await coroutine::return_exception(wasm::exception(seastar::format("Function {} cannot be called on null values", ctx.function_name)));
         }
     }
     auto rets = wasmtime::get_val_vec();
@@ -288,13 +297,13 @@ seastar::future<bytes_opt> run_script(context& ctx, wasmtime::Store& store, wasm
     }
 }
 
-seastar::future<bytes_opt> run_script(const db::functions::function_name& name, context& ctx, const std::vector<data_type>& arg_types, const std::vector<bytes_opt>& params, data_type return_type, bool allow_null_input) {
+seastar::future<bytes_opt> run_script(const db::functions::function_name& name, context& ctx, const std::vector<data_type>& arg_types, std::span<const bytes_opt> params, data_type return_type, bool allow_null_input) {
     wasm::instance_cache::value_type func_inst;
     std::exception_ptr ex;
     bytes_opt ret;
     try {
-        func_inst = ctx.cache->get(name, arg_types, ctx).get0();
-        ret = wasm::run_script(ctx, *func_inst->instance->store, *func_inst->instance->instance, *func_inst->instance->func, arg_types, params, return_type, allow_null_input).get0();
+        func_inst = ctx.cache.get(name, arg_types, ctx).get();
+        ret = wasm::run_script(ctx, *func_inst->instance->store, *func_inst->instance->instance, *func_inst->instance->func, arg_types, params, return_type, allow_null_input).get();
     } catch (const wasm::instance_corrupting_exception& e) {
         func_inst->instance = std::nullopt;
         ex = std::current_exception();
@@ -303,7 +312,7 @@ seastar::future<bytes_opt> run_script(const db::functions::function_name& name, 
     }
     if (func_inst) {
         // The construction of func_inst may have failed due to a insufficient free memory for compiled modules.
-        ctx.cache->recycle(func_inst);
+        ctx.cache.recycle(func_inst);
     }
     if (ex) {
         std::rethrow_exception(std::move(ex));

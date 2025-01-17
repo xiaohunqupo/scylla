@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,11 +14,9 @@
 #include <optional>
 #include <seastar/util/optimized_optional.hh>
 
-#include <seastar/core/future-util.hh>
-
-#include "db/timeout_clock.hh"
 #include "reader_permit.hh"
 #include "mutation_fragment_fwd.hh"
+#include "mutation/mutation_partition.hh"
 
 // mutation_fragments are the objects that streamed_mutation are going to
 // stream. They can represent:
@@ -90,6 +88,9 @@ public:
     void apply(const schema& s, const deletable_row& r) {
         _row.apply(s, r);
     }
+    void apply(const schema& our_schema, const schema& their_schema, const deletable_row& r) {
+        _row.apply(our_schema, their_schema, r);
+    }
 
     position_in_partition_view position() const;
 
@@ -118,9 +119,9 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    friend fmt::formatter<printer>;
 
     deletable_row as_deletable_row() && { return std::move(_row); }
     const deletable_row& as_deletable_row() const & { return _row; }
@@ -177,9 +178,9 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    friend fmt::formatter<printer>;
 };
 
 class partition_start final {
@@ -210,7 +211,7 @@ public:
         return _key.equal(s, other._key) && _partition_tombstone == other._partition_tombstone;
     }
 
-    friend std::ostream& operator<<(std::ostream& is, const partition_start& row);
+    friend fmt::formatter<partition_start>;
 };
 
 class partition_end final {
@@ -228,8 +229,6 @@ public:
     bool equal(const schema& s, const partition_end& other) const {
         return true;
     }
-
-    friend std::ostream& operator<<(std::ostream& is, const partition_end& row);
 };
 
 template<typename T, typename ReturnType>
@@ -301,6 +300,7 @@ private:
     mutation_fragment() = default;
     explicit operator bool() const noexcept { return bool(_data); }
     void destroy_data() noexcept;
+    void reset_memory(const schema& s, std::optional<reader_resources> res = {});
     friend class optimized_optional<mutation_fragment>;
 
     friend class position_in_partition;
@@ -313,7 +313,7 @@ public:
         , _data(std::make_unique<data>(std::move(permit)))
     {
         new (&_data->_clustering_row) clustering_row(std::forward<Args>(args)...);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        reset_memory(s);
     }
 
     mutation_fragment(const schema& s, reader_permit permit, static_row&& r);
@@ -341,7 +341,7 @@ public:
                 new (&_data->_partition_end) partition_end(o._data->_partition_end);
                 break;
         }
-        _data->_memory.reset(o._data->_memory.resources());
+        reset_memory(s, o._data->_memory.resources());
     }
     mutation_fragment(mutation_fragment&& other) = default;
     mutation_fragment& operator=(mutation_fragment&& other) noexcept {
@@ -384,19 +384,19 @@ public:
 
     void mutate_as_static_row(const schema& s, std::invocable<static_row&> auto&& fn) {
         fn(_data->_static_row);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        reset_memory(s);
     }
     void mutate_as_clustering_row(const schema& s, std::invocable<clustering_row&> auto&& fn) {
         fn(_data->_clustering_row);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        reset_memory(s);
     }
     void mutate_as_range_tombstone(const schema& s, std::invocable<range_tombstone&> auto&& fn) {
         fn(_data->_range_tombstone);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        reset_memory(s);
     }
     void mutate_as_partition_start(const schema& s, std::invocable<partition_start&> auto&& fn) {
         fn(_data->_partition_start);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        reset_memory(s);
     }
 
     static_row&& as_static_row() && { return std::move(_data->_static_row); }
@@ -417,7 +417,7 @@ public:
     template<typename Consumer>
     requires MutationFragmentConsumer<Consumer, decltype(std::declval<Consumer>().consume(std::declval<range_tombstone>()))>
     decltype(auto) consume(Consumer& consumer) && {
-        _data->_memory.reset();
+        _data->_memory.reset_to_zero();
         switch (_kind) {
         case kind::static_row:
             return consumer.consume(std::move(_data->_static_row));
@@ -495,9 +495,9 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    friend fmt::formatter<printer>;
 
 private:
     size_t calculate_memory_usage(const schema& s) const {
@@ -524,9 +524,6 @@ inline position_in_partition_view partition_end::position() const
 {
     return position_in_partition_view::for_partition_end();
 }
-
-std::ostream& operator<<(std::ostream&, mutation_fragment::kind);
-
 
 // range_tombstone_stream is a helper object that simplifies producing a stream
 // of range tombstones and merging it with a stream of clustering rows.
@@ -568,7 +565,7 @@ public:
     }
     void reset();
     bool empty() const;
-    friend std::ostream& operator<<(std::ostream& out, const range_tombstone_stream&);
+    friend fmt::formatter<range_tombstone_stream>;
 };
 
 // F gets a stream element as an argument and returns the new value which replaces that element
@@ -586,4 +583,41 @@ template<>
 struct appending_hash<mutation_fragment> {
     template<typename Hasher>
     void operator()(Hasher& h, const mutation_fragment& mf, const schema& s) const;
+};
+
+template <> struct fmt::formatter<clustering_row::printer> : fmt::formatter<string_view> {
+    auto format(const clustering_row::printer& p, fmt::format_context& ctx) const {
+        auto& row = p._clustering_row;
+        return fmt::format_to(ctx.out(), "{{clustering_row: ck {} dr {}}}",
+                              row._ck, deletable_row::printer(p._schema, row._row));
+    }
+};
+template <> struct fmt::formatter<static_row::printer> : fmt::formatter<string_view> {
+    auto format(const static_row::printer& p, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{static_row: {}}}",
+                              row::printer(p._schema, column_kind::static_column, p._static_row._cells));
+    }
+};
+template <> struct fmt::formatter<partition_start> : fmt::formatter<string_view> {
+    auto format(const partition_start& ph, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{partition_start: pk {} partition_tombstone {}}}",
+                              ph._key, ph._partition_tombstone);
+    }
+};
+template <> struct fmt::formatter<partition_end> : fmt::formatter<string_view> {
+    auto format(const partition_end&, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{partition_end}}");
+    }
+};
+template <> struct fmt::formatter<mutation_fragment::printer> : fmt::formatter<string_view> {
+    auto format(const mutation_fragment::printer&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<mutation_fragment::kind> : fmt::formatter<string_view> {
+    auto format(mutation_fragment::kind, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<range_tombstone_stream> : fmt::formatter<string_view> {
+    auto format(const range_tombstone_stream& rtl, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", rtl._list);
+    }
 };

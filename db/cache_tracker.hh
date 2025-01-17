@@ -3,15 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "utils/lru.hh"
 #include "utils/logalloc.hh"
+#include "utils/updateable_value.hh"
 #include "mutation/partition_version.hh"
 #include "mutation/mutation_cleaner.hh"
+#include "utils/cached_file_stats.hh"
+#include "sstables/partition_index_cache_stats.hh"
 
 #include <seastar/core/metrics_registration.hh>
 
@@ -23,7 +26,7 @@ namespace cache {
 
 class autoupdating_underlying_reader;
 class cache_streamed_mutation;
-class cache_flat_mutation_reader;
+class cache_mutation_reader;
 class read_context;
 class lsa_manager;
 
@@ -35,7 +38,7 @@ public:
     friend class row_cache;
     friend class cache::read_context;
     friend class cache::autoupdating_underlying_reader;
-    friend class cache::cache_flat_mutation_reader;
+    friend class cache::cache_mutation_reader;
     struct stats {
         uint64_t partition_hits;
         uint64_t partition_misses;
@@ -68,6 +71,8 @@ public:
         uint64_t pinned_dirty_memory_overload;
         uint64_t range_tombstone_reads;
         uint64_t row_tombstone_reads;
+        uint64_t rows_compacted;
+        uint64_t rows_compacted_away;
 
         uint64_t active_reads() const {
             return reads - reads_done;
@@ -75,18 +80,22 @@ public:
     };
 private:
     stats _stats{};
+    cached_file_stats _index_cached_file_stats{};
+    partition_index_cache_stats _partition_index_cache_stats{};
     seastar::metrics::metric_groups _metrics;
     logalloc::region _region;
     lru _lru;
     mutation_cleaner _garbage;
     mutation_cleaner _memtable_cleaner;
     mutation_application_stats& _app_stats;
+    utils::updateable_value<double> _index_cache_fraction;
 private:
     void setup_metrics();
 public:
     using register_metrics = bool_class<class register_metrics_tag>;
-    cache_tracker(mutation_application_stats&, register_metrics);
-    cache_tracker(register_metrics = register_metrics::no);
+    cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats&, register_metrics);
+    cache_tracker(utils::updateable_value<double> index_cache_fraction, register_metrics);
+    cache_tracker();
     ~cache_tracker();
     void clear();
     void touch(rows_entry&);
@@ -115,6 +124,8 @@ public:
     void on_row_merged_from_memtable() noexcept { ++_stats.rows_merged_from_memtable; }
     void on_range_tombstone_read() noexcept { ++_stats.range_tombstone_reads; }
     void on_row_tombstone_read() noexcept { ++_stats.row_tombstone_reads; }
+    void on_row_compacted() noexcept { ++_stats.rows_compacted; }
+    void on_row_compacted_away() noexcept { ++_stats.rows_compacted_away; }
     void pinned_dirty_memory_overload(uint64_t bytes) noexcept;
     allocation_strategy& allocator() noexcept;
     logalloc::region& region() noexcept;
@@ -126,6 +137,8 @@ public:
     stats& get_stats() noexcept { return _stats; }
     void set_compaction_scheduling_group(seastar::scheduling_group);
     lru& get_lru() { return _lru; }
+    cached_file_stats& get_index_cached_file_stats() { return _index_cached_file_stats; }
+    partition_index_cache_stats& get_partition_index_cache_stats() { return _partition_index_cache_stats; }
     seastar::memory::reclaiming_result evict_from_lru_shallow() noexcept;
 };
 

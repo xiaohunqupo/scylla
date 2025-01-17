@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 /// \brief Tests the GoogleCloudSnitch.
@@ -21,7 +21,6 @@
 
 #include <boost/test/unit_test.hpp>
 #include "locator/gce_snitch.hh"
-#include "utils/fb_utilities.hh"
 #include <seastar/testing/test_case.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
@@ -54,8 +53,7 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
         fs::path fname(test_files_subdir);
         fname /= fs::path(property_fname);
 
-        utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
-        utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
+        auto my_address = gms::inet_address("localhost");
 
         char* meta_url_env = std::getenv(DUMMY_META_SERVER_IP);
         char* use_gce_server = std::getenv(USE_GCE_META_SERVER);
@@ -74,7 +72,7 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
         try {
             if (use_dummy_server) {
                 http_server.start("dummy_GCE_meta_server").get();
-                http_server.set_routes([] (routes& r) {
+                http_server.set_routes([] (httpd::routes& r) {
                     r.put(seastar::httpd::operation_type::GET, locator::gce_snitch::ZONE_NAME_QUERY_REQ, new gce_meta_get_handler());
                 }).get();
                 http_server.listen(ipv4_addr(meta_url.c_str(), 80)).get();
@@ -84,6 +82,8 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
             cfg.name = "GoogleCloudSnitch";
             cfg.properties_file_name = fname.string();
             cfg.gce_meta_server_url = meta_url;
+            cfg.listen_address = my_address;
+            cfg.broadcast_address = my_address;
             sharded<snitch_ptr> snitch;
             snitch.start(cfg).get();
             snitch.invoke_on_all(&snitch_ptr::start).get();
@@ -98,14 +98,13 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
             auto cpu0_dc = make_lw_shared<sstring>();
             auto cpu0_rack = make_lw_shared<sstring>();
             auto res = make_lw_shared<bool>(true);
-            auto my_address = utils::fb_utilities::get_broadcast_address();
 
-            snitch.invoke_on(0, [cpu0_dc, cpu0_rack, res, my_address] (snitch_ptr& inst) {
+            snitch.invoke_on(0, [cpu0_dc, cpu0_rack, res] (snitch_ptr& inst) {
                 *cpu0_dc =inst->get_datacenter();
                 *cpu0_rack = inst->get_rack();
             }).get();
 
-            snitch.invoke_on_all([cpu0_dc, cpu0_rack, res, my_address] (snitch_ptr& inst) {
+            snitch.invoke_on_all([cpu0_dc, cpu0_rack, res] (snitch_ptr& inst) {
                 if (*cpu0_dc != inst->get_datacenter() ||
                     *cpu0_rack != inst->get_rack()) {
                     *res = false;

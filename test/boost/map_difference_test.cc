@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
@@ -15,7 +15,8 @@
 #include <map>
 #include <set>
 
-using namespace std;
+using std::map;
+using std::set;
 
 BOOST_AUTO_TEST_CASE(both_empty) {
     map<int, int> left;

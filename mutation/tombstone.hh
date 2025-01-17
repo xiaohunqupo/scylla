@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <functional>
 #include <compare>
 
 #include "timestamp.hh"
@@ -34,7 +33,6 @@ struct tombstone final {
 
     std::strong_ordering operator<=>(const tombstone& t) const = default;
     bool operator==(const tombstone&) const = default;
-    bool operator!=(const tombstone&) const = default;
 
     explicit operator bool() const {
         return timestamp != api::missing_timestamp;
@@ -62,15 +60,27 @@ struct tombstone final {
         result.apply(t);
         return result;
     }
-
-    friend std::ostream& operator<<(std::ostream& out, const tombstone& t) {
-        if (t) {
-            return out << "{tombstone: timestamp=" << t.timestamp << ", deletion_time=" << t.deletion_time.time_since_epoch().count() << "}";
-        } else {
-            return out << "{tombstone: none}";
-        }
-    }
 };
+
+template <>
+struct fmt::formatter<tombstone> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const tombstone& t, FormatContext& ctx) const {
+        if (t) {
+            return fmt::format_to(ctx.out(),
+                                  "{{tombstone: timestamp={}, deletion_time={}}}",
+                                  t.timestamp, t.deletion_time.time_since_epoch().count());
+        } else {
+            return fmt::format_to(ctx.out(),
+                                  "{{tombstone: none}}");
+        }
+     }
+};
+
+inline std::ostream& operator<<(std::ostream& out, const tombstone& t) {
+    fmt::print(out, "{}", t);
+    return out;
+}
 
 template<>
 struct appending_hash<tombstone> {
@@ -80,8 +90,3 @@ struct appending_hash<tombstone> {
         feed_hash(h, t.deletion_time);
     }
 };
-
-// Determines whether tombstone may be GC-ed.
-using can_gc_fn = std::function<bool(tombstone)>;
-
-extern can_gc_fn always_gc;

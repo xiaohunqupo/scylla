@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <boost/algorithm/string/join.hpp>
+#include "utils/assert.hh"
 #include <fmt/chrono.h>
 #include <lua.hpp>
 #include <seastar/core/fstream.hh>
@@ -22,6 +22,15 @@
 #include "tools/lua_sstable_consumer.hh"
 #include "types/collection.hh"
 #include "types/tuple.hh"
+#include "dht/i_partitioner.hh"
+
+// Lua 5.4 added an extra parameter to lua_resume
+
+#if LUA_VERSION_NUM >= 504
+#    define LUA_504_PLUS(x...) x
+#else
+#    define LUA_504_PLUS(x...)
+#endif
 
 namespace {
 
@@ -55,7 +64,7 @@ template <> struct type_to_metatable<json_writer> { static constexpr const char*
 template <typename T>
 const char* get_metatable_name() {
     const auto metatable_name = type_to_metatable<std::remove_cv_t<T>>::metatable_name;
-    assert(metatable_name);
+    SCYLLA_ASSERT(metatable_name);
     return metatable_name;
 }
 
@@ -76,6 +85,8 @@ void* lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
 
 static const luaL_Reg loadedlibs[] = {
     {"base", luaopen_base},
+    {LUA_MATHLIBNAME, luaopen_math},
+    {LUA_OSLIBNAME, luaopen_os},
     {LUA_STRLIBNAME, luaopen_string},
     {LUA_TABLIBNAME, luaopen_table},
     {NULL, NULL},
@@ -276,14 +287,14 @@ int new_ring_position_l(lua_State* l) {
             pk = pop_userdata<partition_key>(l, 2);
             token = dht::get_token(s, *pk);
         } else if (lua_type(l, 2) == LUA_TNUMBER) {
-            token = dht::token(dht::token_kind::key, lua_tointeger(l, 2));
+            token = dht::token(lua_tointeger(l, 2));
         }
     }
 
     if (lua_gettop(l) == 3) {
         pk = pop_userdata<partition_key>(l, 2);
         if (lua_type(l, 3) == LUA_TNUMBER) {
-            token = dht::token(dht::token_kind::key, lua_tointeger(l, 3));
+            token = dht::token(lua_tointeger(l, 3));
         } else {
             luaL_checktype(l, 3, LUA_TNIL);
         }
@@ -292,7 +303,7 @@ int new_ring_position_l(lua_State* l) {
         if (!weight) {
             luaL_error(l, "weight of 0 is invalid for min/max ring_position");
         }
-        token = dht::token(weight < 0 ? dht::token_kind::after_all_keys : dht::token_kind::before_all_keys, 0);
+        token = weight < 0 ? dht::maximum_token() : dht::minimum_token();
     }
 
     push_userdata<dht::ring_position_ext>(l, *token, std::move(pk), weight);
@@ -902,7 +913,7 @@ int range_tombstone_change_index_l(lua_State* l) {
 }
 
 class json_writer {
-    tools::mutation_fragment_json_writer _writer;
+    tools::mutation_fragment_stream_json_writer _writer;
 
 private:
     static json_writer& get_this(lua_State* l) {
@@ -1286,7 +1297,7 @@ private:
         int ret = LUA_YIELD;
         int nresults = 0;
         while (ret == LUA_YIELD) {
-            ret = lua_resume(l, nullptr, nargs, &nresults);
+            ret = lua_resume(l, nullptr, nargs LUA_504_PLUS(, &nresults));
             if (ret == LUA_YIELD) {
                 if (nresults == 0) {
                     co_await coroutine::maybe_yield();

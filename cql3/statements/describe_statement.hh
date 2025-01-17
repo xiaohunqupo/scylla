@@ -3,15 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "seastar/core/sstring.hh"
+#include <seastar/core/sstring.hh>
 #include "cql3/cql_statement.hh"
 #include "cql3/statements/raw/describe_statement.hh"
-#include <memory>
 
 /**
  *  SERVER-SIDE DESCRIBE STATEMENT
@@ -24,8 +23,13 @@
  *  - generic_describe_statements - DESC
  *
  *  Keyspace element means: UDT, UDF, UDA, index, view or table
- *  (see `data_dictionary/keyspace_element.hh`)
  */
+
+namespace replica {
+
+class database;
+
+}
 
 namespace cql3 {
 
@@ -40,7 +44,7 @@ protected:
     describe_statement();
 
     virtual std::vector<lw_shared_ptr<column_specification>> get_column_specifications() const = 0;
-    virtual std::vector<lw_shared_ptr<column_specification>> get_column_specifications(const service::client_state& client_state) const {
+    virtual std::vector<lw_shared_ptr<column_specification>> get_column_specifications(replica::database& db, const service::client_state& client_state) const {
         return get_column_specifications();
     }
     virtual seastar::future<std::vector<std::vector<bytes_opt>>> describe(cql3::query_processor& qp, const service::client_state& client_state) const = 0;
@@ -48,21 +52,20 @@ public:
     virtual uint32_t get_bound_terms() const override;
     virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
     virtual seastar::future<> check_access(query_processor& qp, const service::client_state& state) const override;
-    virtual void validate(query_processor&, const service::client_state& state) const override;
     virtual seastar::shared_ptr<const metadata> get_result_metadata() const override;
 
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-    execute(cql3::query_processor& qp, service::query_state& state, const query_options& options) const override;
+    execute(cql3::query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
 };
 
 class cluster_describe_statement : public describe_statement {
 private:
-    bool should_add_range_ownership(const service::client_state& client_state) const;
+    bool should_add_range_ownership(replica::database& db, const service::client_state& client_state) const;
     future<bytes_opt> range_ownership(const service::storage_proxy& proxy, const sstring& ks) const;
 
 protected:
     virtual std::vector<lw_shared_ptr<column_specification>> get_column_specifications() const override;
-    virtual std::vector<lw_shared_ptr<column_specification>> get_column_specifications(const service::client_state& client_state) const override;
+    virtual std::vector<lw_shared_ptr<column_specification>> get_column_specifications(replica::database& db, const service::client_state& client_state) const override;
     virtual seastar::future<std::vector<std::vector<bytes_opt>>> describe(cql3::query_processor& qp, const service::client_state& client_state) const override;
 
 public:
@@ -72,6 +75,7 @@ public:
 class schema_describe_statement : public describe_statement {
     struct schema_desc {
         bool full_schema;
+        bool with_hashed_passwords;
     };
     struct keyspace_desc {
         std::optional<sstring> keyspace;
@@ -87,7 +91,7 @@ protected:
     virtual seastar::future<std::vector<std::vector<bytes_opt>>> describe(cql3::query_processor& qp, const service::client_state& client_state) const override;
 
 public:
-    schema_describe_statement(bool full_schema, bool with_internals);
+    schema_describe_statement(bool full_schema, bool with_hashed_passwords, bool with_internals);
     schema_describe_statement(std::optional<sstring> keyspace, bool only, bool with_internals);
 };
 

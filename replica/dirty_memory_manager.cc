@@ -1,11 +1,13 @@
 // Copyright (C) 2012-present ScyllaDB
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 
+#include "utils/assert.hh"
 #include "dirty_memory_manager.hh"
 #include "database.hh" // for memtable_list
 #include <seastar/core/metrics_api.hh>
 #include <seastar/util/later.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "seastarx.hh"
@@ -42,7 +44,7 @@ region_group_binomial_group_sanity_check(const region_group::region_heap& bh) {
         auto t = r->evictable_occupancy().total_space();
         fmt::print(" r = {} (id={}), occupancy = {}\n", fmt::ptr(r), r->id(), t);
     }
-    assert(0);
+    SCYLLA_ASSERT(0);
 #endif
 }
 
@@ -62,7 +64,7 @@ dirty_memory_manager_logalloc::size_tracked_region* region_group::get_largest_re
 void
 region_group::add(logalloc::region* child_r) {
     auto child = static_cast<size_tracked_region*>(child_r);
-    assert(!child->_heap_handle);
+    SCYLLA_ASSERT(!child->_heap_handle);
     child->_heap_handle = std::make_optional(_regions.push(child));
     region_group_binomial_group_sanity_check(_regions);
     update_unspooled(child_r->occupancy().total_space());
@@ -92,11 +94,6 @@ region_group::moved(logalloc::region* old_address, logalloc::region* new_address
     // assignment operator.
     old_child->_heap_handle = std::make_optional(_regions.push(new_child));
     region_group_binomial_group_sanity_check(_regions);
-}
-
-bool
-region_group::execution_permitted() noexcept {
-    return !under_unspooled_pressure() && !_under_real_pressure;
 }
 
 void
@@ -241,7 +238,7 @@ future<> dirty_memory_manager::shutdown() {
 }
 
 future<> dirty_memory_manager::flush_one(replica::memtable_list& mtlist, flush_permit&& permit) noexcept {
-    return mtlist.seal_active_memtable(std::move(permit)).handle_exception([this, schema = mtlist.back()->schema()] (std::exception_ptr ep) {
+    return mtlist.seal_active_memtable(std::move(permit)).handle_exception([schema = mtlist.back()->schema()] (std::exception_ptr ep) {
         dblog.error("Failed to flush memtable, {}:{} - {}", schema->ks_name(), schema->cf_name(), ep);
         return make_exception_future<>(ep);
     });
@@ -287,7 +284,7 @@ future<> dirty_memory_manager::flush_when_needed() {
                 // Do not wait. The semaphore will protect us against a concurrent flush. But we
                 // want to start a new one as soon as the permits are destroyed and the semaphore is
                 // made ready again, not when we are done with the current one.
-                (void)this->flush_one(mtlist, std::move(permit)).handle_exception([this] (std::exception_ptr ex) {
+                (void)this->flush_one(mtlist, std::move(permit)).handle_exception([] (std::exception_ptr ex) {
                     dblog.error("Flushing memtable returned unexpected error: {}", ex);
                 });
                 return make_ready_future<>();

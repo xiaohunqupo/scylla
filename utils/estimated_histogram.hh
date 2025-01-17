@@ -5,17 +5,19 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <cmath>
 #include <algorithm>
 #include <vector>
 #include <chrono>
+#include <fmt/ostream.h>
 #include <seastar/core/metrics_types.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include "seastarx.hh"
 #include <seastar/core/bitops.hh>
 #include <limits>
@@ -185,7 +187,7 @@ public:
     /*!
      * \brief returns the smallest value that could have been added to this histogram
      * This method looks for the first non-empty bucket and returns its lower limit.
-     * Note that for non-empty histogram the lowest potentail value is Min.
+     * Note that for non-empty histogram the lowest potential value is Min.
      *
      * It will return 0 if the histogram is empty.
      */
@@ -377,6 +379,10 @@ struct estimated_histogram {
     int64_t _count = 0;
     int64_t _sample_sum = 0;
 
+    estimated_histogram(std::vector<int64_t> bucket_offsets, std::vector<int64_t> buckets)
+        : bucket_offsets(std::move(bucket_offsets)), buckets(std::move(buckets))
+    { }
+
     estimated_histogram(int bucket_count = 90) {
 
         new_offsets(bucket_count);
@@ -553,7 +559,7 @@ public:
      * @return estimated value at given percentile
      */
     int64_t percentile(double perc) const {
-        assert(perc >= 0 && perc <= 1.0);
+        SCYLLA_ASSERT(perc >= 0 && perc <= 1.0);
         auto last_bucket = buckets.size() - 1;
 
         auto c = count();
@@ -626,7 +632,6 @@ public:
             max_name_len = std::max(max_name_len, names.back().size());
         }
 
-        sstring formatstr = format("{{:{:d}s}}: {{:d}}\n", max_name_len);
         for (size_t i = 0; i < name_count; i++) {
             int64_t count = h.buckets[i];
             // sort-of-hack to not print empty ranges at the start that are only used to demarcate the
@@ -635,7 +640,7 @@ public:
             if (i == 0 && count == 0) {
                 continue;
             }
-            out << format(formatstr.c_str(), names[i], count);
+            fmt::print(out, "{:{}s}: {:d}", names[i], max_name_len, count);
         }
         return out;
     }

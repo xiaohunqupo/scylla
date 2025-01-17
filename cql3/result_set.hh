@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -14,8 +14,6 @@
 #include "utils/chunked_vector.hh"
 #include "enum_set.hh"
 #include "service/pager/paging_state.hh"
-
-#include "query-result-reader.hh"
 
 #include "result_generator.hh"
 
@@ -129,14 +127,14 @@ public:
 };
 
 template<typename Visitor>
-concept ResultVisitor = requires(Visitor& visitor) {
+concept ResultVisitor = requires(Visitor& visitor, managed_bytes_view_opt val) {
     visitor.start_row();
-    visitor.accept_value(std::optional<query::result_bytes_view>());
+    visitor.accept_value(std::move(val));
     visitor.end_row();
 };
 
 class result_set {
-    using col_type = bytes_opt;
+    using col_type = managed_bytes_opt;
     using row_type = std::vector<col_type>;
     using rows_type = utils::chunked_vector<row_type>;
 
@@ -157,8 +155,10 @@ public:
     bool empty() const;
 
     void add_row(row_type row);
+    void add_row(std::vector<bytes_opt> row);
 
     void add_column_value(col_type value);
+    void add_column_value(bytes_opt value);
 
     void reverse();
 
@@ -187,11 +187,28 @@ public:
             visitor.start_row();
             for (auto i = 0u; i < column_count; i++) {
                 auto& cell = row[i];
-                visitor.accept_value(cell ? std::optional<query::result_bytes_view>(*cell) : std::optional<query::result_bytes_view>());
+                visitor.accept_value(cell ? managed_bytes_view_opt(*cell) : managed_bytes_view_opt());
             }
             visitor.end_row();
         }
     }
+
+    // visit_gently() is like visit(), except it may yield between rows and
+    // returns a future that will resolve when it's done. We only yield
+    // between rows, not between individual cells, which is a good compromise
+    // if we assume that individual rows are not too large.
+    future<> visit_gently(ResultVisitor auto& visitor) const {
+        auto column_count = get_metadata().column_count();
+        return do_for_each(_rows, [&visitor, column_count] (auto& row) {
+            visitor.start_row();
+            for (auto i = 0u; i < column_count; i++) {
+                auto& cell = row[i];
+                visitor.accept_value(cell ? managed_bytes_view_opt(*cell) : managed_bytes_view_opt());
+            }
+            visitor.end_row();
+        });
+    }
+
 
     class builder;
 };
@@ -204,12 +221,12 @@ public:
         : _result(std::move(mtd)) { }
 
     void start_row() { }
-    void accept_value(std::optional<query::result_bytes_view> value) {
+    void accept_value(managed_bytes_view_opt value) {
         if (!value) {
             _current_row.emplace_back();
             return;
         }
-        _current_row.emplace_back(value->linearize());
+        _current_row.emplace_back(value);
     }
     void end_row() {
         _result.add_row(std::exchange(_current_row, { }));

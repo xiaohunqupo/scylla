@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <unordered_set>
@@ -12,14 +12,16 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/file.hh>
+#include <seastar/core/pipe.hh>
 
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 
 #include "test/lib/tmpdir.hh"
 #include "test/lib/random_utils.hh"
-#include "test/lib/make_random_string.hh"
+#include "test/lib/test_utils.hh"
 
+#include "utils/assert.hh"
 #include "utils/lister.hh"
 
 class expected_exception : public std::exception {
@@ -51,13 +53,6 @@ SEASTAR_TEST_CASE(test_empty_directory_lister) {
     BOOST_REQUIRE(!count);
 }
 
-static future<> touch_file(fs::path filename, open_flags flags = open_flags::wo | open_flags::create, file_permissions create_permissions = file_permissions::default_file_permissions) {
-    file_open_options opts;
-    opts.create_permissions = create_permissions;
-    auto f = co_await open_file_dma(filename.native(), flags, opts);
-    co_await f.close();
-}
-
 static future<size_t> generate_random_content(tmpdir& tmp, std::unordered_set<std::string>& file_names, std::unordered_set<std::string>& dir_names, size_t min_count = 1, size_t max_count = 1000) {
     size_t count = tests::random::get_int<size_t>(min_count, max_count);
     for (size_t i = 0; i < count; i++) {
@@ -74,7 +69,7 @@ static future<size_t> generate_random_content(tmpdir& tmp, std::unordered_set<st
     }
 
     for (const auto& name : file_names) {
-        co_await touch_file(tmp.path() / name);
+        co_await tests::touch_file(tmp.path() / name);
     }
     for (const auto& name : dir_names) {
         co_await touch_directory((tmp.path() / name).native());
@@ -89,7 +84,7 @@ SEASTAR_TEST_CASE(test_lister_abort) {
     std::unordered_set<std::string> dir_names;
 
     auto count = co_await generate_random_content(tmp, file_names, dir_names, 1, tests::random::get_int(100, 1000));
-    assert(count > 0);
+    SCYLLA_ASSERT(count > 0);
     BOOST_TEST_MESSAGE(fmt::format("Generated {} dir entries", count));
 
     size_t initial = tests::random::get_int<size_t>(1, count);
@@ -168,7 +163,7 @@ SEASTAR_TEST_CASE(test_directory_lister_close) {
     auto dl = directory_lister(tmp.path());
     auto initial = tests::random::get_int(count);
     BOOST_TEST_MESSAGE(fmt::format("Getting {} dir entries", initial));
-    for (auto i = 0; i < initial; i++) {
+    for (decltype(initial) i = 0; i < initial; i++) {
         auto de = co_await dl.get();
         BOOST_REQUIRE(de);
     }

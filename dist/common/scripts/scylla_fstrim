@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 import os
 import sys
@@ -34,6 +34,7 @@ def main():
         mountpoints.add(find_mount_point(d))
 
     mountpoints.add(find_mount_point(cfg['commitlog_directory']))
+    mountpoints.add(find_mount_point(cfg['schema_commitlog_directory']))
     # workaround of #2649
     subprocess.call(["/opt/scylladb/scripts/scylla-blocktune", "--set-nomerges", "1"])
     for d in mountpoints:

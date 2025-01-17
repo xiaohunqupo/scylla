@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 import asyncio
 import logging
@@ -20,7 +20,7 @@ logger = logging.getLogger('schema-test')
 # - Creates 20+20 tables to alter and 20 tables to index
 # - In parallel run 20 * create table, and drop/add column and index of previous 2 tables
 @pytest.mark.asyncio
-async def test_cassandra_issue_10250(random_tables, fails_without_consistent_cluster_management):
+async def test_cassandra_issue_10250(random_tables):
     tables = random_tables
     # How many combinations of tables; original Cassandra issue repro had 20
     RANGE = 1
@@ -36,6 +36,7 @@ async def test_cassandra_issue_10250(random_tables, fails_without_consistent_clu
         tables_i.append(await tables.add_table(columns=[Column(name="id", ctype=UUIDType),
                                                *[Column(name=f"c{i}", ctype=IntType) for i in range(1, 8)]],
                                                pks=1, name=f"index_me_{n}"))
+    logger.debug("Created initial tables")
 
     # Create a bunch of futures to run in parallel (in aws list)
     #   - alter a table in the _a list by adding a column
@@ -57,8 +58,9 @@ async def test_cassandra_issue_10250(random_tables, fails_without_consistent_clu
 
     # Run everything in parallel
     await asyncio.gather(*aws)
+    logger.debug("Done running concurrent schema changes")
     # Sleep to settle; original Cassandra issue repro sleeps 20 seconds
     await asyncio.sleep(1)
-    logger.debug("verifing schema status")
+    logger.debug("verifying schema status")
     # When bug happens, deleted columns are still there (often) and/or new columns are missing (rarely)
     await tables.verify_schema()

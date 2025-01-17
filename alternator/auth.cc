@@ -3,136 +3,41 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "alternator/error.hh"
-#include "log.hh"
+#include "auth/common.hh"
+#include "utils/log.hh"
 #include <string>
 #include <string_view>
-#include <gnutls/crypto.h>
-#include "utils/hashers.hh"
 #include "bytes.hh"
 #include "alternator/auth.hh"
 #include <fmt/format.h>
-#include "auth/common.hh"
 #include "auth/password_authenticator.hh"
-#include "auth/roles-metadata.hh"
 #include "service/storage_proxy.hh"
 #include "alternator/executor.hh"
 #include "cql3/selection/selection.hh"
-#include "query-result-set.hh"
 #include "cql3/result_set.hh"
+#include "types/types.hh"
 #include <seastar/core/coroutine.hh>
 
 namespace alternator {
 
 static logging::logger alogger("alternator-auth");
 
-static hmac_sha256_digest hmac_sha256(std::string_view key, std::string_view msg) {
-    hmac_sha256_digest digest;
-    int ret = gnutls_hmac_fast(GNUTLS_MAC_SHA256, key.data(), key.size(), msg.data(), msg.size(), digest.data());
-    if (ret) {
-        throw std::runtime_error(fmt::format("Computing HMAC failed ({}): {}", ret, gnutls_strerror(ret)));
-    }
-    return digest;
-}
-
-static hmac_sha256_digest get_signature_key(std::string_view key, std::string_view date_stamp, std::string_view region_name, std::string_view service_name) {
-    auto date = hmac_sha256("AWS4" + std::string(key), date_stamp);
-    auto region = hmac_sha256(std::string_view(date.data(), date.size()), region_name);
-    auto service = hmac_sha256(std::string_view(region.data(), region.size()), service_name);
-    auto signing = hmac_sha256(std::string_view(service.data(), service.size()), "aws4_request");
-    return signing;
-}
-
-static std::string apply_sha256(std::string_view msg) {
-    sha256_hasher hasher;
-    hasher.update(msg.data(), msg.size());
-    return to_hex(hasher.finalize());
-}
-
-static std::string apply_sha256(const std::vector<temporary_buffer<char>>& msg) {
-    sha256_hasher hasher;
-    for (const temporary_buffer<char>& buf : msg) {
-        hasher.update(buf.get(), buf.size());
-    }
-    return to_hex(hasher.finalize());
-}
-
-static std::string format_time_point(db_clock::time_point tp) {
-    time_t time_point_repr = db_clock::to_time_t(tp);
-    std::string time_point_str;
-    time_point_str.resize(17);
-    ::tm time_buf;
-    // strftime prints the terminating null character as well
-    std::strftime(time_point_str.data(), time_point_str.size(), "%Y%m%dT%H%M%SZ", ::gmtime_r(&time_point_repr, &time_buf));
-    time_point_str.resize(16);
-    return time_point_str;
-}
-
-void check_expiry(std::string_view signature_date) {
-    //FIXME: The default 15min can be changed with X-Amz-Expires header - we should honor it
-    std::string expiration_str = format_time_point(db_clock::now() - 15min);
-    std::string validity_str = format_time_point(db_clock::now() + 15min);
-    if (signature_date < expiration_str) {
-        throw api_error::invalid_signature(
-                fmt::format("Signature expired: {} is now earlier than {} (current time - 15 min.)",
-                signature_date, expiration_str));
-    }
-    if (signature_date > validity_str) {
-        throw api_error::invalid_signature(
-                fmt::format("Signature not yet current: {} is still later than {} (current time + 15 min.)",
-                signature_date, validity_str));
-    }
-}
-
-std::string get_signature(std::string_view access_key_id, std::string_view secret_access_key, std::string_view host, std::string_view method,
-        std::string_view orig_datestamp, std::string_view signed_headers_str, const std::map<std::string_view, std::string_view>& signed_headers_map,
-        const std::vector<temporary_buffer<char>>& body_content, std::string_view region, std::string_view service, std::string_view query_string) {
-    auto amz_date_it = signed_headers_map.find("x-amz-date");
-    if (amz_date_it == signed_headers_map.end()) {
-        throw api_error::invalid_signature("X-Amz-Date header is mandatory for signature verification");
-    }
-    std::string_view amz_date = amz_date_it->second;
-    check_expiry(amz_date);
-    std::string_view datestamp = amz_date.substr(0, 8);
-    if (datestamp != orig_datestamp) {
-        throw api_error::invalid_signature(
-                format("X-Amz-Date date does not match the provided datestamp. Expected {}, got {}",
-                        orig_datestamp, datestamp));
-    }
-    std::string_view canonical_uri = "/";
-
-    std::stringstream canonical_headers;
-    for (const auto& header : signed_headers_map) {
-        canonical_headers << fmt::format("{}:{}", header.first, header.second) << '\n';
-    }
-
-    std::string payload_hash = apply_sha256(body_content);
-    std::string canonical_request = fmt::format("{}\n{}\n{}\n{}\n{}\n{}", method, canonical_uri, query_string, canonical_headers.str(), signed_headers_str, payload_hash);
-
-    std::string_view algorithm = "AWS4-HMAC-SHA256";
-    std::string credential_scope = fmt::format("{}/{}/{}/aws4_request", datestamp, region, service);
-    std::string string_to_sign = fmt::format("{}\n{}\n{}\n{}", algorithm, amz_date, credential_scope,  apply_sha256(canonical_request));
-
-    hmac_sha256_digest signing_key = get_signature_key(secret_access_key, datestamp, region, service);
-    hmac_sha256_digest signature = hmac_sha256(std::string_view(signing_key.data(), signing_key.size()), string_to_sign);
-
-    return to_hex(bytes_view(reinterpret_cast<const int8_t*>(signature.data()), signature.size()));
-}
-
-future<std::string> get_key_from_roles(service::storage_proxy& proxy, std::string username) {
-    schema_ptr schema = proxy.data_dictionary().find_schema("system_auth", "roles");
+future<std::string> get_key_from_roles(service::storage_proxy& proxy, auth::service& as, std::string username) {
+    schema_ptr schema = proxy.data_dictionary().find_schema(auth::get_auth_ks_name(as.query_processor()), "roles");
     partition_key pk = partition_key::from_single_value(*schema, utf8_type->decompose(username));
     dht::partition_range_vector partition_ranges{dht::partition_range(dht::decorate_key(*schema, pk))};
     std::vector<query::clustering_range> bounds{query::clustering_range::make_open_ended_both_sides()};
     const column_definition* salted_hash_col = schema->get_column_definition(bytes("salted_hash"));
-    if (!salted_hash_col) {
-        co_await coroutine::return_exception(api_error::unrecognized_client(format("Credentials cannot be fetched for: {}", username)));
+    const column_definition* can_login_col = schema->get_column_definition(bytes("can_login"));
+    if (!salted_hash_col || !can_login_col) {
+        co_await coroutine::return_exception(api_error::unrecognized_client(fmt::format("Credentials cannot be fetched for: {}", username)));
     }
-    auto selection = cql3::selection::selection::for_columns(schema, {salted_hash_col});
-    auto partition_slice = query::partition_slice(std::move(bounds), {}, query::column_id_vector{salted_hash_col->id}, selection->get_query_options());
+    auto selection = cql3::selection::selection::for_columns(schema, {salted_hash_col, can_login_col});
+    auto partition_slice = query::partition_slice(std::move(bounds), {}, query::column_id_vector{salted_hash_col->id, can_login_col->id}, selection->get_query_options());
     auto command = ::make_lw_shared<query::read_command>(schema->id(), schema->version(), partition_slice,
             proxy.get_max_result_size(partition_slice), query::tombstone_limit(proxy.get_tombstone_limit()));
     auto cl = auth::password_authenticator::consistency_for_user(username);
@@ -146,11 +51,18 @@ future<std::string> get_key_from_roles(service::storage_proxy& proxy, std::strin
 
     auto result_set = builder.build();
     if (result_set->empty()) {
-        co_await coroutine::return_exception(api_error::unrecognized_client(format("User not found: {}", username)));
+        co_await coroutine::return_exception(api_error::unrecognized_client(fmt::format("User not found: {}", username)));
     }
-    const bytes_opt& salted_hash = result_set->rows().front().front(); // We only asked for 1 row and 1 column
+    const auto& result = result_set->rows().front();
+    bool can_login = result[1] && value_cast<bool>(boolean_type->deserialize(*result[1]));
+    if (!can_login) {
+        // This is a valid role name, but has "login=False" so should not be
+        // usable for authentication (see #19735).
+        co_await coroutine::return_exception(api_error::unrecognized_client(fmt::format("Role {} has login=false so cannot be used for login", username)));
+    }
+    const managed_bytes_opt& salted_hash = result.front();
     if (!salted_hash) {
-        co_await coroutine::return_exception(api_error::unrecognized_client(format("No password found for user: {}", username)));
+        co_await coroutine::return_exception(api_error::unrecognized_client(fmt::format("No password found for user: {}", username)));
     }
     co_return value_cast<sstring>(utf8_type->deserialize(*salted_hash));
 }

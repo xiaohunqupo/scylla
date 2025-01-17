@@ -142,7 +142,7 @@ This will reduce contention over hot keys and thus increase LWT performance.
 The feature is identified by the `SCYLLA_LWT_ADD_METADATA_MARK` key that is
 meant to be sent in the SUPPORTED message along with the following additional
 parameters:
-  - `SCYLLA_LWT_OPTIMIZATION_META_BIT_MASK` is a 32-bit unsigned integer that represents
+  - `LWT_OPTIMIZATION_META_BIT_MASK` is a 32-bit unsigned integer that represents
     the bit mask that should be used by the client to test against when checking
     prepared statement metadata flags to see if the current query is conditional
     or not.
@@ -180,3 +180,47 @@ The string map in the SUPPORTED response will contain the following parameters:
 
   - `ERROR_CODE`: a 32-bit signed decimal integer which Scylla
     will use as the error code for the rate limit exception.
+
+## Sending tablet info to the drivers
+
+This extension adds support for sending tablet info to the drivers if the 
+request was routed to the wrong node/shard.
+
+There is a need for sending tablet info to the drivers so they can be 
+tablet aware.
+For the best performance we want to get this info lazily only when it is 
+needed.
+
+The info is send when driver asks about the information that the specific 
+tablet contains and it is directed to the wrong node/shard so it could 
+use that information for every subsequent query.
+If we send the query to the wrong node/shard, we want to send the RESULT 
+message with additional information about the tablet in `custom_payload`:
+
+  - `tablets-routing-v1` - tablets routing information, which contains info about token
+    range (in format `(first_token, last_token]`) and tablet replicas, for every replica
+    there is information about the host and shard.
+
+The driver has to be able to receive `custom_payload` and deserialise its field
+from `bytes` to:
+
+  - for `tablets-routing-v1` - `TupleType(LongType, LongType, ListType(TupleType(UUIDType, Int32Type)))`,
+    two `LongType` represent first and last token, `ListType(TupleType(UUIDType, Int32Type))`
+    contains information about replicas (for every replica there is a tuple with two elements
+    `UUIDType` and `Int32Type` representing host and shard ids).
+
+When the driver receives information about the tablet, it has to check if any of
+the previously received tablets has an overlapping token range.
+The group of tablets that meets this criterion has to be deleted, and the new
+tablet should replace them.
+
+## Negotiate sending tablets info to the drivers
+
+This extension allows the driver to inform the database that it is aware of
+tablets and is able to interpret the tablet information sent in `custom_payload`.
+
+Having a designated flag gives the ability to skip tablet metadata generation
+(which is quite expensive) if driver is not aware of tablets. 
+
+The feature is identified by the `TABLETS_ROUTING_V1` key, which is meant to be sent
+in the SUPPORTED message.

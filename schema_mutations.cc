@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "schema_mutations.hh"
@@ -49,7 +49,7 @@ void schema_mutations::copy_to(std::vector<mutation>& dst) const {
     }
 }
 
-table_schema_version schema_mutations::digest() const {
+table_schema_version schema_mutations::digest(db::schema_features sf) const {
     if (_scylla_tables) {
         auto rs = query::result_set(*_scylla_tables);
         if (!rs.empty()) {
@@ -62,16 +62,19 @@ table_schema_version schema_mutations::digest() const {
     }
 
     md5_hasher h;
-    db::schema_features sf = db::schema_features::full();
 
-    // Disable this feature so that the digest remains compactible with Scylla
-    // versions prior to this feature.
-    // This digest affects the table schema version calculation and it's important
-    // that all nodes arrive at the same table schema version to avoid needless schema version
-    // pulls. Table schema versions are calculated on boot when we don't yet
-    // know all the cluster features, so we could get different table versions after reboot
-    // in an already upgraded cluster.
-    sf.remove<db::schema_feature::DIGEST_INSENSITIVE_TO_EXPIRY>();
+    if (!sf.contains<db::schema_feature::TABLE_DIGEST_INSENSITIVE_TO_EXPIRY>()) {
+        // Disable this feature so that the digest remains compactible with Scylla
+        // versions prior to this feature.
+        // This digest affects the table schema version calculation and it's important
+        // that all nodes arrive at the same table schema version to avoid needless schema version
+        // pulls. It used to be the case that when table schema versions were calculated on boot we
+        // didn't yet know all the cluster features, so we could get different table versions after reboot
+        // in an already upgraded cluster. However, they are now available, and if
+        // TABLE_DIGEST_INSENSITIVE_TO_EXPIRY is enabled, we can compute with DIGEST_INSENSITIVE_TO_EXPIRY
+        // enabled.
+        sf.remove<db::schema_feature::DIGEST_INSENSITIVE_TO_EXPIRY>();
+    }
 
     db::schema_tables::feed_hash_for_schema_digest(h, _columnfamilies, sf);
     db::schema_tables::feed_hash_for_schema_digest(h, _columns, sf);
@@ -125,10 +128,6 @@ bool schema_mutations::operator==(const schema_mutations& other) const {
            ;
 }
 
-bool schema_mutations::operator!=(const schema_mutations& other) const {
-    return !(*this == other);
-}
-
 bool schema_mutations::live() const {
     return _columnfamilies.live_row_count() > 0 || _columns.live_row_count() > 0 ||
             (_view_virtual_columns && _view_virtual_columns->live_row_count() > 0) ||
@@ -139,17 +138,17 @@ bool schema_mutations::is_view() const {
     return _columnfamilies.schema() == db::schema_tables::views();
 }
 
-std::ostream& operator<<(std::ostream& out, const schema_mutations& sm) {
-    out << "schema_mutations{\n";
-    out << " tables=" << sm.columnfamilies_mutation() << ",\n";
-    out << " scylla_tables=" << sm.scylla_tables() << ",\n";
-    out << " columns=" << sm.columns_mutation() << ",\n";
-    out << " dropped_columns=" << sm.dropped_columns_mutation() << ",\n";
-    out << " indices=" << sm.indices_mutation() << ",\n";
-    out << " computed_columns=" << sm.computed_columns_mutation() << ",\n";
-    out << " view_virtual_columns=" << sm.view_virtual_columns_mutation() << "\n";
-    out << "}";
-    return out;
+auto fmt::formatter<schema_mutations>::format(const schema_mutations& sm, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    auto out = fmt::format_to(ctx.out(), "schema_mutations{{\n");
+    out = fmt::format_to(out, " tables={},\n", sm.columnfamilies_mutation());
+    out = fmt::format_to(out, " scylla_tables={},\n", sm.scylla_tables());
+    out = fmt::format_to(out, " tables={},\n", sm.columns_mutation());
+    out = fmt::format_to(out, " dropped_columns={},\n", sm.dropped_columns_mutation());
+    out = fmt::format_to(out, " indices={},\n", sm.indices_mutation());
+    out = fmt::format_to(out, " computed_columns={},\n", sm.computed_columns_mutation());
+    out = fmt::format_to(out, " view_virtual_columns={},\n", sm.view_virtual_columns_mutation());
+    return fmt::format_to(out, "}}");
 }
 
 schema_mutations& schema_mutations::operator+=(schema_mutations&& sm) {

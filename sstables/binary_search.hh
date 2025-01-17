@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -32,7 +32,7 @@ namespace sstables {
  * It's easier to reuse the same code for both binary searches, and just ignore
  * the extra information when not needed.
  *
- * This code should work in all kinds of vectors in whose's elements is possible to aquire
+ * This code should work in all kinds of vectors in whose's elements is possible to acquire
  * a key view via get_key().
  */
 template <typename T>

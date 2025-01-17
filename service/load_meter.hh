@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#pragma  once
+#pragma once
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/distributed.hh>
@@ -28,7 +28,6 @@ private:
 
     /** raw load value */
     double get_load() const;
-    sstring get_load_string() const;
 
 public:
     future<std::map<sstring, double>> get_load_map();

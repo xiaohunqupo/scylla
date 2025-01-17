@@ -1,10 +1,14 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
+import asyncio
+import time
 import pytest
 from cassandra.protocol import InvalidRequest, ReadFailure                         # type: ignore
+from cassandra.query import SimpleStatement                                        # type: ignore
+from test.topology.util import wait_for_token_ring_and_group0_consistency
 
 
 # Simple test of schema helper
@@ -13,6 +17,10 @@ async def test_new_table(manager, random_tables):
     cql = manager.cql
     assert cql is not None
     table = await random_tables.add_table(ncolumns=5)
+    # Before performing data queries, make sure that the token ring
+    # has converged (we're using ring_delay = 0).
+    # Otherwise the queries may pick wrong replicas.
+    await wait_for_token_ring_and_group0_consistency(manager, time.time() + 60)
     await cql.run_async(f"INSERT INTO {table} ({','.join(c.name for c in table.columns)})" \
                         f"VALUES ({', '.join(['%s'] * len(table.columns))})",
                         parameters=[c.val(1) for c in table.columns])
@@ -87,3 +95,29 @@ async def test_add_index(random_tables):
         await table.add_index(0)
     await table.add_index(2)
     await random_tables.verify_schema(table)
+
+
+@pytest.mark.asyncio
+async def test_paged_result(manager, random_tables):
+    """Test run_async with paged results"""
+    cql = manager.cql
+    assert cql is not None
+    table = await random_tables.add_table(ncolumns=5)
+    inserts = []
+    nrows = 21
+    fetch_size = 10    # Get only 10 rows at a time
+    for i in range(nrows):
+        inserts.append(cql.run_async(f"INSERT INTO {table} "
+                f"({','.join(c.name for c in table.columns)})"
+                f"VALUES ({', '.join(['%s'] * len(table.columns))})",
+                parameters=[c.val(i) for c in table.columns]))
+    await asyncio.gather(*inserts)
+
+    # Check only 1 page
+    stmt = SimpleStatement(f"SELECT * FROM {table} ALLOW FILTERING", fetch_size = fetch_size)
+    res = await cql.run_async(stmt, all_pages=False)
+    assert len(res) == fetch_size
+
+    # Check all pages
+    res = await cql.run_async(stmt, all_pages = True)
+    assert len(res) == nrows

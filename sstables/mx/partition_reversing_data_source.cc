@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/coroutine.hh>
@@ -15,7 +15,8 @@
 #include "sstables/shared_sstable.hh"
 #include "sstables/sstables.hh"
 #include "sstables/types.hh"
-#include "vint-serialization.hh"
+#include "utils/buffer_input_stream.hh"
+#include "utils/to_string.hh"
 
 namespace sstables {
 
@@ -146,7 +147,7 @@ private:
     uint64_t _prev_unfiltered_size;
 
     // for calculating the clustering blocks
-    boost::iterator_range<std::vector<std::optional<uint32_t>>::const_iterator> _ck_column_value_fix_lengths;
+    std::ranges::subrange<std::vector<std::optional<uint32_t>>::const_iterator> _ck_column_value_fix_lengths;
     uint64_t _ck_blocks_header;
     uint32_t _ck_blocks_header_offset;
     bool _reading_range_tombstone_ck = false;
@@ -156,16 +157,16 @@ private:
 
     void setup_ck(const std::vector<std::optional<uint32_t>>& column_value_fix_lengths) {
         if (column_value_fix_lengths.empty()) {
-            _ck_column_value_fix_lengths = boost::make_iterator_range(column_value_fix_lengths);
+            _ck_column_value_fix_lengths = std::ranges::subrange(column_value_fix_lengths);
         } else {
-            _ck_column_value_fix_lengths = boost::make_iterator_range(std::begin(column_value_fix_lengths),
-                                                                      std::begin(column_value_fix_lengths) + _ck_size);
+            _ck_column_value_fix_lengths = std::ranges::subrange(std::begin(column_value_fix_lengths),
+                                                                 std::begin(column_value_fix_lengths) + _ck_size);
         }
         _ck_blocks_header_offset = 0u;
     }
     bool no_more_ck_blocks() const { return _ck_column_value_fix_lengths.empty(); }
     void move_to_next_ck_block() {
-        _ck_column_value_fix_lengths.advance_begin(1);
+        _ck_column_value_fix_lengths.advance(1);
         ++_ck_blocks_header_offset;
         if (_ck_blocks_header_offset == 32u) {
             _ck_blocks_header_offset = 0u;
@@ -365,7 +366,6 @@ class partition_reversing_data_source_impl final : public data_source_impl {
     const schema& _schema;
     shared_sstable _sst;
     index_reader& _ir;
-    const ::io_priority_class& _io_priority;
     reader_permit _permit;
     tracing::trace_state_ptr _trace_state;
     std::optional<partition_header_context> _partition_header_context;
@@ -403,10 +403,10 @@ class partition_reversing_data_source_impl final : public data_source_impl {
     } _state = state::RANGE_END;
 private:
     input_stream<char> data_stream(size_t start, size_t end) {
-        return _sst->data_stream(start, end - start, _io_priority, _permit, _trace_state, {});
+        return _sst->data_stream(start, end - start, _permit, _trace_state, {});
     }
     future<temporary_buffer<char>> data_read(uint64_t start, uint64_t end) {
-        return _sst->data_read(start, end - start, _io_priority, _permit);
+        return _sst->data_read(start, end - start, _permit);
     }
     future<input_stream<char>> last_row_stream(size_t row_size) {
         if (_cached_read.size() < row_size) {
@@ -457,12 +457,10 @@ public:
             uint64_t partition_start,
             size_t partition_len,
             reader_permit permit,
-            const io_priority_class& io_priority,
             tracing::trace_state_ptr trace_state)
         : _schema(s)
         , _sst(std::move(sst))
         , _ir(ir)
-        , _io_priority(io_priority)
         , _permit(std::move(permit))
         , _trace_state(std::move(trace_state))
         , _partition_start(partition_start)
@@ -473,7 +471,6 @@ public:
     { }
 
     partition_reversing_data_source_impl(partition_reversing_data_source_impl&&) noexcept = default;
-    partition_reversing_data_source_impl& operator=(partition_reversing_data_source_impl&&) noexcept = default;
 
     virtual future<temporary_buffer<char>> get() override {
         if (!_partition_header_context) {
@@ -607,9 +604,9 @@ public:
 };
 
 partition_reversing_data_source make_partition_reversing_data_source(const schema& s, shared_sstable sst, index_reader& ir, uint64_t pos, size_t len,
-                                                          reader_permit permit, const io_priority_class& io_priority, tracing::trace_state_ptr trace_state) {
+                                                          reader_permit permit, tracing::trace_state_ptr trace_state) {
     auto source_impl = std::make_unique<partition_reversing_data_source_impl>(
-            s, std::move(sst), ir, pos, len, std::move(permit), io_priority, trace_state);
+            s, std::move(sst), ir, pos, len, std::move(permit), trace_state);
     auto& curr_pos = source_impl->current_position_in_sstable();
     return partition_reversing_data_source {
         .the_source = seastar::data_source{std::move(source_impl)},

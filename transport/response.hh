@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "server.hh"
-#include "utils/reusable_buffer.hh"
 
 namespace cql_transport {
 
@@ -31,6 +30,7 @@ enum class cql_binary_opcode : uint8_t {
     AUTH_CHALLENGE = 14,
     AUTH_RESPONSE  = 15,
     AUTH_SUCCESS   = 16,
+    OPCODES_COUNT
 };
 
 class response {
@@ -73,8 +73,9 @@ public:
     void write_consistency(db::consistency_level c);
     void write_string_map(std::map<sstring, sstring> string_map);
     void write_string_multimap(std::multimap<sstring, sstring> string_map);
+    void write_string_bytes_map(const std::unordered_map<sstring, bytes>& map);
     void write_value(bytes_opt value);
-    void write_value(std::optional<query::result_bytes_view> value);
+    void write_value(std::optional<managed_bytes_view> value);
     void write(const cql3::metadata& m, bool skip = false);
     void write(const cql3::prepared_metadata& m, uint8_t version);
 

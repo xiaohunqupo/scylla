@@ -3,8 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
+
+#include <random>
 
 #include "test/lib/scylla_test_case.hh"
 #include "utils/stall_free.hh"
@@ -64,6 +66,9 @@ template <typename T>
 struct clear_gently_tracker {
     std::unique_ptr<T> v;
     std::function<void (T)> on_clear;
+    clear_gently_tracker() noexcept
+        : on_clear([] (T) { BOOST_FAIL("clear_gently called on default-constructed clear_gently_tracker"); })
+    {}
     clear_gently_tracker(T i, std::function<void (T)> f) : v(std::make_unique<T>(std::move(i))), on_clear(std::move(f)) {}
     clear_gently_tracker(clear_gently_tracker&& x) noexcept : v(std::move(x.v)), on_clear(std::move(x.on_clear)) {}
     clear_gently_tracker& operator=(clear_gently_tracker&& x) noexcept {
@@ -78,6 +83,9 @@ struct clear_gently_tracker {
         v.reset();
         return make_ready_future<>();
     }
+    operator bool() const noexcept {
+        return bool(v);
+    }
 };
 
 SEASTAR_THREAD_TEST_CASE(test_clear_gently_non_trivial_unique_ptr) {
@@ -89,6 +97,24 @@ SEASTAR_THREAD_TEST_CASE(test_clear_gently_non_trivial_unique_ptr) {
     utils::clear_gently(p).get();
     BOOST_CHECK(p);
     BOOST_REQUIRE_EQUAL(cleared_gently, 1);
+
+    cleared_gently = 0;
+    p.reset();
+    utils::clear_gently(p).get();
+    BOOST_CHECK(!p);
+    BOOST_REQUIRE_EQUAL(cleared_gently, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_clear_gently_vector_of_unique_ptrs) {
+    int cleared_gently = 0;
+    std::vector<std::unique_ptr<clear_gently_tracker<int>>> v;
+    v.emplace_back(std::make_unique<clear_gently_tracker<int>>(0, [&cleared_gently] (int) {
+        cleared_gently++;
+    }));
+    v.emplace_back(nullptr);
+
+    utils::clear_gently(v).get();
+    BOOST_REQUIRE_EQUAL(cleared_gently, 1);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_clear_gently_foreign_ptr) {
@@ -99,7 +125,7 @@ SEASTAR_THREAD_TEST_CASE(test_clear_gently_foreign_ptr) {
             cleared_gently++;
         });
         return make_foreign<lw_shared_ptr<clear_gently_tracker<int>>>(std::move(p));
-    }).get0();
+    }).get();
 
     utils::clear_gently(p0).get();
     BOOST_CHECK(p0);
@@ -448,4 +474,73 @@ SEASTAR_THREAD_TEST_CASE(test_clear_gently_multi_nesting) {
     utils::clear_gently(c).get();
     BOOST_CHECK(c.empty());
     BOOST_REQUIRE_EQUAL(cleared_gently, top_count * mid_count * count);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_clear_gently_optional) {
+    int cleared_gently = 0;
+    std::optional<clear_gently_tracker<int>> opt = std::make_optional<clear_gently_tracker<int>>(0, [&cleared_gently] (int) {
+        cleared_gently++;
+    });
+
+    BOOST_CHECK(opt);
+    utils::clear_gently(opt).get();
+    BOOST_CHECK(opt);
+    BOOST_REQUIRE_EQUAL(cleared_gently, 1);
+
+    cleared_gently = 0;
+    opt.reset();
+    utils::clear_gently(opt).get();
+    BOOST_REQUIRE_EQUAL(cleared_gently, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_clear_gently_vector_of_optionals) {
+    int cleared_gently = 0;
+    std::vector<std::optional<clear_gently_tracker<int>>> v;
+    v.emplace_back(std::make_optional<clear_gently_tracker<int>>(0, [&cleared_gently] (int) {
+        cleared_gently++;
+    }));
+    v.emplace_back(std::nullopt);
+
+    utils::clear_gently(v).get();
+    BOOST_REQUIRE_EQUAL(cleared_gently, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_clear_gently_optimized_optional) {
+    int cleared_gently = 0;
+    seastar::optimized_optional<clear_gently_tracker<int>> opt(clear_gently_tracker<int>(0, [&cleared_gently] (int) {
+        cleared_gently++;
+    }));
+
+    BOOST_CHECK(opt);
+    utils::clear_gently(opt).get();
+    BOOST_CHECK(!opt);
+    BOOST_REQUIRE_EQUAL(cleared_gently, 1);
+
+    cleared_gently = 0;
+    utils::clear_gently(opt).get();
+    BOOST_REQUIRE_EQUAL(cleared_gently, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_clear_gently_vector_of_optimized_optionals) {
+    int cleared_gently = 0;
+    std::vector<seastar::optimized_optional<clear_gently_tracker<int>>> v;
+    v.emplace_back(clear_gently_tracker<int>(0, [&cleared_gently] (int) {
+        cleared_gently++;
+    }));
+    v.emplace_back(std::nullopt);
+
+    utils::clear_gently(v).get();
+    BOOST_REQUIRE_EQUAL(cleared_gently, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_reserve_gently_with_chunked_vector) {
+    auto rand = std::default_random_engine();
+    auto size_dist = std::uniform_int_distribution<unsigned>(1, 1 << 12);
+
+    for (int i = 0; i < 100; ++i) {
+        utils::chunked_vector<uint8_t, 512> v;
+        const auto size = size_dist(rand);
+        utils::reserve_gently(v, size).get();
+        BOOST_REQUIRE_EQUAL(v.capacity(), size);
+    }
 }

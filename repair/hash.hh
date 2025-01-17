@@ -2,6 +2,7 @@
 #include <absl/container/btree_set.h>
 #include <cstdint>
 #include <ostream>
+#include <fmt/core.h>
 #include "schema/schema.hh"
 
 class decorated_key_with_hash;
@@ -20,15 +21,7 @@ public:
     void add(const repair_hash& other) {
         hash ^= other.hash;
     }
-    bool operator==(const repair_hash& x) const {
-        return x.hash == hash;
-    }
-    bool operator!=(const repair_hash& x) const {
-        return x.hash != hash;
-    }
-    bool operator<(const repair_hash& x) const {
-        return x.hash < hash;
-    }
+    std::strong_ordering operator<=>(const repair_hash&) const = default;
     friend std::ostream& operator<<(std::ostream& os, const repair_hash& x) {
         return os << x.hash;
     }
@@ -48,4 +41,8 @@ public:
     repair_hash do_hash_for_mf(const decorated_key_with_hash& dk_with_hash, const mutation_fragment& mf);
 };
 
-
+template <> struct fmt::formatter<repair_hash>  : fmt::formatter<string_view> {
+    auto format(const repair_hash& x, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", x.hash);
+    }
+};

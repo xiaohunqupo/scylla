@@ -4,26 +4,27 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <memory>
 #include <optional>
+#include <fmt/ostream.h>
 
 #include "db/functions/function_name.hh"
 #include "db/functions/function.hh"
 #include "db/functions/aggregate_function.hh"
+#include "db/consistency_level_type.hh"
 #include "keys.hh"
-#include "dht/i_partitioner.hh"
+#include "dht/ring_position.hh"
 #include "enum_set.hh"
-#include "range.hh"
+#include "interval.hh"
 #include "tracing/tracing.hh"
 #include "utils/small_vector.hh"
-#include "query_class_config.hh"
 #include "db/per_partition_rate_limit_info.hh"
-#include "utils/UUID.hh"
+#include "query_id.hh"
 #include "bytes.hh"
 #include "cql_serialization_format.hh"
 
@@ -31,14 +32,19 @@ class position_in_partition_view;
 class position_in_partition;
 class partition_slice_builder;
 
-using query_id = utils::tagged_uuid<struct query_id_tag>;
+namespace ser {
+
+template <typename T>
+class serializer;
+
+};
 
 namespace query {
 
 using column_id_vector = utils::small_vector<column_id, 8>;
 
 template <typename T>
-using range = wrapping_range<T>;
+using range = wrapping_interval<T>;
 
 using ring_position = dht::ring_position;
 
@@ -47,7 +53,7 @@ using ring_position = dht::ring_position;
 // key prefixes. Inclusiveness of the range's bounds must be taken into account during comparisons.
 // For example, consider clustering key type consisting of two ints. Then [0:1, 0:] is a valid non-empty range
 // (e.g. it includes the key 0:2) even though 0: < 0:1 w.r.t the clustering prefix order.
-using clustering_range = nonwrapping_range<clustering_key_prefix>;
+using clustering_range = interval<clustering_key_prefix>;
 
 // If `range` was supposed to be used with a comparator `cmp`, then
 // `reverse(range)` is supposed to be used with a reversed comparator `c`.
@@ -77,21 +83,20 @@ typedef std::vector<clustering_range> clustering_row_ranges;
 /// Trim the clustering ranges.
 ///
 /// Equivalent of intersecting each clustering range with [pos, +inf) position
-/// in partition range, or (-inf, pos] position in partition range if
-/// reversed == true. Ranges that do not intersect are dropped. Ranges that
+/// in partition range. Ranges that do not intersect are dropped. Ranges that
 /// partially overlap are trimmed.
-/// Result: each range will overlap fully with [pos, +inf), or (-int, pos] if
-/// reversed is true.
-void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, position_in_partition pos, bool reversed = false);
+/// Result: each range will overlap fully with [pos, +inf).
+/// Works both with forward schema and ranges, and reversed schema and native reversed ranges
+void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, position_in_partition pos);
 
 /// Trim the clustering ranges.
 ///
 /// Equivalent of intersecting each clustering range with (key, +inf) clustering
-/// range, or (-inf, key) clustering range if reversed == true. Ranges that do
-/// not intersect are dropped. Ranges that partially overlap are trimmed.
-/// Result: each range will overlap fully with (key, +inf), or (-int, key) if
-/// reversed is true.
-void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, const clustering_key& key, bool reversed = false);
+/// range. Ranges that do not intersect are dropped. Ranges that partially overlap
+/// are trimmed.
+/// Result: each range will overlap fully with (key, +inf).
+/// Works both with forward schema and ranges, and reversed schema and native reversed ranges
+void trim_clustering_row_ranges_to(const schema& s, clustering_row_ranges& ranges, const clustering_key& key);
 
 class specific_ranges {
 public:
@@ -142,13 +147,6 @@ constexpr auto max_rows_if_set = std::numeric_limits<uint32_t>::max();
 // Specifies subset of rows, columns and cell attributes to be returned in a query.
 // Can be accessed across cores.
 // Schema-dependent.
-//
-// COMPATIBILITY NOTE: the partition-slice for reverse queries has two different
-// format:
-// * legacy format
-// * native format
-// The wire format uses the legacy format. See docs/dev/reverse-reads.md
-// for more details on the formats.
 class partition_slice {
     friend class ::partition_slice_builder;
 public:
@@ -172,6 +170,11 @@ public:
         // directly, bypassing the intermediate reconcilable_result format used
         // in pre 4.5 range scans.
         range_scan_data_variant,
+        // When set, mutation query can end a page even if there is no live row in the
+        // final reconcilable_result. This prevents exchanging large pages when there
+        // is a lot of dead rows. This flag is needed during rolling upgrades to support
+        // old coordinators which do not tolerate pages with no live rows.
+        allow_mutation_read_page_without_live_row,
     };
     using option_set = enum_set<super_enum<option,
         option::send_clustering_key,
@@ -186,7 +189,8 @@ public:
         option::with_digest,
         option::bypass_cache,
         option::always_return_static_content,
-        option::range_scan_data_variant>>;
+        option::range_scan_data_variant,
+        option::allow_mutation_read_page_without_live_row>>;
     clustering_row_ranges _row_ranges;
 public:
     column_id_vector static_columns; // TODO: consider using bitmap
@@ -232,13 +236,13 @@ public:
     const cql_serialization_format cql_format() const {
         return cql_serialization_format(4); // For IDL compatibility
     }
-    const uint32_t partition_row_limit_low_bits() const {
+    uint32_t partition_row_limit_low_bits() const {
         return _partition_row_limit_low_bits;
     }
-    const uint32_t partition_row_limit_high_bits() const {
+    uint32_t partition_row_limit_high_bits() const {
         return _partition_row_limit_high_bits;
     }
-    const uint64_t partition_row_limit() const {
+    uint64_t partition_row_limit() const {
         return (static_cast<uint64_t>(_partition_row_limit_high_bits) << 32) | _partition_row_limit_low_bits;
     }
     void set_partition_row_limit(uint64_t limit) {
@@ -262,9 +266,6 @@ partition_slice native_reverse_slice_to_legacy_reverse_slice(const schema& schem
 // Fully reverse slice (forward to native reverse or native reverse to forward).
 // Also toggles the reversed bit in `partition_slice::options`.
 partition_slice reverse_slice(const schema& schema, partition_slice slice);
-// Half reverse slice (forwad to legacy reverse or legacy reverse to forward).
-// Also toggles the reversed bit in `partition_slice::options`.
-partition_slice half_reverse_slice(const schema&, partition_slice);
 
 constexpr auto max_partitions = std::numeric_limits<uint32_t>::max();
 constexpr auto max_tombstones = std::numeric_limits<uint64_t>::max();
@@ -275,6 +276,89 @@ enum class partition_limit : uint32_t { max = max_partitions };
 enum class tombstone_limit : uint64_t { max = max_tombstones };
 
 using is_first_page = bool_class<class is_first_page_tag>;
+
+/*
+ * This struct is used in two incompatible ways.
+ *
+ * SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT cluster feature determines which way is
+ * used.
+ *
+ * 1. If SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT is not enabled on the cluster then
+ *    `page_size` field is ignored. Depending on the query type the meaning of
+ *    the remaining two fields is:
+ *
+ *    a. For unpaged queries or for reverse queries:
+ *
+ *          * `soft_limit` is used to warn about queries that result exceeds
+ *            this limit. If the limit is exceeded, a warning will be written to
+ *            the log.
+ *
+ *          * `hard_limit` is used to terminate a query which result exceeds
+ *            this limit. If the limit is exceeded, the operation will end with
+ *            an exception.
+ *
+ *    b. For all other queries, `soft_limit` == `hard_limit` and their value is
+ *       really a page_size in bytes. If the page is not previously cut by the
+ *       page row limit then reaching the size of `soft_limit`/`hard_limit`
+ *       bytes will cause a page to be finished.
+ *
+ * 2. If SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT is enabled on the cluster then all
+ *    three fields are always set. They are used in different places:
+ *
+ *    a. `soft_limit` and `hard_limit` are used for unpaged queries and in a
+ *       reversing reader used for reading KA/LA sstables. Their meaning is the
+ *       same as in (1.a) above.
+ *
+ *    b. all other queries use `page_size` field only and the meaning of the
+ *       field is the same ase in (1.b) above.
+ *
+ * Two interpretations of the `max_result_size` struct are not compatible so we
+ * need to take care of handling a mixed clusters.
+ *
+ * As long as SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT cluster feature is not
+ * supported by all nodes in the clustser, new nodes will always use the
+ * interpretation described in the point (1). `soft_limit` and `hard_limit`
+ * fields will be set appropriately to the query type and `page_size` field
+ * will be set to 0. Old nodes will ignare `page_size` anyways and new nodes
+ * will know to ignore it as well when it's set to 0. Old nodes will never set
+ * `page_size` and that means new nodes will give it a default value of 0 and
+ * ignore it for messages that miss this field.
+ *
+ * Once SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT cluster feature becomes supported by
+ * the whole cluster, new nodes will start to set `page_size` to the right value
+ * according to the interpretation described in the point (2).
+ *
+ * For each request, only the coordinator looks at
+ * SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT and based on it decides for this request
+ * whether it will be handled with interpretation (1) or (2). Then all the
+ * replicas can check the decision based only on the message they receive.
+ * If page_size is set to 0 or not set at all then the request will be handled
+ * using the interpretation (1). Otherwise, interpretation (2) will be used.
+ */
+struct max_result_size {
+    uint64_t soft_limit;
+    uint64_t hard_limit;
+private:
+    uint64_t page_size = 0;
+public:
+
+    max_result_size() = delete;
+    explicit max_result_size(uint64_t max_size) : soft_limit(max_size), hard_limit(max_size) { }
+    explicit max_result_size(uint64_t soft_limit, uint64_t hard_limit) : soft_limit(soft_limit), hard_limit(hard_limit) { }
+    max_result_size(uint64_t soft_limit, uint64_t hard_limit, uint64_t page_size)
+            : soft_limit(soft_limit)
+            , hard_limit(hard_limit)
+            , page_size(page_size)
+    { }
+    uint64_t get_page_size() const {
+        return page_size == 0 ? hard_limit : page_size;
+    }
+    max_result_size without_page_limit() const {
+        return max_result_size(soft_limit, hard_limit, 0);
+    }
+    bool operator==(const max_result_size&) const = default;
+    friend class ser::serializer<query::max_result_size>;
+};
 
 // Full specification of a query to the database.
 // Intended for passing across replicas.
@@ -380,7 +464,12 @@ public:
     friend std::ostream& operator<<(std::ostream& out, const read_command& r);
 };
 
-struct forward_request {
+// Reverse read_command by reversing the schema version and transforming the slice from
+// the legacy reversed format to native reversed format. Shall be called with reversed
+// queries only.
+lw_shared_ptr<query::read_command> reversed(lw_shared_ptr<query::read_command>&& cmd);
+
+struct mapreduce_request {
     enum class reduction_type {
         count,
         aggregate
@@ -389,7 +478,7 @@ struct forward_request {
         db::functions::function_name name;
         std::vector<sstring> column_names;
     };
-    struct reductions_info { 
+    struct reductions_info {
         // Used by selector_factries to prepare reductions information
         std::vector<reduction_type> types;
         std::vector<aggregation_info> infos;
@@ -405,19 +494,28 @@ struct forward_request {
     std::optional<std::vector<aggregation_info>> aggregation_infos;
 };
 
-std::ostream& operator<<(std::ostream& out, const forward_request& r);
-std::ostream& operator<<(std::ostream& out, const forward_request::reduction_type& r);
-std::ostream& operator<<(std::ostream& out, const forward_request::aggregation_info& a);
+std::ostream& operator<<(std::ostream& out, const mapreduce_request& r);
+std::ostream& operator<<(std::ostream& out, const mapreduce_request::reduction_type& r);
+std::ostream& operator<<(std::ostream& out, const mapreduce_request::aggregation_info& a);
 
-struct forward_result {
+struct mapreduce_result {
     // vector storing query result for each selected column
     std::vector<bytes_opt> query_results;
 
     struct printer {
         const std::vector<::shared_ptr<db::functions::aggregate_function>> functions;
-        const query::forward_result& res;
+        const query::mapreduce_result& res;
     };
 };
 
-std::ostream& operator<<(std::ostream& out, const query::forward_result::printer&);
+std::ostream& operator<<(std::ostream& out, const query::mapreduce_result::printer&);
 }
+
+
+template <> struct fmt::formatter<query::specific_ranges> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::partition_slice> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::read_command> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::mapreduce_request> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::mapreduce_request::reduction_type> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::mapreduce_request::aggregation_info> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::mapreduce_result::printer> : fmt::ostream_formatter {};

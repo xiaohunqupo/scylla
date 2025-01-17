@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/sstring.hh>
 #include "seastarx.hh"
-#include <iosfwd>
 #include <functional>
 
 namespace db {
@@ -48,19 +47,20 @@ public:
     }
 };
 
-inline
-std::ostream& operator<<(std::ostream& os, const function_name& fn) {
-    if (!fn.keyspace.empty()) {
-        os << fn.keyspace << ".";
+}
+}
+
+template <>
+struct fmt::formatter<db::functions::function_name> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const db::functions::function_name& fn, FormatContext& ctx) const {
+        auto out = ctx.out();
+        if (fn.has_keyspace()) {
+            out = fmt::format_to(out, "{}.", fn.keyspace);
+        }
+        return fmt::format_to(out, "{}", fn.name);
     }
-    return os << fn.name;
-}
-
-}
-}
-
-
-
+};
 
 namespace std {
 

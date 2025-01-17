@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -47,7 +47,7 @@ public:
     stream_result_future(stream_manager& mgr, streaming::plan_id plan_id_, sstring description_, bool is_receiving)
         : stream_result_future(mgr, plan_id_, description_, make_shared<stream_coordinator>(is_receiving)) {
         // Note: Origin sets connections_per_host = 0 on receiving side, We set 1 to
-        // refelct the fact that we actaully create one conncetion to the initiator.
+        // refelct the fact that we actually create one connection to the initiator.
     }
 
     /**
@@ -75,7 +75,7 @@ public:
 
 public:
     static future<stream_state> init_sending_side(stream_manager& mgr, streaming::plan_id plan_id_, sstring description_, std::vector<stream_event_handler*> listeners_, shared_ptr<stream_coordinator> coordinator_);
-    static shared_ptr<stream_result_future> init_receiving_side(stream_manager& mgr, streaming::plan_id plan_id, sstring description, inet_address from);
+    static shared_ptr<stream_result_future> init_receiving_side(stream_manager& mgr, streaming::plan_id plan_id, sstring description, locator::host_id from);
 
 public:
     void add_event_listener(stream_event_handler* listener) {

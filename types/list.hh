@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -12,7 +12,7 @@
 #include <seastar/core/sstring.hh>
 #include <vector>
 
-#include "types.hh"
+#include "types/types.hh"
 #include "types/collection.hh"
 
 class user_type_impl;

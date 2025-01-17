@@ -3,19 +3,19 @@ Enable Authorization
 ====================
 
 
-Authorization is the process by where users are granted permissions, which entitle them to access or change data on specific keyspaces, tables, or an entire datacenter. Authorization for Scylla is done internally within Scylla and is not done with a third party such as LDAP or OAuth. Granting permissions to users requires the use of a role such as Database Administrator and requires a user who has been :doc:`authenticated </operating-scylla/security/authentication>`. 
+Authorization is the process by where users are granted permissions, which entitle them to access or change data on specific keyspaces, tables, or an entire datacenter. Authorization for ScyllaDB is done internally within ScyllaDB and is not done with a third party such as LDAP or OAuth. Granting permissions to users requires the use of a role such as Database Administrator and requires a user who has been :doc:`authenticated </operating-scylla/security/authentication>`. 
 
-Authorization is enabled using the authorizer setting in scylla.yaml. Scylla has two authorizers available:
+Authorization is enabled using the authorizer setting in scylla.yaml. ScyllaDB has two authorizers available:
 
 * ``AllowAllAuthorizer`` (default setting) - which performs no checking and so effectively grants all permissions to all roles. This must be used if AllowAllAuthenticator is the configured :doc:`authenticator </operating-scylla/security/authentication>`.
 
-* ``CassandraAuthorizer`` - which implements permission management functionality and stores its data in Scylla system tables.
+* ``CassandraAuthorizer`` - which implements permission management functionality and stores its data in ScyllaDB system tables.
 
 
 .. note:: Once Authorization is enabled, **all users must**:
 
    * Have :ref:`roles <roles>` and permissions (set by a DBA with :ref:`superuser <superuser>` credentials) configured.
-   * Use a user/password to :ref:`connect <access>` to Scylla.
+   * Use a user/password to :ref:`connect <access>` to ScyllaDB.
 
 Enabling Authorization
 ----------------------
@@ -52,66 +52,18 @@ It is highly recommended to perform this action on a node that is not processing
 .. _superuser:
 
 Set a Superuser
-...............
+.........................
 
-By default, the superuser credentials are username cassandra, password cassandra. This is not secure. It is highly advised to change this to a unique username and password combination.
+The default ScyllaDB superuser role is ``cassandra`` with password ``cassandra``. Using the default
+superuser is unsafe and may significantly impact performance. 
 
-**Procedure**
+If you haven't created a custom superuser while enabling authentication, you should create a custom superuser
+before creating additional roles. 
+See :doc:`Creating a Custom Superuser </operating-scylla/security/create-superuser/>` for instructions.
 
-1. Start cqlsh with the default superuser settings.
-
-.. code-block:: cql
-
-   cqlsh -u cassandra -p cassandra
-
-.. note:: The cassandra user is special. When you try to login with this username, it is required to usen EACH_QUORUM consistency level(CL) for replies. On the other hand, your own user requires LOCAL_ONE consistency level.
-          This can be a problematic in certain situations, such as adding or removing DCs. In such cases the cassandra user won't be able to login.
-          Creating a superuser role and assigning yourself to the role is definitely the best way forward. Refer to :doc:`RBAC </operating-scylla/security/rbac-usecase>` for an example of how to create roles and refer to :doc:`Grant Authorization </operating-scylla/security/authorization>` for information on using the grant clause.
-
-
-2. Create a role for the superuser which has all privileges
-
-.. code-block:: cql
-
-   CREATE ROLE <role-name> WITH SUPERUSER = true;
-
-.. code-block:: cql
-
-   CREATE ROLE DBA WITH SUPERUSER = true;
-
-.. note:: This role already has complete read and write permissions on all tables and keyspaces and does not need to be granted anything else. The superuser permission setting is by default, disabled. Only for the administrator does it need to be enabled.
-
-3. Assign that role to yourself and grant login privileges
-
-.. code-block:: cql
-
-   CREATE ROLE <user> WITH PASSWORD = 'password' AND SUPERUSER = true AND LOGIN = true;
-
-.. include:: /operating-scylla/security/_common/warning-no-pwd.rst 
+.. note::
    
-For example (John is the DBA)
-
-.. code-block:: cql
-
-   CREATE ROLE john WITH PASSWORD = '39fksah!' AND LOGIN = true;
-   GRANT DBA TO john;
-
-4. Exit cqlsh and login again with the new credentials
-
-.. code-block:: none
-  
-   cqlsh> exit
-   cqlsh -u new-username -p new-password
-
-For example:
-
-.. code-block:: none
-  
-   cqlsh> exit
-   cqlsh -u john -p 39fksah!
-
-
-.. note:: To guarantee new authorization values (like a password) are visible across the cluster, make sure to run a repair on table `system_auth` after updating or adding users.
+   We recommend creating a custom superuser to improve security.
 
 .. _roles:
 
@@ -148,7 +100,7 @@ In this example, you are creating a user (``db_user``) who can access with passw
 Clients Resume Access with New Permissions
 ..........................................
 
-1. Restart Scylla. As each node restarts and clients reconnect, the enforcement of the granted permissions will begin.
+1. Restart ScyllaDB. As each node restarts and clients reconnect, the enforcement of the granted permissions will begin.
 
 .. include:: /rst_include/scylla-commands-restart-index.rst
 

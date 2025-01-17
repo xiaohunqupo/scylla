@@ -3,16 +3,74 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <optional>
 
 #include "commitlog_types.hh"
 #include "mutation/frozen_mutation.hh"
 #include "schema/schema_fwd.hh"
+#include "replay_position.hh"
+
+namespace detail {
+
+    using buffer_type = fragmented_temporary_buffer;
+    using base_iterator = typename std::vector<temporary_buffer<char>>::const_iterator;
+
+    static constexpr auto sector_overhead_size = sizeof(uint32_t) + sizeof(db::segment_id_type);
+
+    // iterator adaptor to enable splitting normal
+    // frag-buffer temporary buffer objects into 
+    // sub-disk-page sized chunks.
+    class sector_split_iterator {
+        base_iterator _iter, _end;
+        char* _ptr;
+        size_t _size;
+        size_t _sector_size;
+    public:
+        sector_split_iterator(const sector_split_iterator&) noexcept;
+        sector_split_iterator(base_iterator i, base_iterator e, size_t sector_size);
+        sector_split_iterator(base_iterator i, base_iterator e, size_t sector_size, size_t overhead);
+        sector_split_iterator();
+
+        char* get_write() const {
+            return _ptr;
+        }
+        size_t size() const {
+            return _size;
+        }
+        char* begin() {
+            return _ptr;
+        }
+        char* end() {
+            return _ptr + _size;
+        }
+        const char* begin() const {
+            return _ptr;
+        }
+        const char* end() const {
+            return _ptr + _size;
+        }
+
+        bool operator==(const sector_split_iterator& rhs) const {
+            return _iter == rhs._iter && _ptr == rhs._ptr;
+        }
+
+        auto& operator*() const {
+            return *this;
+        }
+        auto* operator->() const {
+            return this;
+        }
+
+        sector_split_iterator& operator++();
+        sector_split_iterator operator++(int);
+    };
+}
 
 class commitlog_entry {
     std::optional<column_mapping> _mapping;
@@ -44,8 +102,9 @@ public:
     {}
 
     void set_with_schema(bool value) {
-        _with_schema = value;
-        compute_size();
+        if (std::exchange(_with_schema, value) != value || _size == std::numeric_limits<size_t>::max()) {
+            compute_size();
+        }
     }
     bool with_schema() const {
         return _with_schema;
@@ -55,7 +114,7 @@ public:
     }
 
     size_t size() const {
-        assert(_size != std::numeric_limits<size_t>::max());
+        SCYLLA_ASSERT(_size != std::numeric_limits<size_t>::max());
         return _size;
     }
 
@@ -65,7 +124,10 @@ public:
     force_sync sync() const {
         return _sync;
     }
-    void write(typename seastar::memory_output_stream<std::vector<temporary_buffer<char>>::iterator>& out) const;
+
+    using ostream = typename seastar::memory_output_stream<detail::sector_split_iterator>;
+
+    void write(ostream& out) const;
 };
 
 class commitlog_entry_reader {

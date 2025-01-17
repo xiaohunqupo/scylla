@@ -5,19 +5,15 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <chrono>
 #include "cql3/statements/prepared_statement.hh"
 #include "tracing/trace_state.hh"
-#include "tracing/trace_keyspace_helper.hh"
-#include "service/storage_proxy.hh"
-#include "to_string.hh"
 #include "timestamp.hh"
 
 #include "cql3/values.hh"
 #include "cql3/query_options.hh"
-#include "utils/UUID_gen.hh"
 
 namespace tracing {
 
@@ -26,12 +22,12 @@ logging::logger trace_state_logger("trace_state");
 struct trace_state::params_values {
     struct prepared_statement_info {
         prepared_checked_weak_ptr statement;
-        std::optional<std::vector<sstring_view>> query_option_names;
+        std::optional<std::vector<std::string_view>> query_option_names;
         cql3::raw_value_view_vector_with_unset query_option_values;
         explicit prepared_statement_info(prepared_checked_weak_ptr statement) : statement(std::move(statement)) {}
     };
 
-    std::optional<inet_address_vector_replica_set> batchlog_endpoints;
+    std::optional<host_id_vector_replica_set> batchlog_endpoints;
     std::optional<api::timestamp_type> user_timestamp;
     std::vector<sstring> queries;
     std::optional<db::consistency_level> cl;
@@ -51,33 +47,7 @@ void trace_state::params_values_deleter::operator()(params_values* pv) {
     delete pv;
 }
 
-void trace_state::init_session_records(
-    trace_type type,
-    std::chrono::seconds slow_query_ttl,
-    std::optional<utils::UUID> session_id,
-    span_id parent_id) {
-
-    _records = make_lw_shared<one_session_records>();
-    _records->session_id = session_id ? *session_id : utils::UUID_gen::get_time_UUID();
-
-    if (full_tracing()) {
-        if (!log_slow_query()) {
-            _records->ttl = ttl_by_type(type);
-        } else {
-            _records->ttl = std::max(ttl_by_type(type), slow_query_ttl);
-        }
-    } else {
-        _records->ttl = slow_query_ttl;
-    }
-
-    _records->session_rec.command = type;
-    _records->session_rec.slow_query_record_ttl = slow_query_ttl;
-    _records->my_span_id = span_id::make_span_id();
-    _records->parent_id = parent_id;
-}
-
-
-void trace_state::set_batchlog_endpoints(const inet_address_vector_replica_set& val) {
+void trace_state::set_batchlog_endpoints(const host_id_vector_replica_set& val) {
     _params_ptr->batchlog_endpoints.emplace(val);
 }
 
@@ -105,11 +75,11 @@ void trace_state::set_response_size(size_t s) noexcept {
     _records->session_rec.response_size = s;
 }
 
-void trace_state::add_query(sstring_view val) {
+void trace_state::add_query(std::string_view val) {
     _params_ptr->queries.emplace_back(std::move(val));
 }
 
-void trace_state::add_session_param(sstring_view key, sstring_view val) {
+void trace_state::add_session_param(std::string_view key, std::string_view val) {
     _records->session_rec.parameters.emplace(std::move(key), std::move(val));
 }
 
@@ -142,7 +112,8 @@ void trace_state::build_parameters_map() {
     params_values& vals = *_params_ptr;
 
     if (vals.batchlog_endpoints) {
-        params_map.emplace("batch_endpoints", join(sstring(","),  *vals.batchlog_endpoints | boost::adaptors::transformed([](gms::inet_address ep) {return seastar::format("/{}", ep);})));
+        auto batch_endpoints = fmt::format("{}", fmt::join(*vals.batchlog_endpoints | std::views::transform([](locator::host_id ep) {return seastar::format("/{}", ep);}), ","));
+        params_map.emplace("batch_endpoints", std::move(batch_endpoints));
     }
 
     if (vals.cl) {
@@ -193,7 +164,7 @@ void trace_state::build_parameters_map() {
 }
 
 void trace_state::build_parameters_map_for_one_prepared(const prepared_checked_weak_ptr& prepared_ptr,
-        std::optional<std::vector<sstring_view>>& names_opt,
+        std::optional<std::vector<std::string_view>>& names_opt,
         cql3::raw_value_view_vector_with_unset& values, const sstring& param_name_prefix) {
     auto& params_map = _records->session_rec.parameters;
     size_t i = 0;
@@ -208,7 +179,7 @@ void trace_state::build_parameters_map_for_one_prepared(const prepared_checked_w
 
         auto& names = names_opt.value();
         for (; i < values.values.size(); ++i) {
-            params_map.emplace(format("{}[{:d}]({})", param_name_prefix, i, names[i]), raw_value_to_sstring(values.values[i], values.unset[i], prepared_ptr ? prepared_ptr->bound_names[i]->type : nullptr));
+            params_map.emplace(seastar::format("{}[{:d}]({})", param_name_prefix, i, names[i]), raw_value_to_sstring(values.values[i], values.unset[i], prepared_ptr ? prepared_ptr->bound_names[i]->type : nullptr));
         }
     } else {
         for (; i < values.values.size(); ++i) {

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -24,6 +24,22 @@ class schema_extension;
 using schema_ptr = seastar::lw_shared_ptr<const schema>;
 
 using table_id = utils::tagged_uuid<struct table_id_tag>;
+
+struct table_info {
+    sstring name;
+    table_id id;
+};
+
+namespace std {
+
+std::ostream& operator<<(std::ostream& os, const table_info& ti);
+
+} // namespace std
+
+template <>
+struct fmt::formatter<table_info> : fmt::formatter<string_view> {
+    auto format(const table_info&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
 
 // Cluster-wide identifier of schema version of particular table.
 //

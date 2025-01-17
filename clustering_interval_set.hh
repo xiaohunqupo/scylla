@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "schema/schema_fwd.hh"
 #include "mutation/position_in_partition.hh"
 #include <boost/icl/interval_set.hpp>
@@ -75,8 +76,7 @@ public:
             const interval::interval_type& iv = *_i;
             return position_range{iv.lower().position(), iv.upper().position()};
         }
-        bool operator==(const position_range_iterator& other) const { return _i == other._i; }
-        bool operator!=(const position_range_iterator& other) const { return _i != other._i; }
+        bool operator==(const position_range_iterator& other) const = default;
         position_range_iterator& operator++() {
             ++_i;
             return *this;
@@ -88,8 +88,8 @@ public:
         }
     };
     static interval::type make_interval(const schema& s, const position_range& r) {
-        assert(r.start().has_clustering_key());
-        assert(r.end().has_clustering_key());
+        SCYLLA_ASSERT(r.start().has_clustering_key());
+        SCYLLA_ASSERT(r.end().has_clustering_key());
         return interval::right_open(
             position_in_partition_with_schema(s.shared_from_this(), r.start()),
             position_in_partition_with_schema(s.shared_from_this(), r.end()));
@@ -123,6 +123,10 @@ public:
     }
     position_range_iterator begin() const { return {_set.begin()}; }
     position_range_iterator end() const { return {_set.end()}; }
-    friend std::ostream& operator<<(std::ostream&, const clustering_interval_set&);
 };
 
+template <> struct fmt::formatter<clustering_interval_set> : fmt::formatter<string_view> {
+    auto format(const clustering_interval_set& set, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}}}", fmt::join(set, ",\n  "));
+    }
+};

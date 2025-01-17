@@ -3,19 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/algorithm/string.hpp>
-#include <boost/algorithm/string/join.hpp>
+#include <boost/range/adaptor/map.hpp>
 #include <filesystem>
-#include <source_location>
+#include <set>
 #include <fmt/chrono.h>
-#include <seastar/core/app-template.hh>
+#include <fmt/ostream.h>
+#include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/queue.hh>
 #include <seastar/util/closeable.hh>
+#include <seastar/core/queue.hh>
 
 #include "compaction/compaction.hh"
+#include "compaction/compaction_strategy.hh"
+#include "compaction/compaction_strategy_state.hh"
 #include "db/config.hh"
 #include "db/large_data_handler.hh"
 #include "gms/feature_service.hh"
@@ -27,10 +32,8 @@
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstable_directory.hh"
 #include "sstables/open_info.hh"
-#include "types/user.hh"
-#include "types/set.hh"
-#include "types/map.hh"
 #include "tools/json_writer.hh"
+#include "tools/load_system_tablets.hh"
 #include "tools/lua_sstable_consumer.hh"
 #include "tools/schema_loader.hh"
 #include "tools/sstable_consumer.hh"
@@ -38,16 +41,29 @@
 #include "locator/host_id.hh"
 
 using namespace seastar;
+using namespace sstables;
 
-using json_writer = tools::json_writer;
+using json_writer = mutation_json::json_writer;
 
 namespace bpo = boost::program_options;
 
+using namespace tools::utils;
+
+using operation_func = void(*)(schema_ptr, reader_permit, const std::vector<sstables::shared_sstable>&, sstables::sstables_manager&, const bpo::variables_map&);
+
+namespace std {
+// required by boost::lexical_cast<std::string>(vector<string>), which is in turn used
+// by boost::program_option for printing out the default value of an option
+std::ostream& operator<<(std::ostream& os, const std::vector<sstring>& v) {
+    return os << fmt::format("{}", v);
+}
+}
+
 namespace {
 
-const auto app_name = "scylla-sstable";
+const auto app_name = "sstable";
 
-logging::logger sst_log(app_name);
+logging::logger sst_log(format("scylla-{}", app_name));
 
 db::nop_large_data_handler large_data_handler;
 
@@ -129,30 +145,219 @@ partition_set get_partitions(schema_ptr schema, const bpo::variables_map& app_co
     return partitions;
 }
 
+struct sstable_path_info {
+    std::filesystem::path sstable_path;
+    std::filesystem::path data_dir_path;
+    sstring keyspace;
+    sstring table;
+};
+
+sstable_path_info extract_from_sstable_path(const bpo::variables_map& app_config) {
+    if (!app_config.count("sstables")) {
+        throw std::invalid_argument("cannot extract information from sstable path, no sstable arguments");
+    }
+
+    auto sst_path = std::filesystem::path(app_config["sstables"].as<std::vector<sstring>>().front());
+    sstring keyspace, table;
+    try {
+        auto [_, ks, tbl] = sstables::parse_path(sst_path);
+        keyspace = std::move(ks);
+        table = std::move(tbl);
+    } catch (const sstables::malformed_sstable_exception&) {
+        throw std::invalid_argument(fmt::format("cannot extract information from sstable path, sstable has invalid path: {}", sst_path));
+    }
+    const auto sst_dir_path = std::filesystem::path(sst_path).remove_filename();
+    std::filesystem::path data_dir_path;
+    // Detect whether sstable is in root table directory, or in a sub-directory
+    // The last component is "" due to the trailing "/" left by "remove_filename()" above.
+    // So we need to go back 2 more, to find the supposed keyspace component.
+    if (keyspace == std::prev(sst_dir_path.end(), 3)->native()) {
+        data_dir_path = sst_dir_path / ".." / "..";
+    } else {
+        data_dir_path = sst_dir_path / ".." / ".." / "..";
+    }
+
+    return sstable_path_info{std::move(sst_path), std::move(data_dir_path), std::move(keyspace), std::move(table)};
+}
+
+std::pair<sstring, sstring> get_keyspace_and_table_options(const bpo::variables_map& app_config) {
+    sstring keyspace_name, table_name;
+    auto k_it = app_config.find("keyspace");
+    auto t_it = app_config.find("table");
+    if (k_it != app_config.end() || t_it != app_config.end()) {
+        return std::pair(k_it->second.as<sstring>(), t_it->second.as<sstring>());
+    }
+
+    try {
+        auto info = extract_from_sstable_path(app_config);
+        return std::pair(info.keyspace, info.table);
+    } catch (...) {
+        throw std::invalid_argument("don't know which schema to load: no --keyspace and --table provided, failed to extract keyspace/table from sstable paths");
+    }
+}
+
+struct path_with_source {
+    fs::path path;
+    sstring source;
+};
+
+path_with_source obtain_data_dir(const bpo::variables_map& app_config, db::config& cfg) {
+    if (app_config.contains("scylla-data-dir")) {
+        return {.path = fs::path(app_config["scylla-data-dir"].as<sstring>()), .source = "--scylla-data-dir parameter"};
+    } else if (app_config.contains("scylla-yaml-file")) {
+        return {.path = fs::path(cfg.data_file_directories()[0]), .source = "--scylla-yaml-file parameter"};
+    } else if (std::getenv("SCYLLA_CONF")) {
+        return {.path = fs::path(cfg.data_file_directories()[0]), .source = "SCYLLA_CONF environment variable"};
+    } else if (std::getenv("SCYLLA_HOME")) {
+        return {.path = fs::path(cfg.data_file_directories()[0]), .source = "SCYLLA_HOME environment variable"};
+    } else {
+        const auto info = extract_from_sstable_path(app_config);
+        return {.path = info.data_dir_path, .source = seastar::format("autodetected from sstable path ({})", info.sstable_path.native())};
+    }
+}
+
+struct schema_with_source {
+    schema_ptr schema;
+    sstring source;
+    std::optional<fs::path> path;
+    sstring obtained_from;
+};
+
+std::optional<schema_with_source> try_load_schema_from_user_provided_source(const bpo::variables_map& app_config, db::config& cfg) {
+    sstring schema_source_opt;
+    try {
+        if (!app_config["schema-file"].defaulted()) {
+            schema_source_opt = "schema-file";
+            const auto schema_file_path = std::filesystem::path(app_config["schema-file"].as<sstring>());
+            return schema_with_source{.schema = tools::load_one_schema_from_file(cfg, schema_file_path).get(),
+                .source = schema_source_opt,
+                .path = schema_file_path,
+                .obtained_from = "--schema-file parameter"};
+        }
+        // All the below schema sources require this.
+        const auto [keyspace_name, table_name] = get_keyspace_and_table_options(app_config);
+        if (app_config.contains("system-schema")) {
+            schema_source_opt = "system-schema";
+            return schema_with_source{.schema = tools::load_system_schema(cfg, keyspace_name, table_name),
+                .source = schema_source_opt,
+                .obtained_from = "--system-schema parameter"};
+        }
+        if (app_config.contains("schema-tables")) {
+            const auto path_with_source = obtain_data_dir(app_config, cfg);
+            schema_source_opt = "schema-tables";
+            return schema_with_source{.schema = tools::load_schema_from_schema_tables(cfg, path_with_source.path, keyspace_name, table_name).get(),
+                .source= schema_source_opt,
+                .path = path_with_source.path,
+                .obtained_from = format("--schema-tables parameter (data-dir path obtained via {})", path_with_source.source)};
+        }
+        if (app_config.contains("sstable-schema")) {
+            const auto sst_path = fs::path(app_config["sstables"].as<std::vector<sstring>>().front());
+            return schema_with_source{.schema = tools::load_schema_from_sstable(cfg, sst_path, keyspace_name, table_name).get(),
+                .source= schema_source_opt,
+                .path = sst_path,
+                .obtained_from = "--sstable-schema parameter"};
+        }
+    } catch (...) {
+        fmt::print(std::cerr, "error processing arguments: could not load schema via {}: {}\n", schema_source_opt, std::current_exception());
+        return {};
+    }
+    // Should not happen, but if it does (we all know it will), let's at least have a message printed.
+    fmt::print(std::cerr, "error processing arguments: could not load schema from known schema sources: unknown error\n");
+    return {};
+}
+
+std::optional<schema_with_source> try_load_schema_autodetect(const bpo::variables_map& app_config, db::config& cfg) {
+    try {
+        const auto schema_file_path = std::filesystem::path(app_config["schema-file"].as<sstring>());
+        return schema_with_source{.schema = tools::load_one_schema_from_file(cfg, schema_file_path).get(),
+            .source = "schema-file",
+            .path = schema_file_path,
+            .obtained_from = "--schema-file parameters (default value)"};
+    } catch (...) {
+        sst_log.debug("Trying to read schema file from default location failed: {}", std::current_exception());
+    }
+
+    if (app_config.count("sstables")) {
+        try {
+            auto info = extract_from_sstable_path(app_config);
+            return schema_with_source{.schema = tools::load_schema_from_schema_tables(cfg, info.data_dir_path, info.keyspace, info.table).get(),
+                .source = "schema-tables",
+                .path = info.data_dir_path,
+                .obtained_from = format("sstable path ({})", info.sstable_path)};
+        } catch (...) {
+            sst_log.debug("Trying to find scylla data dir based on the sstable path failed: {}", std::current_exception());
+        }
+    } else {
+        sst_log.debug("Trying to find scylla data dir based on sstable path failed: no sstable argument provided");
+    }
+
+    try {
+        const auto [keyspace_name, table_name] = get_keyspace_and_table_options(app_config);
+        const auto data_dir_path = std::filesystem::path(cfg.data_file_directories().at(0));
+        return schema_with_source{.schema = tools::load_schema_from_schema_tables(cfg, data_dir_path, keyspace_name, table_name).get(),
+            .source = "schema-tables",
+            .path = data_dir_path,
+            .obtained_from = "data dir"};
+    } catch (...) {
+        sst_log.debug("Trying to locate data dir failed: {}", std::current_exception());
+    }
+
+    try {
+        sstring keyspace_name, table_name;
+        try {
+            std::tie(keyspace_name, table_name) = get_keyspace_and_table_options(app_config);
+        } catch (std::invalid_argument&) {
+            keyspace_name = "my_keyspace";
+            table_name = "my_table";
+        }
+        if (!app_config.count("sstables")) {
+            throw std::runtime_error("no sstables provided on the command-line");
+        }
+        const auto sst_path = app_config["sstables"].as<std::vector<sstring>>().front();
+        return schema_with_source{.schema = tools::load_schema_from_sstable(cfg, fs::path(sst_path),
+                keyspace_name, table_name).get(),
+            .source = "sstable's serialization header",
+            .obtained_from = sst_path};
+    } catch (...) {
+        sst_log.debug("Trying to load schema from the sstable itself failed: {}", std::current_exception());
+    }
+
+    fmt::print(std::cerr, "Failed to autodetect and load schema, try again with --logger-log-level scylla-sstable=debug to learn more or provide the schema source manually\n");
+    return {};
+}
+
 const std::vector<sstables::shared_sstable> load_sstables(schema_ptr schema, sstables::sstables_manager& sst_man, const std::vector<sstring>& sstable_names) {
     std::vector<sstables::shared_sstable> sstables;
     sstables.resize(sstable_names.size());
 
     parallel_for_each(sstable_names, [schema, &sst_man, &sstable_names, &sstables] (const sstring& sst_name) -> future<> {
         const auto i = std::distance(sstable_names.begin(), std::find(sstable_names.begin(), sstable_names.end(), sst_name));
-        const auto sst_path = std::filesystem::path(sst_name);
+        const auto sst_path = std::filesystem::canonical(std::filesystem::path(sst_name));
 
         if (const auto ftype_opt = co_await file_type(sst_path.c_str(), follow_symlink::yes)) {
             if (!ftype_opt) {
-                throw std::invalid_argument(fmt::format("error: failed to determine type of file pointed to by provided sstable path {}", sst_path.c_str()));
+                throw std::invalid_argument(fmt::format("failed to determine type of file pointed to by provided sstable path {}", sst_path.c_str()));
             }
             if (*ftype_opt != directory_entry_type::regular) {
-                throw std::invalid_argument(fmt::format("error: file pointed to by provided sstable path {} is not a regular file", sst_path.c_str()));
+                throw std::invalid_argument(fmt::format("file pointed to by provided sstable path {} is not a regular file", sst_path.c_str()));
             }
         }
 
-        const auto dir_path = std::filesystem::path(sst_path).remove_filename();
-        const auto sst_filename = sst_path.filename();
 
-        auto ed = sstables::entry_descriptor::make_descriptor(dir_path.c_str(), sst_filename.c_str(), schema->ks_name(), schema->cf_name());
-        auto sst = sst_man.make_sstable(schema, dir_path.c_str(), ed.generation, ed.version, ed.format);
+        auto ed = sstables::parse_path(sst_path, schema->ks_name(), schema->cf_name());
+        const auto dir_path = sst_path.parent_path();
+        auto local = data_dictionary::make_local_options(dir_path);
+        auto sst = sst_man.make_sstable(schema, local, ed.generation, sstables::sstable_state::normal, ed.version, ed.format);
 
-        co_await sst->load(default_priority_class(), sstables::sstable_open_config{.load_first_and_last_position_metadata = false});
+        try {
+            co_await sst->load(schema->get_sharder(), sstables::sstable_open_config{.load_first_and_last_position_metadata = false});
+        } catch (...) {
+            // Print each individual error here since parallel_for_each
+            // will propagate only one of them up the stack.
+            auto msg = fmt::format("Could not load SSTable: {}", sst->get_filename());
+            fmt::print(std::cerr, "{}: {}\n", msg, std::current_exception());
+            throw_with_nested(std::runtime_error(msg));
+        }
 
         sstables[i] = std::move(sst);
     }).get();
@@ -196,7 +401,7 @@ output_format get_output_format_from_options(const bpo::variables_map& opts, out
         } else if (value == "json") {
             return output_format::json;
         } else {
-            throw std::invalid_argument(fmt::format("error: invalid value for dump option output-format: {}", value));
+            throw std::invalid_argument(fmt::format("invalid value for dump option output-format: {}", value));
         }
     }
     return default_format;
@@ -206,249 +411,107 @@ output_format get_output_format_from_options(const bpo::variables_map& opts, out
 
 namespace tools {
 
-sstring mutation_fragment_json_writer::to_string(gc_clock::time_point tp) {
-    return fmt::format("{:%F %T}z", fmt::gmtime(gc_clock::to_time_t(tp)));
-}
-
-void mutation_fragment_json_writer::write(gc_clock::duration ttl, gc_clock::time_point expiry) {
-    _writer.Key("ttl");
-    _writer.AsString(ttl);
-    _writer.Key("expiry");
-    _writer.String(to_string(expiry));
-}
-
-void mutation_fragment_json_writer::write(const tombstone& t) {
-    _writer.StartObject();
-    if (t) {
-        _writer.Key("timestamp");
-        _writer.Int64(t.timestamp);
-        _writer.Key("deletion_time");
-        _writer.String(to_string(t.deletion_time));
-    }
-    _writer.EndObject();
-}
-
-void mutation_fragment_json_writer::write(const row_marker& m) {
-    _writer.StartObject();
-    _writer.Key("timestamp");
-    _writer.Int64(m.timestamp());
-    if (m.is_live() && m.is_expiring()) {
-        write(m.ttl(), m.expiry());
-    }
-    _writer.EndObject();
-}
-
-void mutation_fragment_json_writer::write(counter_cell_view cv) {
-    _writer.StartArray();
-    for (const auto& shard : cv.shards()) {
-        _writer.StartObject();
-        _writer.Key("id");
-        _writer.AsString(shard.id());
-        _writer.Key("value");
-        _writer.Int64(shard.value());
-        _writer.Key("clock");
-        _writer.Int64(shard.logical_clock());
-        _writer.EndObject();
-    }
-    _writer.EndArray();
-}
-
-void mutation_fragment_json_writer::write(const atomic_cell_view& cell, data_type type) {
-    _writer.StartObject();
-    _writer.Key("is_live");
-    _writer.Bool(cell.is_live());
-    _writer.Key("type");
-    if (type->is_counter()) {
-        if (cell.is_counter_update()) {
-            _writer.String("counter-update");
-        } else {
-            _writer.String("counter-shards");
-        }
-    } else if (type->is_collection()) {
-        _writer.String("frozen-collection");
-    } else {
-        _writer.String("regular");
-    }
-    _writer.Key("timestamp");
-    _writer.Int64(cell.timestamp());
-    if (type->is_counter()) {
-        _writer.Key("value");
-        if (cell.is_counter_update()) {
-            _writer.Int64(cell.counter_update_value());
-        } else {
-            write(counter_cell_view(cell));
-        }
-    } else {
-        if (cell.is_live_and_has_ttl()) {
-            write(cell.ttl(), cell.expiry());
-        }
-        if (cell.is_live()) {
-            _writer.Key("value");
-            _writer.String(type->to_string(cell.value().linearize()));
-        } else {
-            _writer.Key("deletion_time");
-            _writer.String(to_string(cell.deletion_time()));
-        }
-    }
-    _writer.EndObject();
-}
-void mutation_fragment_json_writer::write(const collection_mutation_view_description& mv, data_type type) {
-    _writer.StartObject();
-
-    if (mv.tomb) {
-        _writer.Key("tombstone");
-        write(mv.tomb);
-    }
-
-    _writer.Key("cells");
-
-    std::function<void(size_t, bytes_view)> write_key;
-    std::function<void(size_t, atomic_cell_view)> write_value;
-    if (auto t = dynamic_cast<const collection_type_impl*>(type.get())) {
-        write_key = [this, t = t->name_comparator()] (size_t, bytes_view k) { _writer.String(t->to_string(k)); };
-        write_value = [this, t = t->value_comparator()] (size_t, atomic_cell_view v) { write(v, t); };
-    } else if (auto t = dynamic_cast<const tuple_type_impl*>(type.get())) {
-        write_key = [this] (size_t i, bytes_view) { _writer.String(""); };
-        write_value = [this, t] (size_t i, atomic_cell_view v) { write(v, t->type(i)); };
-    }
-
-    if (write_key && write_value) {
-        _writer.StartArray();
-        for (size_t i = 0; i < mv.cells.size(); ++i) {
-            _writer.StartObject();
-            _writer.Key("key");
-            write_key(i, mv.cells[i].first);
-            _writer.Key("value");
-            write_value(i, mv.cells[i].second);
-            _writer.EndObject();
-        }
-        _writer.EndArray();
-    } else {
-        _writer.Null();
-    }
-
-    _writer.EndObject();
-}
-
-void mutation_fragment_json_writer::write(const atomic_cell_or_collection& cell, const column_definition& cdef) {
-    if (cdef.is_atomic()) {
-        write(cell.as_atomic_cell(cdef), cdef.type);
-    } else if (cdef.type->is_collection() || cdef.type->is_user_type()) {
-        cell.as_collection_mutation().with_deserialized(*cdef.type, [&, this] (collection_mutation_view_description mv) {
-            write(mv, cdef.type);
-        });
-    } else {
-        _writer.Null();
-    }
-}
-
-void mutation_fragment_json_writer::write(const row& r, column_kind kind) {
-    _writer.StartObject();
-    r.for_each_cell([this, kind] (column_id id, const atomic_cell_or_collection& cell) {
-        auto cdef = _schema.column_at(kind, id);
-        _writer.Key(cdef.name_as_text());
-        write(cell, cdef);
-    });
-    _writer.EndObject();
-}
-
-void mutation_fragment_json_writer::write(const clustering_row& cr) {
-    _writer.StartObject();
-    _writer.Key("type");
-    _writer.String("clustering-row");
-    _writer.Key("key");
-    _writer.DataKey(_schema, cr.key());
+void mutation_fragment_stream_json_writer::write(const clustering_row& cr) {
+    writer().StartObject();
+    writer().Key("type");
+    writer().String("clustering-row");
+    writer().Key("key");
+    writer().DataKey(_writer.schema(), cr.key());
     if (cr.tomb()) {
-        _writer.Key("tombstone");
-        write(cr.tomb().regular());
-        _writer.Key("shadowable_tombstone");
-        write(cr.tomb().shadowable().tomb());
+        writer().Key("tombstone");
+        _writer.write(cr.tomb().regular());
+        writer().Key("shadowable_tombstone");
+        _writer.write(cr.tomb().shadowable().tomb());
     }
     if (!cr.marker().is_missing()) {
-        _writer.Key("marker");
-        write(cr.marker());
+        writer().Key("marker");
+        _writer.write(cr.marker());
     }
-    _writer.Key("columns");
-    write(cr.cells(), column_kind::regular_column);
-    _writer.EndObject();
+    writer().Key("columns");
+    _writer.write(cr.cells(), column_kind::regular_column);
+    writer().EndObject();
 }
 
-void mutation_fragment_json_writer::write(const range_tombstone_change& rtc) {
-    _writer.StartObject();
-    _writer.Key("type");
-    _writer.String("range-tombstone-change");
+void mutation_fragment_stream_json_writer::write(const range_tombstone_change& rtc) {
+    writer().StartObject();
+    writer().Key("type");
+    writer().String("range-tombstone-change");
     const auto pos = rtc.position();
     if (pos.has_key()) {
-        _writer.Key("key");
-        _writer.DataKey(_schema, pos.key());
+        writer().Key("key");
+        writer().DataKey(_writer.schema(), pos.key());
     }
-    _writer.Key("weight");
-    _writer.Int(static_cast<int>(pos.get_bound_weight()));
-    _writer.Key("tombstone");
-    write(rtc.tombstone());
-    _writer.EndObject();
+    writer().Key("weight");
+    writer().Int(static_cast<int>(pos.get_bound_weight()));
+    writer().Key("tombstone");
+    _writer.write(rtc.tombstone());
+    writer().EndObject();
 }
 
-void mutation_fragment_json_writer::start_stream() {
-    _writer.StartStream();
+void mutation_fragment_stream_json_writer::start_stream() {
+    writer().StartStream();
 }
 
-void mutation_fragment_json_writer::start_sstable(const sstables::sstable* const sst) {
-    _writer.SstableKey(sst);
-    _writer.StartArray();
+void mutation_fragment_stream_json_writer::start_sstable(const sstables::sstable* const sst) {
+    if (sst) {
+        writer().Key(sst->get_filename());
+    } else {
+        writer().Key("anonymous");
+    }
+    writer().StartArray();
 }
 
-void mutation_fragment_json_writer::start_partition(const partition_start& ps) {
+void mutation_fragment_stream_json_writer::start_partition(const partition_start& ps) {
     const auto& dk = ps.key();
     _clustering_array_created = false;
 
-    _writer.StartObject();
+    writer().StartObject();
 
-    _writer.Key("key");
-    _writer.DataKey(_schema, dk.key(), dk.token());
+    writer().Key("key");
+    writer().DataKey(_writer.schema(), dk.key(), dk.token());
 
     if (ps.partition_tombstone()) {
-        _writer.Key("tombstone");
-        write(ps.partition_tombstone());
+        writer().Key("tombstone");
+        _writer.write(ps.partition_tombstone());
     }
 }
 
-void mutation_fragment_json_writer::partition_element(const static_row& sr) {
-    _writer.Key("static_row");
-    write(sr.cells(), column_kind::static_column);
+void mutation_fragment_stream_json_writer::partition_element(const static_row& sr) {
+    writer().Key("static_row");
+    _writer.write(sr.cells(), column_kind::static_column);
 }
 
-void mutation_fragment_json_writer::partition_element(const clustering_row& cr) {
+void mutation_fragment_stream_json_writer::partition_element(const clustering_row& cr) {
     if (!_clustering_array_created) {
-        _writer.Key("clustering_elements");
-        _writer.StartArray();
+        writer().Key("clustering_elements");
+        writer().StartArray();
         _clustering_array_created = true;
     }
     write(cr);
 }
 
-void mutation_fragment_json_writer::partition_element(const range_tombstone_change& rtc) {
+void mutation_fragment_stream_json_writer::partition_element(const range_tombstone_change& rtc) {
     if (!_clustering_array_created) {
-        _writer.Key("clustering_elements");
-        _writer.StartArray();
+        writer().Key("clustering_elements");
+        writer().StartArray();
         _clustering_array_created = true;
     }
     write(rtc);
 }
 
-void mutation_fragment_json_writer::end_partition() {
+void mutation_fragment_stream_json_writer::end_partition() {
     if (_clustering_array_created) {
-        _writer.EndArray();
+        writer().EndArray();
     }
-    _writer.EndObject();
+    writer().EndObject();
 }
 
-void mutation_fragment_json_writer::end_sstable() {
-    _writer.EndArray();
+void mutation_fragment_stream_json_writer::end_sstable() {
+    writer().EndArray();
 }
 
-void mutation_fragment_json_writer::end_stream() {
-    _writer.EndStream();
+void mutation_fragment_stream_json_writer::end_stream() {
+    writer().EndStream();
 }
 
 } // namespace tools
@@ -498,7 +561,7 @@ class dumping_consumer : public sstable_consumer {
         }
     };
     class json_dumper : public sstable_consumer {
-        tools::mutation_fragment_json_writer _writer;
+        tools::mutation_fragment_stream_json_writer _writer;
     public:
         explicit json_dumper(const schema& s) : _writer(s) {}
         virtual future<> consume_stream_start() override {
@@ -627,7 +690,7 @@ private:
                 }
             });
         } else {
-            throw std::runtime_error(fmt::format("Cannot collect timestamp of cell (column {} of uknown type {})", cdef.name_as_text(), cdef.type->name()));
+            throw std::runtime_error(fmt::format("Cannot collect timestamp of cell (column {} of unknown type {})", cdef.name_as_text(), cdef.type->name()));
         }
     }
 
@@ -669,7 +732,7 @@ public:
             } else if (value == "hours") {
                 _bucket = bucket::hours;
             } else {
-                throw std::invalid_argument(fmt::format("error: invalid value for writetime-histogram option bucket: {}", value));
+                throw std::invalid_argument(fmt::format("invalid value for writetime-histogram option bucket: {}", value));
             }
         }
     }
@@ -743,7 +806,7 @@ public:
     }
 };
 
-stop_iteration consume_reader(flat_mutation_reader_v2 rd, sstable_consumer& consumer, sstables::sstable* sst, const partition_set& partitions, bool no_skips) {
+stop_iteration consume_reader(mutation_reader rd, sstable_consumer& consumer, sstables::sstable* sst, const partition_set& partitions, bool no_skips) {
     auto close_rd = deferred_close(rd);
     if (consumer.consume_sstable_start(sst).get() == stop_iteration::yes) {
         return consumer.consume_sstable_end().get();
@@ -752,7 +815,7 @@ stop_iteration consume_reader(flat_mutation_reader_v2 rd, sstable_consumer& cons
     consumer_wrapper::filter_type filter;
     if (!partitions.empty()) {
         filter = [&] (const dht::decorated_key& key) {
-            const auto pass = partitions.find(key) != partitions.end();
+            const auto pass = partitions.contains(key);
             sst_log.trace("filter({})={}", key, pass);
             skip_partition = !pass;
             return pass;
@@ -786,15 +849,15 @@ stop_iteration consume_reader(flat_mutation_reader_v2 rd, sstable_consumer& cons
     return consumer.consume_sstable_end().get();
 }
 
-void consume_sstables(schema_ptr schema, reader_permit permit, std::vector<sstables::shared_sstable> sstables, bool merge, bool use_crawling_reader,
-        std::function<stop_iteration(flat_mutation_reader_v2&, sstables::sstable*)> reader_consumer) {
-    sst_log.trace("consume_sstables(): {} sstables, merge={}, use_crawling_reader={}", sstables.size(), merge, use_crawling_reader);
+void consume_sstables(schema_ptr schema, reader_permit permit, std::vector<sstables::shared_sstable> sstables, bool merge, bool use_full_scan_reader,
+        std::function<stop_iteration(mutation_reader&, sstables::sstable*)> reader_consumer) {
+    sst_log.trace("consume_sstables(): {} sstables, merge={}, use_full_scan_reader={}", sstables.size(), merge, use_full_scan_reader);
     if (merge) {
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         readers.reserve(sstables.size());
         for (const auto& sst : sstables) {
-            if (use_crawling_reader) {
-                readers.emplace_back(sst->make_crawling_reader(schema, permit));
+            if (use_full_scan_reader) {
+                readers.emplace_back(sst->make_full_scan_reader(schema, permit));
             } else {
                 readers.emplace_back(sst->make_reader(schema, permit, query::full_partition_range, schema->full_slice()));
             }
@@ -804,8 +867,8 @@ void consume_sstables(schema_ptr schema, reader_permit permit, std::vector<sstab
         reader_consumer(rd, nullptr);
     } else {
         for (const auto& sst : sstables) {
-            auto rd = use_crawling_reader
-                ? sst->make_crawling_reader(schema, permit)
+            auto rd = use_full_scan_reader
+                ? sst->make_full_scan_reader(schema, permit)
                 : sst->make_reader(schema, permit, query::full_partition_range, schema->full_slice());
 
             if (reader_consumer(rd, sst.get()) == stop_iteration::yes) {
@@ -815,64 +878,182 @@ void consume_sstables(schema_ptr schema, reader_permit permit, std::vector<sstab
     }
 }
 
-using operation_func = void(*)(schema_ptr, reader_permit, const std::vector<sstables::shared_sstable>&, sstables::sstables_manager&, const bpo::variables_map&);
+class scylla_sstable_table_state : public compaction::table_state {
+    struct dummy_compaction_backlog_tracker : public compaction_backlog_tracker::impl {
+        virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) override { }
+        virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override { return 0.0; }
+    };
 
-class operation {
-    std::string _name;
-    std::string _summary;
-    std::string _description;
-    std::vector<std::string> _available_options;
-    operation_func _func;
+private:
+    schema_ptr _schema;
+    reader_permit _permit;
+    sstables::sstables_manager& _sst_man;
+    std::string _output_dir;
+    sstables::sstable_set _main_set;
+    sstables::sstable_set _maintenance_set;
+    std::vector<sstables::shared_sstable> _compacted_undeleted_sstables;
+    mutable sstables::compaction_strategy _compaction_strategy;
+    compaction_strategy_state _compaction_strategy_state;
+    tombstone_gc_state _tombstone_gc_state;
+    compaction_backlog_tracker _backlog_tracker;
+    std::string _group_id;
+    condition_variable _staging_done_condition;
+    mutable sstable_generation_generator _generation_generator;
+
+private:
+    sstables::shared_sstable do_make_sstable() const {
+        const auto format = sstables::sstable_format_types::big;
+        const auto version = sstables::get_highest_sstable_version();
+        auto generation = _generation_generator();
+        auto sst_name = sstables::sstable::filename(_output_dir, _schema->ks_name(), _schema->cf_name(), version, generation, format, component_type::Data);
+        if (file_exists(sst_name).get()) {
+            throw std::runtime_error(fmt::format("cannot create output sstable {}, file already exists", sst_name));
+        }
+        auto local = data_dictionary::make_local_options(_output_dir);
+        return _sst_man.make_sstable(_schema, local, generation, sstables::sstable_state::normal, version, format);
+    }
+    sstables::sstable_writer_config do_configure_writer(sstring origin) const {
+        return _sst_man.configure_writer(std::move(origin));
+    }
 
 public:
-    operation(std::string name, std::string summary, std::string description, operation_func func)
-        : _name(std::move(name)), _summary(std::move(summary)), _description(std::move(description)), _func(func) {
-    }
-    operation(std::string name, std::string summary, std::string description, std::vector<std::string> available_options, operation_func func)
-        : _name(std::move(name)), _summary(std::move(summary)), _description(std::move(description)), _available_options(std::move(available_options)), _func(func) {
-    }
-
-    const std::string& name() const { return _name; }
-    const std::string& summary() const { return _summary; }
-    const std::string& description() const { return _description; }
-    const std::vector<std::string>& available_options() const { return _available_options; }
-
-    void operator()(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
-            sstables::sstables_manager& sst_man, const bpo::variables_map& vm) const {
-        _func(std::move(schema), std::move(permit), sstables, sst_man, vm);
-    }
+    scylla_sstable_table_state(schema_ptr schema, reader_permit permit, sstables::sstables_manager& sst_man, std::string output_dir)
+        : _schema(std::move(schema))
+        , _permit(std::move(permit))
+        , _sst_man(sst_man)
+        , _output_dir(std::move(output_dir))
+        , _main_set(sstables::make_partitioned_sstable_set(_schema, false))
+        , _maintenance_set(sstables::make_partitioned_sstable_set(_schema, false))
+        , _compaction_strategy(sstables::make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
+        , _compaction_strategy_state(compaction::compaction_strategy_state::make(_compaction_strategy))
+        , _tombstone_gc_state(nullptr)
+        , _backlog_tracker(std::make_unique<dummy_compaction_backlog_tracker>())
+        , _group_id("dummy-group")
+        , _generation_generator(0)
+    { }
+    virtual const schema_ptr& schema() const noexcept override { return _schema; }
+    virtual unsigned min_compaction_threshold() const noexcept override { return _schema->min_compaction_threshold(); }
+    virtual bool compaction_enforce_min_threshold() const noexcept override { return false; }
+    virtual const sstables::sstable_set& main_sstable_set() const override { return _main_set; }
+    virtual const sstables::sstable_set& maintenance_sstable_set() const override { return _maintenance_set; }
+    lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc() const override { return make_lw_shared<const sstables::sstable_set>(main_sstable_set()); }
+    virtual std::unordered_set<sstables::shared_sstable> fully_expired_sstables(const std::vector<sstables::shared_sstable>& sstables, gc_clock::time_point compaction_time) const override { return {}; }
+    virtual const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept override { return _compacted_undeleted_sstables; }
+    virtual sstables::compaction_strategy& get_compaction_strategy() const noexcept override { return _compaction_strategy; }
+    virtual compaction_strategy_state& get_compaction_strategy_state() noexcept override { return _compaction_strategy_state; }
+    virtual reader_permit make_compaction_reader_permit() const override { return _permit; }
+    virtual sstables::sstables_manager& get_sstables_manager() noexcept override { return _sst_man; }
+    virtual sstables::shared_sstable make_sstable() const override { return do_make_sstable(); }
+    virtual sstables::sstable_writer_config configure_writer(sstring origin) const override { return do_configure_writer(std::move(origin)); }
+    virtual api::timestamp_type min_memtable_timestamp() const override { return api::min_timestamp; }
+    virtual api::timestamp_type min_memtable_live_timestamp() const override { return api::min_timestamp; }
+    virtual api::timestamp_type min_memtable_live_row_marker_timestamp() const override { return api::min_timestamp; }
+    virtual bool memtable_has_key(const dht::decorated_key& key) const override { return false; }
+    virtual future<> on_compaction_completion(sstables::compaction_completion_desc desc, sstables::offstrategy offstrategy) override { return make_ready_future<>(); }
+    virtual bool is_auto_compaction_disabled_by_user() const noexcept override { return false; }
+    virtual bool tombstone_gc_enabled() const noexcept override { return false; }
+    virtual const tombstone_gc_state& get_tombstone_gc_state() const noexcept override { return _tombstone_gc_state; }
+    virtual compaction_backlog_tracker& get_backlog_tracker() override { return _backlog_tracker; }
+    virtual const std::string get_group_id() const noexcept override { return _group_id; }
+    virtual seastar::condition_variable& get_staging_done_condition() noexcept override { return _staging_done_condition; }
+    dht::token_range get_token_range_after_split(const dht::token& t) const noexcept override { return dht::token_range(); }
 };
+
+void validate_output_dir(std::filesystem::path output_dir, bool accept_nonempty_output_dir) {
+    auto fd = open_file_dma(output_dir.native(), open_flags::ro).get();
+    unsigned entries = 0;
+    fd.list_directory([&entries] (directory_entry) {
+        ++entries;
+        return make_ready_future<>();
+    }).done().get();
+    if (entries && !accept_nonempty_output_dir) {
+        throw std::invalid_argument("output-directory is not empty, pass --unsafe-accept-nonempty-output-dir if you are sure you want to write into this directory");
+    }
+}
 
 void validate_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map& vm) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
-    const auto merge = vm.count("merge");
-    sstables::compaction_data info;
-    consume_sstables(schema, permit, sstables, merge, true, [&info] (flat_mutation_reader_v2& rd, sstables::sstable* sst) {
-        if (sst) {
-            sst_log.info("validating {}", sst->get_filename());
+
+    abort_source abort;
+    // Collect JSON output and print after validation is done, to prevent
+    // interleaving with error messages from validation.
+    std::stringstream json_output_stream;
+    json_writer writer(json_output_stream);
+    writer.StartStream();
+    for (const auto& sst : sstables) {
+        const auto errors = sst->validate(permit, abort, [] (sstring what) { sst_log.info("{}", what); }).get();
+        writer.Key(sst->get_filename());
+        writer.StartObject();
+        writer.Key("errors");
+        writer.Uint64(errors);
+        writer.Key("valid");
+        writer.Bool(errors == 0);
+        writer.EndObject();
+    }
+    writer.EndStream();
+    fmt::print(std::cout, "{}", json_output_stream.view());
+}
+
+void scrub_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
+        sstables::sstables_manager& sst_man, const bpo::variables_map& vm) {
+    static const std::vector<std::pair<std::string, compaction_type_options::scrub::mode>> scrub_modes{
+        {"abort", compaction_type_options::scrub::mode::abort},
+        {"skip", compaction_type_options::scrub::mode::skip},
+        {"segregate", compaction_type_options::scrub::mode::segregate},
+        {"validate", compaction_type_options::scrub::mode::validate},
+    };
+
+    if (sstables.empty()) {
+        throw std::invalid_argument("no sstables specified on the command line");
+    }
+    compaction_type_options::scrub::mode scrub_mode;
+    {
+        if (!vm.count("scrub-mode")) {
+            throw std::invalid_argument("missing mandatory command-line argument --scrub-mode");
         }
-        const auto errors = sstables::scrub_validate_mode_validate_reader(std::move(rd), info).get();
-        sst_log.info("validated {}: {}", sst ? sst->get_filename() : "the stream", errors == 0 ? "valid" : "invalid");
-        return stop_iteration::no;
-    });
+        const auto mode_name = vm["scrub-mode"].as<std::string>();
+        auto mode_it = std::ranges::find_if(scrub_modes, [&mode_name] (const std::pair<std::string, compaction_type_options::scrub::mode>& v) {
+            return v.first == mode_name;
+        });
+        if (mode_it == scrub_modes.end()) {
+            throw std::invalid_argument(fmt::format("invalid scrub-mode: {}", mode_name));
+        }
+        scrub_mode = mode_it->second;
+    }
+    auto output_dir = vm["output-dir"].as<std::string>();
+    if (scrub_mode != compaction_type_options::scrub::mode::validate) {
+        validate_output_dir(output_dir, vm.count("unsafe-accept-nonempty-output-dir"));
+    }
+
+    scylla_sstable_table_state table_state(schema, permit, sst_man, output_dir);
+
+    auto compaction_descriptor = sstables::compaction_descriptor(std::move(sstables));
+    compaction_descriptor.options = sstables::compaction_type_options::make_scrub(scrub_mode, sstables::compaction_type_options::scrub::quarantine_invalid_sstables::no);
+    compaction_descriptor.creator = [&table_state] (shard_id) { return table_state.make_sstable(); };
+    compaction_descriptor.replacer = [] (sstables::compaction_completion_desc) { };
+
+    auto compaction_data = sstables::compaction_data{};
+
+    compaction_progress_monitor progress_monitor;
+    sstables::compact_sstables(std::move(compaction_descriptor), compaction_data, table_state, progress_monitor).get();
 }
 
 void dump_index_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map&) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
     json_writer writer;
     writer.StartStream();
     for (auto& sst : sstables) {
-        sstables::index_reader idx_reader(sst, permit, default_priority_class(), {}, sstables::use_caching::yes);
+        sstables::index_reader idx_reader(sst, permit);
         auto close_idx_reader = deferred_close(idx_reader);
 
-        writer.SstableKey(*sst);
+        writer.Key(sst->get_filename());
         writer.StartArray();
 
         while (!idx_reader.eof()) {
@@ -902,7 +1083,7 @@ sstring disk_string_to_string(const sstables::disk_string<Integer>& ds) {
 void dump_compression_info_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map&) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
     json_writer writer;
@@ -911,7 +1092,7 @@ void dump_compression_info_operation(schema_ptr schema, reader_permit permit, co
     for (auto& sst : sstables) {
         const auto& compression = sst->get_compression();
 
-        writer.SstableKey(*sst);
+        writer.Key(sst->get_filename());
         writer.StartObject();
         writer.Key("name");
         writer.String(disk_string_to_string(compression.name));
@@ -940,7 +1121,7 @@ void dump_compression_info_operation(schema_ptr schema, reader_permit permit, co
 void dump_summary_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map&) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
     json_writer writer;
@@ -949,7 +1130,7 @@ void dump_summary_operation(schema_ptr schema, reader_permit permit, const std::
     for (auto& sst : sstables) {
         auto& summary = sst->get_summary();
 
-        writer.SstableKey(*sst);
+        writer.Key(sst->get_filename());
         writer.StartObject();
 
         writer.Key("header");
@@ -980,7 +1161,7 @@ void dump_summary_operation(schema_ptr schema, reader_permit permit, const std::
 
             auto pkey = e.get_key().to_partition_key(*schema);
             writer.Key("key");
-            writer.DataKey(*schema, pkey, e.token);
+            writer.DataKey(*schema, pkey, e.get_token());
             writer.Key("position");
             writer.Uint64(e.position);
 
@@ -988,11 +1169,11 @@ void dump_summary_operation(schema_ptr schema, reader_permit permit, const std::
         }
         writer.EndArray();
 
-        auto first_key = sstables::key_view(summary.first_key.value).to_partition_key(*schema);
+        auto first_key = dht::decorate_key(*schema, sstables::key_view(summary.first_key.value).to_partition_key(*schema));
         writer.Key("first_key");
         writer.DataKey(*schema, first_key);
 
-        auto last_key = sstables::key_view(summary.last_key.value).to_partition_key(*schema);
+        auto last_key = dht::decorate_key(*schema, sstables::key_view(summary.last_key.value).to_partition_key(*schema));
         writer.Key("last_key");
         writer.DataKey(*schema, last_key);
 
@@ -1005,15 +1186,21 @@ class json_dumper {
     json_writer& _writer;
     sstables::sstable_version_types _version;
     std::function<std::string_view(const void* const)> _name_resolver;
+    std::function<sstring(const void* const, bytes_view)> _disk_string_converter;
+
+public:
+    static sstring default_disk_string_converter(const void* const, bytes_view value) {
+        return sstring(value.begin(), value.end());
+    }
 
 private:
-    void visit(int8_t val) { _writer.Int(val); }
-    void visit(uint8_t val) { _writer.Uint(val); }
-    void visit(int val) { _writer.Int(val); }
-    void visit(unsigned val) { _writer.Uint(val); }
-    void visit(int64_t val) { _writer.Int64(val); }
-    void visit(uint64_t val) { _writer.Uint64(val); }
-    void visit(double val) {
+    void visit(const void* const field, int8_t val) { _writer.Int(val); }
+    void visit(const void* const field, uint8_t val) { _writer.Uint(val); }
+    void visit(const void* const field, int val) { _writer.Int(val); }
+    void visit(const void* const field, unsigned val) { _writer.Uint(val); }
+    void visit(const void* const field, int64_t val) { _writer.Int64(val); }
+    void visit(const void* const field, uint64_t val) { _writer.Uint64(val); }
+    void visit(const void* const field, double val) {
         if (std::isnan(val)) {
             _writer.String("NaN");
         } else {
@@ -1022,42 +1209,42 @@ private:
     }
 
     template <typename Integer>
-    void visit(const sstables::disk_string<Integer>& val) {
-        _writer.String(disk_string_to_string(val));
+    void visit(const void* const field, const sstables::disk_string<Integer>& val) {
+        _writer.String(_disk_string_converter(field, val.value));
     }
 
     template <typename Contents>
-    void visit(const std::optional<Contents>& val) {
+    void visit(const void* const field, const std::optional<Contents>& val) {
         if (bool(val)) {
-            visit(*val);
+            visit(field, *val);
         } else {
             _writer.Null();
         }
     }
 
     template <typename Integer, typename T>
-    void visit(const sstables::disk_array<Integer, T>& val) {
+    void visit(const void* const field, const sstables::disk_array<Integer, T>& val) {
         _writer.StartArray();
         for (const auto& elem : val.elements) {
-            visit(elem);
+            visit(field, elem);
         }
         _writer.EndArray();
     }
 
-    void visit(const sstables::disk_string_vint_size& val) {
-        _writer.String(sstring(val.value.begin(), val.value.end()));
+    void visit(const void* const field, const sstables::disk_string_vint_size& val) {
+        _writer.String(_disk_string_converter(field, val.value));
     }
 
     template <typename T>
-    void visit(const sstables::disk_array_vint_size<T>& val) {
+    void visit(const void* const field, const sstables::disk_array_vint_size<T>& val) {
         _writer.StartArray();
         for (const auto& elem : val.elements) {
-            visit(elem);
+            visit(field, elem);
         }
         _writer.EndArray();
     }
 
-    void visit(const utils::estimated_histogram& val) {
+    void visit(const void* const field, const utils::estimated_histogram& val) {
         _writer.StartArray();
         for (size_t i = 0; i < val.buckets.size(); i++) {
             _writer.StartObject();
@@ -1070,7 +1257,7 @@ private:
         _writer.EndArray();
     }
 
-    void visit(const utils::streaming_histogram& val) {
+    void visit(const void* const field, const utils::streaming_histogram& val) {
         _writer.StartObject();
         for (const auto& [k, v] : val.bin) {
             _writer.Key(format("{}", k));
@@ -1079,7 +1266,7 @@ private:
         _writer.EndObject();
     }
 
-    void visit(const db::replay_position& val) {
+    void visit(const void* const field, const db::replay_position& val) {
         _writer.StartObject();
         _writer.Key("id");
         _writer.Uint64(val.id);
@@ -1088,63 +1275,71 @@ private:
         _writer.EndObject();
     }
 
-    void visit(const sstables::commitlog_interval& val) {
+    void visit(const void* const field, const sstables::commitlog_interval& val) {
         _writer.StartObject();
         _writer.Key("start");
-        visit(val.start);
+        visit(field, val.start);
         _writer.Key("end");
-        visit(val.end);
+        visit(field, val.end);
         _writer.EndObject();
     }
 
-    void visit(const utils::UUID& uuid) {
-        _writer.String(uuid.to_sstring());
+    void visit(const void* const field, const utils::UUID& uuid) {
+        _writer.String(fmt::to_string(uuid));
     }
 
     template <typename Tag>
-    void visit(const utils::tagged_uuid<Tag>& id) {
-        visit(id.uuid());
+    void visit(const void* const field, const utils::tagged_uuid<Tag>& id) {
+        visit(field, id.uuid());
     }
 
     template <typename Integer>
-    void visit(const sstables::vint<Integer>& val) {
-        visit(val.value);
+    void visit(const void* const field, const sstables::vint<Integer>& val) {
+        visit(field, val.value);
     }
 
-    void visit(const sstables::serialization_header::column_desc& val) {
+    void visit(const void* const field, const sstables::serialization_header::column_desc& val) {
         auto prev_name_resolver = std::exchange(_name_resolver, [&val] (const void* const field) {
             if (field == &val.name) { return "name"; }
             else if (field == &val.type_name) { return "type_name"; }
             else { throw std::invalid_argument("invalid field offset"); }
         });
 
+        _writer.StartObject();
         const_cast<sstables::serialization_header::column_desc&>(val).describe_type(_version, std::ref(*this));
+        _writer.EndObject();
 
         _name_resolver = std::move(prev_name_resolver);
     }
 
-    json_dumper(json_writer& writer, sstables::sstable_version_types version, std::function<std::string_view(const void* const)> name_resolver)
-        : _writer(writer), _version(version), _name_resolver(std::move(name_resolver)) {
+    json_dumper(json_writer& writer, sstables::sstable_version_types version, std::function<std::string_view(const void* const)> name_resolver,
+        std::function<sstring(const void* const, bytes_view string)> disk_string_converter)
+        : _writer(writer), _version(version), _name_resolver(std::move(name_resolver)), _disk_string_converter(std::move(disk_string_converter)) {
     }
 
 public:
     template <typename Arg1>
     void operator()(Arg1& arg1) {
         _writer.Key(_name_resolver(&arg1));
-        visit(arg1);
+        visit(&arg1, arg1);
     }
 
     template <typename Arg1, typename... Arg>
     void operator()(Arg1& arg1, Arg&... arg) {
         _writer.Key(_name_resolver(&arg1));
-        visit(arg1);
+        visit(&arg1, arg1);
         (*this)(arg...);
     }
 
     template <typename T>
-    static void dump(json_writer& writer, sstables::sstable_version_types version, const T& obj, std::string_view name,
-            std::function<std::string_view(const void* const)> name_resolver) {
-        json_dumper dumper(writer, version, std::move(name_resolver));
+    static void dump(
+            json_writer& writer,
+            sstables::sstable_version_types version,
+            const T& obj,
+            std::string_view name,
+            std::function<std::string_view(const void* const)> name_resolver,
+            std::function<sstring(const void* const, bytes_view string)> disk_string_converter = &json_dumper::default_disk_string_converter) {
+        json_dumper dumper(writer, version, std::move(name_resolver), std::move(disk_string_converter));
         writer.Key(name);
         writer.StartObject();
         const_cast<T&>(obj).describe_type(version, std::ref(dumper));
@@ -1192,6 +1387,11 @@ void dump_stats_metadata(json_writer& writer, sstables::sstable_version_types ve
         else if (field == &metadata.commitlog_intervals) { return "commitlog_intervals"; }
         else if (field == &metadata.originating_host_id) { return "originating_host_id"; }
         else { throw std::invalid_argument("invalid field offset"); }
+    }, [&metadata] (const void* const field, bytes_view value) {
+        if (field == &metadata.min_column_names || field == &metadata.max_column_names) {
+            return to_hex(value);
+        }
+        return json_dumper::default_disk_string_converter(field, value);
     });
 }
 
@@ -1211,7 +1411,7 @@ void dump_serialization_header(json_writer& writer, sstables::sstable_version_ty
 void dump_statistics_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map&) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
     auto to_string = [] (sstables::metadata_type t) {
@@ -1229,7 +1429,7 @@ void dump_statistics_operation(schema_ptr schema, reader_permit permit, const st
     for (auto& sst : sstables) {
         auto& statistics = sst->get_statistics();
 
-        writer.SstableKey(*sst);
+        writer.Key(sst->get_filename());
         writer.StartObject();
 
         writer.Key("offsets");
@@ -1274,6 +1474,8 @@ const char* to_string(sstables::scylla_metadata_type t) {
         case sstables::scylla_metadata_type::SSTableOrigin: return "sstable_origin";
         case sstables::scylla_metadata_type::ScyllaVersion: return "scylla_version";
         case sstables::scylla_metadata_type::ScyllaBuildId: return "scylla_build_id";
+        case sstables::scylla_metadata_type::ExtTimestampStats: return "ext_timestamp_stats";
+        case sstables::scylla_metadata_type::SSTableIdentifier: return "sstable_identifier";
     }
     std::abort();
 }
@@ -1285,6 +1487,14 @@ const char* to_string(sstables::large_data_type t) {
         case sstables::large_data_type::cell_size: return "cell_size";
         case sstables::large_data_type::rows_in_partition: return "rows_in_partition";
         case sstables::large_data_type::elements_in_collection: return "elements_in_collection";
+    }
+    std::abort();
+}
+
+const char* to_string(sstables::ext_timestamp_stats_type t) {
+    switch (t) {
+        case sstables::ext_timestamp_stats_type::min_live_timestamp: return "min_live_timestamp";
+        case sstables::ext_timestamp_stats_type::min_live_row_marker_timestamp: return "min_live_row_marker_timestamp";
     }
     std::abort();
 }
@@ -1328,6 +1538,7 @@ public:
                 {sstables::sstable_feature::CorrectStaticCompact, "CorrectStaticCompact"},
                 {sstables::sstable_feature::CorrectEmptyCounters, "CorrectEmptyCounters"},
                 {sstables::sstable_feature::CorrectUDTsInCollections, "CorrectUDTsInCollections"},
+                {sstables::sstable_feature::CorrectLastPiBlockWidth, "CorrectLastPiBlockWidth"},
         };
         _writer.StartObject();
         _writer.Key("mask");
@@ -1368,6 +1579,14 @@ public:
         }
         _writer.EndObject();
     }
+    void operator()(const sstables::scylla_metadata::ext_timestamp_stats& val) const {
+        _writer.StartObject();
+        for (const auto& [k, v] : val.map) {
+            _writer.Key(to_string(k));
+            _writer.Int64(v);
+        }
+        _writer.EndObject();
+    }
     template <typename Size>
     void operator()(const sstables::disk_string<Size>& val) const {
         _writer.String(disk_string_to_string(val));
@@ -1378,18 +1597,22 @@ public:
         _writer.Key(to_string(E));
         (*this)(m.value);
     }
+
+    void operator()(const sstables::scylla_metadata::sstable_identifier& sid) const {
+        _writer.AsString(sid.value);
+    }
 };
 
 void dump_scylla_metadata_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map&) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
     json_writer writer;
     writer.StartStream();
     for (auto& sst : sstables) {
-        writer.SstableKey(*sst);
+        writer.Key(sst->get_filename());
         writer.StartObject();
         auto m = sst->get_scylla_metadata();
         if (!m) {
@@ -1407,19 +1630,50 @@ void dump_scylla_metadata_operation(schema_ptr schema, reader_permit permit, con
 void validate_checksums_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map&) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
+    // Collect JSON output and print after validation is done, to prevent
+    // interleaving with error messages from validation.
+    std::stringstream json_output_stream;
+    json_writer writer(json_output_stream);
+    writer.StartStream();
     for (auto& sst : sstables) {
-        const auto valid = sstables::validate_checksums(sst, permit, default_priority_class()).get();
-        sst_log.info("validated the checksums of {}: {}", sst->get_filename(), valid ? "valid" : "invalid");
+        const auto res = sstables::validate_checksums(sst, permit).get();
+        writer.Key(sst->get_filename());
+        writer.StartObject();
+        writer.Key("has_checksums");
+        switch (res.status) {
+        case validate_checksums_status::valid:
+        case validate_checksums_status::invalid:
+            writer.Bool(true);
+            break;
+        case validate_checksums_status::no_checksum:
+            writer.Bool(false);
+        }
+        writer.Key("has_digest");
+        writer.Bool(res.has_digest);
+        switch (res.status) {
+        case validate_checksums_status::valid:
+            writer.Key("valid");
+            writer.Bool(true);
+            break;
+        case validate_checksums_status::invalid:
+            writer.Key("valid");
+            writer.Bool(false);
+            break;
+        case validate_checksums_status::no_checksum:
+        }
+        writer.EndObject();
     }
+    writer.EndStream();
+    fmt::print(std::cout, "{}", json_output_stream.view());
 }
 
 void decompress_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map& vm) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
 
     for (const auto& sst : sstables) {
@@ -1437,7 +1691,7 @@ void decompress_operation(schema_ptr schema, reader_permit permit, const std::ve
         auto ostream = make_file_output_stream(std::move(ofile), options).get();
         auto close_ostream = defer([&ostream] { ostream.close().get(); });
 
-        auto istream = sst->data_stream(0, sst->data_size(), default_priority_class(), permit, nullptr, nullptr);
+        auto istream = sst->data_stream(0, sst->data_size(), permit, nullptr, nullptr);
         auto close_istream = defer([&istream] { istream.close().get(); });
 
         istream.consume([&] (temporary_buffer<char> buf) {
@@ -1605,16 +1859,13 @@ class json_mutation_stream_parser {
         }
 
         std::string stack_to_string() const {
-            return boost::algorithm::join(_state_stack | boost::adaptors::transformed([] (state s) { return std::string(to_string(s)); }), "|");
+            return fmt::to_string(fmt::join(_state_stack | std::views::transform([] (state s) { return to_string(s); }), "|"));
         }
 
-        bool error(const char* msg, auto&&... args) {
-#if FMT_VERSION >= 80000
-            auto parse_error = fmt::format(fmt::runtime(msg), std::forward<decltype(args)>(args)...);
-#else
-            auto parse_error = fmt::format(msg, std::forward<decltype(args)>(args)...);
-#endif
-            sst_log.trace(parse_error.c_str());
+        template<typename... Args>
+        bool error(fmt::format_string<Args...> fmt, Args&&... args) {
+            auto parse_error = fmt::format(fmt, std::forward<Args>(args)...);
+            sst_log.trace("{}", parse_error);
             _queue.abort(std::make_exception_ptr(std::runtime_error(parse_error)));
             return false;
         }
@@ -1630,7 +1881,7 @@ class json_mutation_stream_parser {
                 auto raw = from_hex(*_string);
                 _pkey.emplace(partition_key::from_bytes(raw));
             } catch (...) {
-                return error("failed to parse partition key from raw string: {}", std::current_exception());
+                return error("failed to parse partition key from raw string: {}", fmt::streamed(std::current_exception()));
             }
             return true;
         }
@@ -1640,7 +1891,7 @@ class json_mutation_stream_parser {
                 auto raw = from_hex(*_string);
                 _ckey.emplace(clustering_key::from_bytes(raw));
             } catch (...) {
-                return error("failed to parse clustering key from raw string: {}", std::current_exception());
+                return error("failed to parse clustering key from raw string: {}", fmt::streamed(std::current_exception()));
             }
             return true;
         }
@@ -1993,10 +2244,10 @@ class json_mutation_stream_parser {
             }
             return true;
         }
-        bool unexpected(std::source_location sl = std::source_location::current()) {
+        bool unexpected(seastar::compat::source_location sl = seastar::compat::source_location::current()) {
             return error("unexpected json event {} in state {}", sl.function_name(), stack_to_string());
         }
-        bool unexpected(std::string_view key, std::source_location sl = std::source_location::current()) {
+        bool unexpected(std::string_view key, seastar::compat::source_location sl = seastar::compat::source_location::current()) {
             return error("unexpected json event {}({}) in state {}", sl.function_name(), key, stack_to_string());
         }
     public:
@@ -2284,6 +2535,7 @@ class json_mutation_stream_parser {
     };
 
 private:
+    struct parsing_aborted : public std::exception { };
     class impl {
         queue<mutation_fragment_v2_opt> _queue;
         stream _stream;
@@ -2298,9 +2550,13 @@ private:
             , _handler(std::move(schema), std::move(permit), _queue)
             , _thread([this] { _reader.Parse(_stream, _handler); })
         { }
-        impl(impl&&) = default;
         ~impl() {
-            _thread.join().get();
+            _queue.abort(std::make_exception_ptr(parsing_aborted{}));
+            try {
+                _thread.join().get();
+            } catch (...) {
+                sst_log.warn("json_mutation_stream_parser: parser thread exited with exception: {}", std::current_exception());
+            }
         }
         future<mutation_fragment_v2_opt> operator()() {
             return _queue.pop_eventually().handle_exception([this] (std::exception_ptr e) -> mutation_fragment_v2_opt {
@@ -2321,32 +2577,33 @@ public:
 void write_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& manager, const bpo::variables_map& vm) {
     static const std::vector<std::pair<std::string, mutation_fragment_stream_validation_level>> valid_validation_levels{
+        {"none", mutation_fragment_stream_validation_level::none},
         {"partition_region", mutation_fragment_stream_validation_level::partition_region},
         {"token", mutation_fragment_stream_validation_level::token},
         {"partition_key", mutation_fragment_stream_validation_level::partition_key},
         {"clustering_key", mutation_fragment_stream_validation_level::clustering_key},
     };
     if (!sstables.empty()) {
-        throw std::invalid_argument("error: write operation does not operate on input sstables");
+        throw std::invalid_argument("write operation does not operate on input sstables");
     }
     if (!vm.count("input-file")) {
-        throw std::invalid_argument("error: missing required option '--input-file'");
+        throw std::invalid_argument("missing required option '--input-file'");
     }
     mutation_fragment_stream_validation_level validation_level;
     {
         const auto vl_name = vm["validation-level"].as<std::string>();
-        auto vl_it = boost::find_if(valid_validation_levels, [&vl_name] (const std::pair<std::string, mutation_fragment_stream_validation_level>& v) {
+        auto vl_it = std::ranges::find_if(valid_validation_levels, [&vl_name] (const std::pair<std::string, mutation_fragment_stream_validation_level>& v) {
             return v.first == vl_name;
         });
         if (vl_it == valid_validation_levels.end()) {
-            throw std::invalid_argument(fmt::format("error: invalid validation-level {}", vl_name));
+            throw std::invalid_argument(fmt::format("invalid validation-level {}", vl_name));
         }
         validation_level = vl_it->second;
     }
     auto input_file = vm["input-file"].as<std::string>();
     auto output_dir = vm["output-dir"].as<std::string>();
     if (!vm.count("generation")) {
-        throw std::invalid_argument("error: missing required option '--generation'");
+        throw std::invalid_argument("missing required option '--generation'");
     }
     auto generation = sstables::generation_type(vm["generation"].as<int64_t>());
     auto format = sstables::sstable_format_types::big;
@@ -2355,7 +2612,7 @@ void write_operation(schema_ptr schema, reader_permit permit, const std::vector<
     {
         auto sst_name = sstables::sstable::filename(output_dir, schema->ks_name(), schema->cf_name(), version, generation, format, component_type::Data);
         if (file_exists(sst_name).get()) {
-            throw std::runtime_error(fmt::format("error: cannot create output sstable {}, file already exists", sst_name));
+            throw std::invalid_argument(fmt::format("cannot create output sstable {}, file already exists", sst_name));
         }
     }
 
@@ -2365,7 +2622,8 @@ void write_operation(schema_ptr schema, reader_permit permit, const std::vector<
     auto reader = make_generating_reader_v2(schema, permit, std::move(parser));
     auto writer_cfg = manager.configure_writer("scylla-sstable");
     writer_cfg.validation_level = validation_level;
-    auto sst = manager.make_sstable(schema, output_dir, generation, version, format);
+    auto local = data_dictionary::make_local_options(output_dir);
+    auto sst = manager.make_sstable(schema, local, generation, sstables::sstable_state::normal, version, format);
 
     sst->write_components(std::move(reader), 1, schema, writer_cfg, encoding_stats{}).get();
 }
@@ -2373,18 +2631,18 @@ void write_operation(schema_ptr schema, reader_permit permit, const std::vector<
 void script_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& manager, const bpo::variables_map& vm) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
     const auto merge = vm.count("merge");
     const auto partitions = partition_set(0, {}, decorated_key_equal(*schema));
     if (!vm.count("script-file")) {
-        throw std::invalid_argument("error: missing required option '--script-file'");
+        throw std::invalid_argument("missing required option '--script-file'");
     }
     const auto script_file = vm["script-file"].as<std::string>();
     auto script_params = vm["script-arg"].as<program_options::string_map>();
     auto consumer = make_lua_sstable_consumer(schema, permit, script_file, std::move(script_params)).get();
     consumer->consume_stream_start().get();
-    consume_sstables(schema, permit, sstables, merge, false, [&, &consumer = *consumer] (flat_mutation_reader_v2& rd, sstables::sstable* sst) {
+    consume_sstables(schema, permit, sstables, merge, false, [&, &consumer = *consumer] (mutation_reader& rd, sstables::sstable* sst) {
         return consume_reader(std::move(rd), consumer, sst, partitions, false);
     });
     consumer->consume_stream_end().get();
@@ -2394,87 +2652,140 @@ template <typename SstableConsumer>
 void sstable_consumer_operation(schema_ptr schema, reader_permit permit, const std::vector<sstables::shared_sstable>& sstables,
         sstables::sstables_manager& sst_man, const bpo::variables_map& vm) {
     if (sstables.empty()) {
-        throw std::runtime_error("error: no sstables specified on the command line");
+        throw std::invalid_argument("no sstables specified on the command line");
     }
     const auto merge = vm.count("merge");
     const auto no_skips = vm.count("no-skips");
     const auto partitions = get_partitions(schema, vm);
-    const auto use_crawling_reader = no_skips || partitions.empty();
+    const auto use_full_scan_reader = no_skips || partitions.empty();
     auto consumer = std::make_unique<SstableConsumer>(schema, permit, vm);
     consumer->consume_stream_start().get();
-    consume_sstables(schema, permit, sstables, merge, use_crawling_reader, [&, &consumer = *consumer] (flat_mutation_reader_v2& rd, sstables::sstable* sst) {
+    consume_sstables(schema, permit, sstables, merge, use_full_scan_reader, [&, &consumer = *consumer] (mutation_reader& rd, sstables::sstable* sst) {
         return consume_reader(std::move(rd), consumer, sst, partitions, no_skips);
     });
     consumer->consume_stream_end().get();
 }
 
-class basic_option {
-public:
-    const char* name;
-    const char* description;
+void shard_of_with_vnodes(const std::vector<sstables::shared_sstable>& sstables,
+                          sstables::sstables_manager& sstable_manager,
+                          const bpo::variables_map& vm) {
+    if (!vm.count("shards")) {
+        throw std::invalid_argument("missing required option '--shards'");
+    }
+    unsigned shard_count = vm["shards"].as<unsigned>();
+    unsigned ignore_msb_bits = vm["ignore-msb-bits"].as<unsigned>();
 
-public:
-    basic_option(const char* name, const char* description) : name(name), description(description) { }
+    json_writer writer;
+    writer.StartStream();
+    for (auto& sst : sstables) {
+        // sst was loaded with the smp::count as its shard_count but that's not
+        // necessarily identical to the "shards" specified in the command line.
+        // reload the sst with the specified shard_count and ignore_msb_bits
+        auto schema = schema_builder(sst->get_schema()).with_sharder(
+            shard_count, ignore_msb_bits).build();
+        auto new_sst = sstable_manager.make_sstable(
+            schema,
+            data_dictionary::make_local_options(fs::path(sst->get_storage().prefix())),
+            sst->generation(),
+            sstable_state::normal,
+            sst->get_version());
+        new_sst->load_owner_shards(schema->get_sharder()).get();
 
-    virtual void add_option(bpo::options_description& opts) const = 0;
-};
-
-template <typename T = std::monostate>
-class typed_option : public basic_option {
-    std::optional<T> _default_value;
-
-    virtual void add_option(bpo::options_description& opts) const override {
-        if (_default_value) {
-            opts.add_options()(name, bpo::value<T>()->default_value(*_default_value), description);
-        } else {
-            opts.add_options()(name, bpo::value<T>(), description);
+        writer.Key(sst->get_filename());
+        writer.StartArray();
+        for (unsigned shard_id : new_sst->get_shards_for_this_sstable()) {
+            writer.Uint(shard_id);
         }
+        writer.EndArray();
     }
+    writer.EndStream();
+}
 
-public:
-    typed_option(const char* name, const char* description) : basic_option(name, description) { }
-    typed_option(const char* name, T default_value, const char* description) : basic_option(name, description), _default_value(std::move(default_value)) { }
-};
+void shard_of_with_tablets(schema_ptr schema,
+                           const std::vector<sstables::shared_sstable>& sstables,
+                           std::filesystem::path data_dir_path,
+                           sstables::sstables_manager& sstable_manager,
+                           reader_permit permit) {
+    auto& dbcfg = sstable_manager.config();
+    auto tablets = tools::load_system_tablets(dbcfg, data_dir_path,
+                                              schema->ks_name(), schema->cf_name(),
+                                              permit).get();
+    json_writer writer;
+    writer.StartStream();
+    for (auto& sst : sstables) {
+        writer.Key(sst->get_filename());
+        writer.StartArray();
 
-template <>
-class typed_option<std::monostate> : public basic_option {
-    virtual void add_option(bpo::options_description& opts) const override {
-        opts.add_options()(name, description);
+        // token ranges are distributed across tablets, so we just check for
+        // the token range of each sstable
+        auto first_token = sst->get_first_decorated_key().token();
+        auto last_token = sst->get_last_decorated_key().token();
+        // each tablet holds a range of (last_token(i-1), last_token(i)], where
+        // "last_token" is the value of the column with the same name in
+        // the "system.tablets" table, and "i" is the index of current tablet.
+        auto tablet = tablets.upper_bound(first_token);
+        if (auto last_tablet = tablets.lower_bound(last_token); tablet != last_tablet) {
+            fmt::print(std::cerr, "sstable spans across multiple tablets\n");
+        }
+        if (tablet == tablets.end()) {
+            fmt::print(std::cerr, "unable to find replica set for sstable: {}\n", sst->get_filename());
+            continue;
+        }
+        auto& [token, replica_set] = *tablet;
+        for (auto& replica : replica_set) {
+            writer.StartObject();
+            writer.Key("host");
+            writer.String(fmt::to_string(replica.host));
+            writer.Key("shard");
+            writer.Uint(replica.shard);
+            writer.EndObject();
+        }
+
+        writer.EndArray();
     }
-public:
-    typed_option(const char* name, const char* description) : basic_option(name, description) { }
+    writer.EndStream();
+}
+
+void shard_of_operation(schema_ptr schema, reader_permit permit,
+                        const std::vector<sstables::shared_sstable>& sstables,
+                        sstables::sstables_manager& sstable_manager,
+                        const bpo::variables_map& vm) {
+    // uses "tablets" by default. as new scylla installations enable "tablet" by
+    // default
+    if (vm.count("tablets") && vm.count("vnodes")) {
+        throw std::invalid_argument("--tablets and --vnodes are mutually exclusive");
+    }
+    if (!vm.count("tablets") && !vm.count("vnodes")) {
+        throw std::invalid_argument("Please specify '--tablets' or '--vnodes'");
+    }
+    if (vm.count("vnodes")) {
+        shard_of_with_vnodes(sstables, sstable_manager, vm);
+    } else {
+        auto info = extract_from_sstable_path(vm);
+        shard_of_with_tablets(schema, sstables, info.data_dir_path, sstable_manager, permit);
+    }
+}
+
+const std::vector<operation_option> global_options {
+    typed_option<sstring>("schema-file", "schema.cql", "use the file containing the schema description as the schema source"),
+    typed_option<sstring>("keyspace", "keyspace name"),
+    typed_option<sstring>("table", "table name"),
+    typed_option<>("system-schema", "the table designated by --keyspace and --table is a system table, use the hard-coded in-memory hard-coded schema as the schema source"),
+    typed_option<>("schema-tables", "use the schema-tables as the schema source (see --scylla-yaml-file and --scylla-data-dir)"
+            ", the name of the table can be provided with --keyspace and --table or left to auto-detect if possible"),
+    typed_option<>("sstable-schema", "use the schema stored in the sstable itself as the schema source"),
+    typed_option<sstring>("scylla-yaml-file", "path to the scylla.yaml config file, to obtain the data directory path from,"
+            " this can be also provided directly with --scylla-data-dir"),
+    typed_option<sstring>("scylla-data-dir", "path to the scylla data dir (usually /var/lib/scylla/data), to read the schema tables from"),
 };
 
-class option {
-    shared_ptr<basic_option> _opt; // need copy to support convenient range declaration of std::vector<option>
-
-public:
-    template <typename T>
-    option(typed_option<T> opt) : _opt(make_shared<typed_option<T>>(std::move(opt))) { }
-
-    const char* name() const { return _opt->name; }
-    const char* description() const { return _opt->description; }
-    void add_option(bpo::options_description& opts) const { _opt->add_option(opts); }
+const std::vector<operation_option> global_positional_options{
+    typed_option<std::vector<sstring>>("sstables", "sstable(s) to process for operations that have sstable inputs, can also be provided as positional arguments", -1),
 };
 
-const std::vector<option> all_options {
-    typed_option<std::vector<sstring>>("partition", "partition(s) to filter for, partitions are expected to be in the hex format"),
-    typed_option<sstring>("partitions-file", "file containing partition(s) to filter for, partitions are expected to be in the hex format"),
-    typed_option<>("merge", "merge all sstables into a single mutation fragment stream (use a combining reader over all sstable readers)"),
-    typed_option<>("no-skips", "don't use skips to skip to next partition when the partition filter rejects one, this is slower but works with corrupt index"),
-    typed_option<std::string>("bucket", "months", "the unit of time to use as bucket, one of (years, months, weeks, days, hours)"),
-    typed_option<std::string>("output-format", "json", "the output-format, one of (text, json)"),
-    typed_option<std::string>("input-file", "the file containing the input"),
-    typed_option<std::string>("output-dir", ".", "directory to place the output files to"),
-    typed_option<int64_t>("generation", "generation of generated sstable"),
-    typed_option<std::string>("validation-level", "clustering_key", "degree of validation on the output, one of (partition_region, token, partition_key, clustering_key)"),
-    typed_option<std::string>("script-file", "script file to load and execute"),
-    typed_option<program_options::string_map>("script-arg", {}, "parameter(s) for the script"),
-};
-
-const std::vector<operation> operations{
+const std::map<operation, operation_func> operations_with_func{
 /* dump-data */
-    {"dump-data",
+    {{"dump-data",
             "Dump content of sstable(s)",
 R"(
 Dump the content of the data component. This component contains the data-proper
@@ -2491,10 +2802,16 @@ printers, which are also used when logging mutation-related data structures.
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-data
 for more information on this operation, including the schema of the JSON output.
 )",
-            {"partition", "partitions-file", "merge", "no-skips", "output-format"},
+            {
+                    typed_option<std::vector<sstring>>("partition", "partition(s) to filter for, partitions are expected to be in the hex format"),
+                    typed_option<sstring>("partitions-file", "file containing partition(s) to filter for, partitions are expected to be in the hex format"),
+                    typed_option<>("merge", "merge all sstables into a single mutation fragment stream (use a combining reader over all sstable readers)"),
+                    typed_option<>("no-skips", "don't use skips to skip to next partition when the partition filter rejects one, this is slower but works with corrupt index"),
+                    typed_option<std::string>("output-format", "json", "the output-format, one of (text, json)"),
+            }},
             sstable_consumer_operation<dumping_consumer>},
 /* dump-index */
-    {"dump-index",
+    {{"dump-index",
             "Dump content of sstable index(es)",
 R"(
 Dump the content of the index component. Contains the partition-index of the data
@@ -2506,10 +2823,10 @@ data.
 
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-index
 for more information on this operation, including the schema of the JSON output.
-)",
+)"},
             dump_index_operation},
 /* dump-compression-info */
-    {"dump-compression-info",
+    {{"dump-compression-info",
             "Dump content of sstable compression info(s)",
 R"(
 Dump the content of the compression-info component. Contains compression
@@ -2520,10 +2837,10 @@ to be decompressed.
 
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-compression-info
 for more information on this operation, including the schema of the JSON output.
-)",
+)"},
             dump_compression_info_operation},
 /* dump-summary */
-    {"dump-summary",
+    {{"dump-summary",
             "Dump content of sstable summary(es)",
 R"(
 Dump the content of the summary component. The summary is a sampled index of the
@@ -2534,10 +2851,10 @@ sstables.
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-summary
 for more information on this operation, including the schema of the JSON output.
 
-)",
+)"},
             dump_summary_operation},
 /* dump-statistics */
-    {"dump-statistics",
+    {{"dump-statistics",
             "Dump content of sstable statistics(s)",
 R"(
 Dump the content of the statistics component. Contains various metadata about the
@@ -2546,10 +2863,10 @@ the data component.
 
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-statistics
 for more information on this operation, including the schema of the JSON output.
-)",
+)"},
             dump_statistics_operation},
 /* dump-scylla-metadata */
-    {"dump-scylla-metadata",
+    {{"dump-scylla-metadata",
             "Dump content of sstable scylla metadata(s)",
 R"(
 Dump the content of the scylla-metadata component. Contains scylla-specific
@@ -2558,10 +2875,10 @@ produced by Apache Cassandra.
 
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#dump-scylla-metadata
 for more information on this operation, including the schema of the JSON output.
-)",
+)"},
             dump_scylla_metadata_operation},
 /* writetime-histogram */
-    {"writetime-histogram",
+    {{"writetime-histogram",
             "Generate a histogram of all the timestamps (writetime)",
 R"(
 Crawl over all timestamps in the data component and add them to a histogram. The
@@ -2601,10 +2918,10 @@ following example python script:
 
      plt.show()
 )",
-            {"bucket"},
+            {typed_option<std::string>("bucket", "months", "the unit of time to use as bucket, one of (years, months, weeks, days, hours)")}},
             sstable_consumer_operation<writetime_histogram_collecting_consumer>},
 /* validate */
-    {"validate",
+    {{"validate",
             "Validate the sstable(s), same as scrub in validate mode",
 R"(
 Validates the content of the sstable on the mutation-fragment level, see
@@ -2615,20 +2932,45 @@ validation will happen on the fragment level.
 
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#validate
 for more information on this operation.
-)",
-            {"merge"},
+)"},
             validate_operation},
-    {"validate-checksums",
+/* scrub */
+    {{"scrub",
+            "Scrub the sstable(s), in the specified mode",
+R"(
+Read and re-write the sstable, getting rid of or fixing broken parts, depending
+on the selected mode.
+Output sstables are written to the directory specified via `--output-directory`.
+They will be written with the BIG format and the highest supported sstable
+format, with generations chosen by scylla-sstable. Generations are chosen such
+that they are unique between the sstables written by the current scrub.
+The output directory is expected to be empty, if it isn't scylla-sstable will
+abort the scrub. This can be overridden by the
+`--unsafe-accept-nonempty-output-dir` command line flag, but note that scrub will
+be aborted if an sstable cannot be written because its generation clashes with
+pre-existing sstables in the directory.
+
+See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#scrub
+for more information on this operation, including what the different modes do.
+)",
+            {
+                    typed_option<std::string>("scrub-mode", "scrub mode to use, one of (abort, skip, segregate, validate)"),
+                    typed_option<std::string>("output-dir", ".", "directory to place the scrubbed sstables to"),
+                    typed_option<>("unsafe-accept-nonempty-output-dir", "allow the operation to write into a non-empty output directory, acknowledging the risk that this may result in sstable clash"),
+            }},
+            scrub_operation},
+/* validate-checksums */
+    {{"validate-checksums",
             "Validate the checksums of the sstable(s)",
 R"(
-Validate both the whole-file and the per-chunk checksums checksums of the data
-component.
+Validate both the whole-file and the per-chunk checksums of the data component.
 
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#validate-checksums
 for more information on this operation.
-)",
+)"},
             validate_checksums_operation},
-    {"decompress",
+/* decompress */
+    {{"decompress",
             "Decompress sstable(s)",
 R"(
 Decompress Data.db if compressed. Noop if not compressed. The decompressed data
@@ -2639,9 +2981,10 @@ is written to Data.db.decompressed. E.g. for an sstable:
 the output will be:
 
     md-12311-big-Data.db.decompressed
-)",
+)"},
             decompress_operation},
-    {"write",
+/* write */
+    {{"write",
             "Write an sstable",
 R"(
 Write an sstable based on a JSON representation of the content. The JSON
@@ -2666,9 +3009,15 @@ output sstable clashes with an existing sstable, the write will fail.
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#write
 for more information on this operation, including the schema of the JSON input.
 )",
-            {"input-file", "output-dir", "generation", "validation-level"},
+            {
+                    typed_option<std::string>("input-file", "the file containing the input"),
+                    typed_option<std::string>("output-dir", ".", "directory to place the output sstable(s) to"),
+                    typed_option<sstables::generation_type::int_t>("generation", "generation of generated sstable"),
+                    typed_option<std::string>("validation-level", "clustering_key", "degree of validation on the output, one of (partition_region, token, partition_key, clustering_key)"),
+            }},
             write_operation},
-    {"script",
+/* script */
+    {{"script",
             "Run a script on content of an sstable",
 R"(
 Read the sstable(s) and pass the resulting fragment stream to the script
@@ -2677,8 +3026,23 @@ specified by `--script-file`. Currently only Lua scripts are supported.
 See https://docs.scylladb.com/operating-scylla/admin-tools/scylla-sstable#script
 for more information on this operation, including the API documentation.
 )",
-            {"merge", "script-file", "script-arg"},
+            {
+                typed_option<>("merge", "merge all sstables into a single mutation fragment stream (use a combining reader over all sstable readers)"),
+                typed_option<std::string>("script-file", "script file to load and execute"),
+                typed_option<program_options::string_map>("script-arg", {}, "parameter(s) for the script"),
+            }},
             script_operation},
+/* shard-of */
+    {{"shard-of",
+            "Print out the shard which 'owns' the sstable",
+            "Print out the intersection(s) of the shard-ranges and the partition ranges",
+            {
+                typed_option<unsigned>("shards", "the number of shards the source scylla instance has"),
+                typed_option<unsigned>("ignore-msb-bits", 12u, "'murmur3_partitioner_ignore_msb_bits' set by scylla.yaml"),
+                typed_option<>("tablets", "assume that tokens are distributed with tablets"),
+                typed_option<>("vnodes", "assume that tokens are distributed with vnodes"),
+            }},
+            shard_of_operation},
 };
 
 } // anonymous namespace
@@ -2686,16 +3050,8 @@ for more information on this operation, including the API documentation.
 namespace tools {
 
 int scylla_sstable_main(int argc, char** argv) {
-    const operation* found_op = nullptr;
-    if (std::strcmp(argv[1], "--help") != 0 && std::strcmp(argv[1], "-h") != 0) {
-        found_op = &tools::utils::get_selected_operation(argc, argv, operations, "operation");
-    }
-
-    app_template::seastar_options app_cfg;
-    app_cfg.name = app_name;
-
-    const auto description_template =
-R"(scylla-sstable - a multifunctional command-line tool to examine the content of sstables.
+    constexpr auto description_template =
+R"(scylla-{} - a multifunctional command-line tool to examine the content of sstables.
 
 Usage: scylla sstable {{operation}} [--option1] [--option2] ... [{{sstable_path1}}] [{{sstable_path2}}] ...
 
@@ -2728,14 +3084,18 @@ To be able to interpret the sstables, their schema is required. There
 are multiple ways to obtain the schema:
 * system schema
 * schema file
+* schema tables
+* schema from the sstable itself
 
 ## System schema
 
 If the examined sstables belong to a system table, whose schema is
-hardcoded in scylla (and thus known), it is enough to provide just
-the name of said table in the `keyspace.table` notation, via the
-`--system-schema` command line option. The table has to be from one of
-the following system keyspaces:
+hardcoded in ScyllaDB (and thus known), it is enough to provide just
+the name of said table via the --keyspace and --table command line
+parameters. Alternatively, the keyspace and tablename can be deduced from
+the path of the sstable, if the sstable is in its natural directory, in
+ScyllaDB's data dir.
+The table has to be from one of the following system keyspaces:
 * system
 * system_schema
 * system_distributed
@@ -2765,6 +3125,25 @@ In general you should be able to use the output of `DESCRIBE TABLE` or
 the relevant parts of `DESCRIBE KEYSPACE` of `cqlsh` as well as the
 `schema.cql` produced by snapshots.
 
+## schema tables
+
+The schema can be read from the schema tables located on disk.
+The path to the data directory can be provided via multiple ways:
+* autodetected from the sstable's path -- if the sstable(s) are located in their
+  native table directory.
+* --scylla-data-dir
+* --scylla-yaml-file -- the scylla.yaml contains the data directory path(s).
+* The SCYLLA_HOME and/or SCYLLA_CONF environment variables. These allow locating
+  the scylla.yaml file.
+
+This is the most complete method, which should always result in a complete schema.
+
+## schema from the sstable itself
+
+The sstable stores a basic schema in the statistics component, which can be used
+for most operations on the sstable. This schema should be enough for all dump-
+operations.
+
 # Examples
 
 Dump the content of the sstable:
@@ -2782,85 +3161,130 @@ $ scylla sstable validate /path/to/md-123456-big-Data.db /path/to/md-123457-big-
 
 )";
 
-    if (found_op) {
-        app_cfg.description = format("{}\n\n{}\n", found_op->summary(), found_op->description());
-    } else  {
-        app_cfg.description = format(description_template, app_name, boost::algorithm::join(operations | boost::adaptors::transformed([] (const auto& op) {
-            return format("* {}: {}", op.name(), op.summary());
-        }), "\n"));
-    }
+    const auto operations = operations_with_func | std::views::keys | std::ranges::to<std::vector>();
+    tool_app_template::config app_cfg{
+            .name = app_name,
+            .description = seastar::format(description_template, app_name, sst_log.name(), fmt::join(operations | std::views::transform([] (const auto& op) {
+                return seastar::format("* {}: {}", op.name(), op.summary());
+            }), "\n")),
+            .logger_name = sst_log.name(),
+            .lsa_segment_pool_backend_size_mb = 100,
+            .operations = std::move(operations),
+            .global_options = &global_options,
+            .global_positional_options = &global_positional_options,
+            .db_cfg_ext = db_config_and_extensions()
+    };
+    tool_app_template app(std::move(app_cfg));
 
-    tools::utils::configure_tool_mode(app_cfg, sst_log.name());
+    return app.run_async(argc, argv, [&app] (const operation& operation, const bpo::variables_map& app_config) {
+        schema_ptr schema;
+        std::optional<schema_with_source> schema_with_source;
 
-    app_template app(std::move(app_cfg));
+        auto& dbcfg = *app.cfg().db_cfg_ext->db_cfg;
 
-    app.add_options()
-        ("schema-file", bpo::value<sstring>()->default_value("schema.cql"), "file containing the schema description")
-        ("system-schema", bpo::value<sstring>(), "table has to be a system table, name has to be in `keyspace.table` notation")
-        ;
-    app.add_positional_options({
-        {"sstables", bpo::value<std::vector<sstring>>(), "sstable(s) to process for operations that have sstable inputs, can also be provided as positional arguments", -1},
-    });
+        sstring scylla_yaml_path;
+        sstring scylla_yaml_path_source;
 
-    if (found_op) {
-        bpo::options_description op_desc(found_op->name());
-        for (const auto& opt_name : found_op->available_options()) {
-            auto it = std::find_if(all_options.begin(), all_options.end(), [&] (const option& opt) { return opt.name() == opt_name; });
-            assert(it != all_options.end());
-            it->add_option(op_desc);
+        if (app_config.count("scylla-yaml-file")) {
+            scylla_yaml_path = app_config["scylla-yaml-file"].as<sstring>();
+            scylla_yaml_path_source = "user provided";
+        } else if (std::getenv("SCYLLA_CONF") || std::getenv("SCYLLA_HOME")) {
+            scylla_yaml_path = db::config::get_conf_sub("scylla.yaml").string();
+            scylla_yaml_path_source = "environment provided";
+        } else {
+            scylla_yaml_path = db::config::get_conf_sub("scylla.yaml").string();
+            scylla_yaml_path_source = "dev default";
+
+            // On production machines, the default of ./conf/scylla.yaml will not
+            // work, try /etc/scylla/scylla.yaml instead.
+            if (!file_exists(scylla_yaml_path).get()) {
+                scylla_yaml_path = "/etc/scylla/scylla.yaml";
+                scylla_yaml_path_source = "prod default";
+            }
         }
-        if (!found_op->available_options().empty()) {
-            app.get_options_description().add(op_desc);
+
+        if (file_exists(scylla_yaml_path).get()) {
+            dbcfg.read_from_file(scylla_yaml_path, [] (const sstring& opt, const sstring& msg, std::optional<::utils::config_file::value_status> status) {
+                sst_log.debug("error processing configuration item: {} : {}", msg, opt);
+            }).get();
+            dbcfg.setup_directories();
+            sst_log.debug("Successfully read scylla.yaml from {} location of {}", scylla_yaml_path_source, scylla_yaml_path);
+        } else {
+            dbcfg.experimental_features.set(db::experimental_features_t::all());
+            sst_log.debug("Failed to read scylla.yaml from {} location of {}, some functionality may be unavailable", scylla_yaml_path_source, scylla_yaml_path);
         }
-    }
 
-    return app.run(argc, argv, [&app, found_op] {
-        return async([&app, found_op] {
-            logalloc::use_standard_allocator_segment_pool_backend(100 * 1024 * 1024).get();
+        dbcfg.enable_cache(false);
+        dbcfg.volatile_system_keyspace_for_testing(true);
 
-            auto& app_config = app.configuration();
+        {
+            unsigned schema_sources = 0;
+            schema_sources += !app_config["schema-file"].defaulted();
+            schema_sources += app_config.contains("system-schema");
+            schema_sources += app_config.contains("schema-tables");
+            schema_sources += app_config.contains("sstable-schema");
 
-            const auto& operation = *found_op;
+            if (!schema_sources) {
+                sst_log.debug("No user-provided schema source, attempting to auto-detect it");
+                schema_with_source = try_load_schema_autodetect(app_config, dbcfg);
+            } else if (schema_sources == 1) {
+                sst_log.debug("Single schema source provided");
+                schema_with_source = try_load_schema_from_user_provided_source(app_config, dbcfg);
+            } else {
+                fmt::print(std::cerr, "Multiple schema sources provided, please provide exactly one of: --schema-file, --system-schema, --schema-tables or --sstable-schema (with the accompanying --keyspace and --table if necessary)\n");
+            }
+        }
+        if (schema_with_source) {
+            schema = std::move(schema_with_source->schema);
+            sst_log.debug("Succesfully loaded schema from {}{}, obtained from {}",
+                    schema_with_source->source,
+                    schema_with_source->path ? seastar::format(" ({})", schema_with_source->path->native()) : "",
+                    schema_with_source->obtained_from);
+            sst_log.trace("Loaded schema: {}", schema);
+        } else {
+            return 1;
+        }
 
-            schema_ptr schema;
-            std::string schema_source_opt;
-            try {
-                if (auto it = app_config.find("system-schema"); it != app_config.end()) {
-                    schema_source_opt = "system-schema";
-                    std::vector<sstring> comps;
-                    boost::split(comps, app_config["system-schema"].as<sstring>(), boost::is_any_of("."));
-                    schema = tools::load_system_schema(comps.at(0), comps.at(1));
-                } else {
-                    schema_source_opt = "schema-file";
-                    schema = tools::load_one_schema_from_file(std::filesystem::path(app_config["schema-file"].as<sstring>())).get();
-                }
-            } catch (...) {
-                fmt::print(std::cerr, "error: could not load {} '{}': {}\n", schema_source_opt, app_config[schema_source_opt].as<sstring>(), std::current_exception());
+        gms::feature_service feature_service(gms::feature_config_from_db_config(dbcfg));
+        cache_tracker tracker;
+        sstables::directory_semaphore dir_sem(1);
+        abort_source abort;
+        sstables::sstables_manager sst_man("scylla_sstable", large_data_handler, dbcfg, feature_service, tracker,
+            memory::stats().total_memory(), dir_sem,
+            [host_id = locator::host_id::create_random_id()] { return host_id; }, abort);
+        auto close_sst_man = deferred_close(sst_man);
+
+        std::vector<sstables::shared_sstable> sstables;
+        if (app_config.count("sstables")) {
+            const auto sstable_names = app_config["sstables"].as<std::vector<sstring>>();
+            if (std::set(sstable_names.begin(), sstable_names.end()).size() != sstable_names.size()) {
+                fmt::print(std::cerr, "error processing arguments: duplicate sstable arguments found\n");
                 return 1;
             }
-
-            db::config dbcfg;
-            gms::feature_service feature_service(gms::feature_config_from_db_config(dbcfg));
-            cache_tracker tracker;
-            dbcfg.host_id = locator::host_id::create_random_id();
-            sstables::directory_semaphore dir_sem(1);
-            sstables::sstables_manager sst_man(large_data_handler, dbcfg, feature_service, tracker, memory::stats().total_memory(), dir_sem);
-            auto close_sst_man = deferred_close(sst_man);
-
-            std::vector<sstables::shared_sstable> sstables;
-            if (app_config.count("sstables")) {
-                sstables = load_sstables(schema, sst_man, app_config["sstables"].as<std::vector<sstring>>());
+            try {
+                sstables = load_sstables(schema, sst_man, sstable_names);
+            } catch (...) {
+                fmt::print(std::cerr, "error loading sstables: {}\n", std::current_exception());
+                return 1;
             }
+        }
 
-            reader_concurrency_semaphore rcs_sem(reader_concurrency_semaphore::no_limits{}, app_name);
-            auto stop_semaphore = deferred_stop(rcs_sem);
+        reader_concurrency_semaphore rcs_sem(reader_concurrency_semaphore::no_limits{}, app_name, reader_concurrency_semaphore::register_metrics::no);
+        auto stop_semaphore = deferred_stop(rcs_sem);
 
-            const auto permit = rcs_sem.make_tracking_only_permit(schema.get(), app_name, db::no_timeout);
+        const auto permit = rcs_sem.make_tracking_only_permit(schema, app_name, db::no_timeout, {});
 
-            operation(schema, permit, sstables, sst_man, app_config);
+        try {
+            operations_with_func.at(operation)(schema, permit, sstables, sst_man, app_config);
+        } catch (std::invalid_argument& e) {
+            fmt::print(std::cerr, "error processing arguments: {}\n", e.what());
+            return 1;
+        } catch (...) {
+            fmt::print(std::cerr, "error running operation: {}\n", std::current_exception());
+            return 2;
+        }
 
-            return 0;
-        });
+        return 0;
     });
 }
 

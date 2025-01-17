@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 #include "service/raft/group0_fwd.hh"
@@ -110,7 +110,7 @@ public:
     std::optional<peer_list> request(const peer_list& peers);
 
     // Submit a reply from one of the peers to this discovery
-    // state machine. If this node is a leader, resposne is
+    // state machine. If this node is a leader, response is
     // ignored.
     void response(discovery_peer from, const peer_list& peers);
 

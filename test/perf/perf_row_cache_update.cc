@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/distributed.hh>
@@ -16,11 +16,12 @@
 #include "utils/logalloc.hh"
 #include "utils/UUID_gen.hh"
 #include "row_cache.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "schema/schema_builder.hh"
 #include "readers/combined.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "replica/memtable.hh"
+#include "dht/i_partitioner.hh"
 #include "test/perf/perf.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 
@@ -268,7 +269,7 @@ namespace perf {
 
 int scylla_row_cache_update_main(int argc, char** argv) {
     app_template app;
-    return app.run(argc, argv, [&app] {
+    return app.run(argc, argv, [] {
         return seastar::async([&] {
             engine().at_exit([] {
                 cancelled = true;

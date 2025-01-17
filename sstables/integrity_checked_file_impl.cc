@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "integrity_checked_file_impl.hh"
 #include <seastar/core/do_with.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <boost/algorithm/cxx11/all_of.hpp>
+#include "bytes.hh"
 
 namespace sstables {
 
@@ -41,7 +42,7 @@ static sstring report_zeroed_4k_aligned_blocks(const temporary_buffer<int8_t>& b
 }
 
 future<size_t>
-integrity_checked_file_impl::write_dma(uint64_t pos, const void* buffer, size_t len, const io_priority_class& pc) {
+integrity_checked_file_impl::write_dma(uint64_t pos, const void* buffer, size_t len, io_intent* intent) {
     auto wbuf = temporary_buffer<int8_t>(static_cast<const int8_t*>(buffer), len);
 
     auto ret = report_zeroed_4k_aligned_blocks(wbuf);
@@ -50,8 +51,8 @@ integrity_checked_file_impl::write_dma(uint64_t pos, const void* buffer, size_t 
             "reason: 4k block(s) zeroed, follow their offsets: {}", _fname, len, pos, ret);
     }
 
-    return get_file_impl(_file)->write_dma(pos, buffer, len, pc)
-            .then([this, pos, wbuf = std::move(wbuf), buffer = static_cast<const int8_t*>(buffer), len, &pc] (size_t ret) mutable {
+    return get_file_impl(_file)->write_dma(pos, buffer, len, intent)
+            .then([this, pos, wbuf = std::move(wbuf), buffer = static_cast<const int8_t*>(buffer), len, intent] (size_t ret) mutable {
         if (ret != len) {
             sstlog.error("integrity check failed for {}, stage: after write finished, write: {} bytes to offset {}, " \
                 "reason: only {} bytes were written.", _fname, len, pos, ret);
@@ -72,14 +73,14 @@ integrity_checked_file_impl::write_dma(uint64_t pos, const void* buffer, size_t 
             return make_ready_future<size_t>(ret);
         }
 
-        return _file.dma_read_exactly<int8_t>(pos, len, pc).then([this, pos, wbuf = std::move(wbuf), len, ret] (auto rbuf) mutable {
+        return _file.dma_read_exactly<int8_t>(pos, len, intent).then([this, pos, wbuf = std::move(wbuf), len, ret] (auto rbuf) mutable {
             if (rbuf.size() != len) {
                 sstlog.error("integrity check failed for {}, stage: read after write finished, write: {} bytes to offset {}, " \
                     "reason: only able to read {} bytes for further verification", _fname, len, pos, rbuf.size());
             }
 
             auto rbuf_end = rbuf.get() + rbuf.size();
-            auto r = std::mismatch(rbuf.get(), rbuf.get() + rbuf.size(), wbuf.get(), wbuf.get() + wbuf.size());
+            auto r = std::mismatch(rbuf.get(), rbuf_end, wbuf.get(), wbuf.get() + wbuf.size());
             if (r.first != rbuf_end) {
                 auto mismatch_off = r.first - rbuf.get();
 
@@ -96,9 +97,9 @@ integrity_checked_file_impl::write_dma(uint64_t pos, const void* buffer, size_t 
 }
 
 future<size_t>
-integrity_checked_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc) {
+integrity_checked_file_impl::write_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) {
     // TODO: check integrity before and after file_impl::write_dma() like write_dma() above.
-    return get_file_impl(_file)->write_dma(pos, iov, pc);
+    return get_file_impl(_file)->write_dma(pos, iov, intent);
 }
 
 inline file make_integrity_checked_file(std::string_view name, file f) {

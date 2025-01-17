@@ -3,14 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 
 #include <seastar/core/shared_ptr.hh>
-#include "types.hh"
+#include <fmt/ostream.h>
+#include "types/types.hh"
 #include "schema/schema.hh"
 
 #include <optional>
@@ -88,18 +89,9 @@ public:
         throw no_value(column_name);
     }
     const std::unordered_map<sstring, non_null_data_value>& cells() const { return _cells; }
-    friend inline bool operator==(const result_set_row& x, const result_set_row& y);
-    friend inline bool operator!=(const result_set_row& x, const result_set_row& y);
+    friend inline bool operator==(const result_set_row& x, const result_set_row& y) = default;
     friend std::ostream& operator<<(std::ostream& out, const result_set_row& row);
 };
-
-inline bool operator==(const result_set_row& x, const result_set_row& y) {
-    return x._schema == y._schema && x._cells == y._cells;
-}
-
-inline bool operator!=(const result_set_row& x, const result_set_row& y) {
-    return !(x == y);
-}
 
 // Result set is an in-memory representation of query results in
 // deserialized format. To obtain a result set, use the result_set_builder
@@ -138,3 +130,6 @@ inline bool operator==(const result_set& x, const result_set& y) {
 }
 
 }
+
+template <> struct fmt::formatter<query::result_set> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<query::result_set_row> : fmt::ostream_formatter {};

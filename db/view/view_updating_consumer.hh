@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "dht/i_partitioner.hh"
 #include "schema/schema_fwd.hh"
 #include "mutation/mutation_fragment.hh"
 #include "sstables/shared_sstable.hh"
@@ -24,6 +23,8 @@ class evictable_reader_handle_v2;
 
 namespace db::view {
 
+class view_update_generator;
+
 /*
  * A consumer that pushes materialized view updates for each consumed mutation.
  * It is expected to be run in seastar::async threaded context through consume_in_thread()
@@ -33,8 +34,17 @@ public:
     // We prefer flushing on partition boundaries, so at the end of a partition,
     // we flush on reaching the soft limit. Otherwise we continue accumulating
     // data. We flush mid-partition if we reach the hard limit.
-    static const size_t buffer_size_soft_limit;
-    static const size_t buffer_size_hard_limit;
+    static constexpr size_t buffer_size_soft_limit_default = 1 * 1024 * 1024;
+    static constexpr size_t buffer_size_hard_limit_default = 2 * 1024 * 1024;
+private:
+    size_t _buffer_size_soft_limit = buffer_size_soft_limit_default;
+    size_t _buffer_size_hard_limit = buffer_size_hard_limit_default;
+public:
+    // Meant only for usage in tests.
+    void set_buffer_size_limit_for_testing_purposes(size_t sz) {
+        _buffer_size_soft_limit = sz;
+        _buffer_size_hard_limit = sz;
+    }
 
 private:
     schema_ptr _schema;
@@ -49,6 +59,7 @@ private:
 private:
     void do_flush_buffer();
     void flush_builder();
+    void end_builder();
     void maybe_flush_buffer_mid_partition();
 
 public:
@@ -62,7 +73,7 @@ public:
             , _view_update_pusher(std::move(view_update_pusher))
     { }
 
-    view_updating_consumer(schema_ptr schema, reader_permit permit, replica::table& table, std::vector<sstables::shared_sstable> excluded_sstables, const seastar::abort_source& as,
+    view_updating_consumer(view_update_generator& gen, schema_ptr schema, reader_permit permit, replica::table& table, std::vector<sstables::shared_sstable> excluded_sstables, const seastar::abort_source& as,
             evictable_reader_handle_v2& staging_reader_handle);
 
     view_updating_consumer(view_updating_consumer&&) = default;
@@ -71,7 +82,11 @@ public:
 
     void consume_new_partition(const dht::decorated_key& dk) {
         _mut_builder.emplace(_schema);
-        _mut_builder->consume_new_partition(dk);
+        // Further accounting is inaccurate as we base it on the consumed
+        // mutation-fragments, not on their final form in the mutation.
+        // This is good enough, as long as the difference is small and mostly
+        // constant (per fragment).
+        _buffer_size += _mut_builder->consume_new_partition(dk).memory_usage(*_schema);
     }
 
     void consume(tombstone t) {
@@ -113,8 +128,8 @@ public:
         if (_as->abort_requested()) {
             return stop_iteration::yes;
         }
-        flush_builder();
-        if (_buffer_size >= buffer_size_soft_limit) {
+        end_builder();
+        if (_buffer_size >= _buffer_size_soft_limit) {
             do_flush_buffer();
         }
         return stop_iteration::no;

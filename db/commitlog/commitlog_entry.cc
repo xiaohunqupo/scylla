@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "counters.hh"
@@ -30,14 +30,14 @@ void commitlog_entry_writer::compute_size() {
     _size = ms.size();
 }
 
-void commitlog_entry_writer::write(typename seastar::memory_output_stream<std::vector<temporary_buffer<char>>::iterator>& out) const {
+void commitlog_entry_writer::write(ostream& out) const {
     serialize(out);
 }
 
 commitlog_entry_reader::commitlog_entry_reader(const fragmented_temporary_buffer& buffer)
     : _ce([&] {
     auto in = seastar::fragmented_memory_input_stream(fragmented_temporary_buffer::view(buffer).begin(), buffer.size_bytes());
-    return ser::deserialize(in, boost::type<commitlog_entry>());
+    return ser::deserialize(in, std::type_identity<commitlog_entry>());
 }())
 {
 }

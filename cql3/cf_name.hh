@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -14,7 +14,7 @@
 
 namespace cql3 {
 
-class cf_name : public keyspace_element_name {
+class cf_name final : public keyspace_element_name {
     sstring _cf_name = "";
 public:
     void set_column_family(const sstring& cf, bool keep_case);
@@ -23,12 +23,5 @@ public:
 
     virtual sstring to_string() const override;
 };
-
-inline
-std::ostream&
-operator<<(std::ostream& os, const cf_name& n) {
-    os << n.to_string();
-    return os;
-}
 
 }

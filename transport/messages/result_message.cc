@@ -4,11 +4,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "result_message.hh"
-#include <seastar/core/print.hh>
+#include "cql3/cql_statement.hh"
+#include <seastar/core/format.hh>
+#include <fmt/std.h>
 
 namespace cql_transport::messages {
 
@@ -32,11 +34,6 @@ std::ostream& operator<<(std::ostream& os, const result_message::set_keyspace& m
     return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const result_message::prepared::thrift& msg) {
-    fmt::print(os, "{{result_message::prepared::thrift {:d}}}", msg.get_id());
-    return os;
-}
-
 std::ostream& operator<<(std::ostream& os, const result_message::prepared::cql& msg) {
     fmt::print(os, "{{result_message::prepared::cql {}}}", to_hex(msg.get_id()));
     return os;
@@ -48,29 +45,6 @@ std::ostream& operator<<(std::ostream& os, const result_message::schema_change& 
     return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const result_message::rows& msg) {
-    os << "{result_message::rows ";
-    struct visitor {
-        std::ostream& _os;
-        void start_row() { _os << "{row: "; }
-        void accept_value(std::optional<query::result_bytes_view> value) {
-            if (!value) {
-                _os << " null";
-                return;
-            }
-            _os << " ";
-            using boost::range::for_each;
-            for_each(*value, [this] (bytes_view fragment) {
-                _os << fragment;
-            });
-        }
-        void end_row() { _os << "}"; }
-    };
-    msg.rs().visit(visitor { os });
-    os << "}";
-    return os;
-}
-
 std::ostream& operator<<(std::ostream& os, const result_message& msg) {
     class visitor : public result_message::visitor {
         std::ostream& _os;
@@ -79,9 +53,8 @@ std::ostream& operator<<(std::ostream& os, const result_message& msg) {
         void visit(const result_message::void_message& m) override { _os << m; };
         void visit(const result_message::set_keyspace& m) override { _os << m; };
         void visit(const result_message::prepared::cql& m) override { _os << m; };
-        void visit(const result_message::prepared::thrift& m) override { _os << m; };
         void visit(const result_message::schema_change& m) override { _os << m; };
-        void visit(const result_message::rows& m) override { _os << m; };
+        void visit(const result_message::rows& m) override { fmt::print(_os, "{}", m); };
         void visit(const result_message::bounce_to_shard& m) override { _os << m; };
         void visit(const result_message::exception& m) override { _os << m; };
     };
@@ -94,4 +67,48 @@ void result_message::visitor_base::visit(const result_message::exception& ex) {
     ex.throw_me();
 }
 
+result_message::prepared::prepared(cql3::statements::prepared_statement::checked_weak_ptr prepared, bool support_lwt_opt)
+        : _prepared(std::move(prepared))
+        , _metadata(
+            _prepared->bound_names,
+            _prepared->partition_key_bind_indices,
+            support_lwt_opt ? _prepared->statement->is_conditional() : false)
+        , _result_metadata{extract_result_metadata(_prepared->statement)}
+{
+}
+
+::shared_ptr<const cql3::metadata> result_message::prepared::extract_result_metadata(::shared_ptr<cql3::cql_statement> statement) {
+    return statement->get_result_metadata();
+}
+
+}
+
+auto
+fmt::formatter<cql_transport::messages::result_message::rows>::format(
+    const cql_transport::messages::result_message::rows& msg,
+    fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    using out_t = decltype(ctx.out());
+    out_t out = ctx.out();
+    out = fmt::format_to(out, "{{result_message::rows ");
+    struct visitor {
+        out_t& _os;
+        void start_row() {
+            _os = fmt::format_to(_os, "{{row: ");
+        }
+        void accept_value(managed_bytes_view_opt value) {
+            if (!value) {
+                _os = fmt::format_to(_os, " null");
+                return;
+            }
+            _os = fmt::format_to(_os, " ");
+            for (auto fragment : fragment_range(*value)) {
+                _os = fmt::format_to(_os, "{}", fmt_hex(fragment));
+            }
+        }
+        void end_row() {
+            _os = fmt::format_to(_os, "}}");
+        }
+    };
+    msg.rs().visit(visitor { out });
+    return fmt::format_to(out, "}}");
 }

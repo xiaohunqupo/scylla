@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2023-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 """
 Test snapshot transfer by forcing threshold and performing schema changes
@@ -27,7 +27,8 @@ async def test_snapshot(manager, random_tables):
     server_a, server_b, server_c = await manager.running_servers()
     await manager.mark_dirty()
     # Reduce the snapshot thresholds
-    errs = [inject_error_one_shot(manager.api, s.ip_addr, 'raft_server_snapshot_reduce_threshold')
+    errs = [inject_error_one_shot(manager.api, s.ip_addr, "raft_server_set_snapshot_thresholds",
+                                  parameters={'snapshot_threshold': '3', 'snapshot_trailing': '1'})
             for s in [server_a, server_b, server_c]]
     await asyncio.gather(*errs)
 
@@ -47,7 +48,7 @@ async def test_snapshot(manager, random_tables):
     logger.info("Driver connecting to D %s", server_d)
     await manager.driver_connect()
 
-    await random_tables.verify_schema()
+    await random_tables.verify_schema(do_read_barrier=False)
 
     # Start servers to have quorum for post-test checkup
     # TODO: remove once there's a way to disable post-test checkup

@@ -3,22 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <seastar/core/io_priority_class.hh>
-#include <seastar/util/noncopyable_function.hh>
-
-#include "feed_writers.hh"
+#include "readers/mutation_reader.hh"
 
 namespace mutation_writer {
 
 struct segregate_config {
-    // For flushing the memtable which does the in-memory segregation (sorting)
-    // part.
-    const io_priority_class& pc;
     // Maximum amount of memory to be used by the in-memory segregation
     // (sorting) structures. Partitions can be split across partitions
     size_t max_memory;
@@ -31,6 +25,6 @@ struct segregate_config {
 // streams that honor it.
 // This is useful for scrub compaction to split sstables containing out-of-order
 // and/or duplicate partitions into sstables that honor the partition ordering.
-future<> segregate_by_partition(flat_mutation_reader_v2 producer, segregate_config cfg, reader_consumer_v2 consumer);
+future<> segregate_by_partition(mutation_reader producer, segregate_config cfg, reader_consumer_v2 consumer);
 
 } // namespace mutation_writer

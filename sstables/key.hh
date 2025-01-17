@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,7 +13,7 @@
 #include "replica/database_fwd.hh"
 #include "keys.hh"
 #include "compound_compat.hh"
-#include "dht/i_partitioner.hh"
+#include "dht/token.hh"
 
 namespace sstables {
 
@@ -29,18 +29,13 @@ public:
         return ::with_linearized(_bytes, func);
     }
 
-    std::vector<bytes_view> explode(const schema& s) const {
+    partition_key to_partition_key(const schema& s) const {
         return with_linearized([&] (bytes_view v) {
-            return composite_view(v, s.partition_key_size() > 1).explode();
+            return partition_key::from_exploded_view(composite_view(v, s.partition_key_size() > 1).explode());
         });
     }
 
-    partition_key to_partition_key(const schema& s) const {
-        return partition_key::from_exploded_view(explode(s));
-    }
-
-    bool operator==(const key_view& k) const { return k._bytes == _bytes; }
-    bool operator!=(const key_view& k) const { return !(k == *this); }
+    bool operator==(const key_view& k) const = default;
 
     bool empty() const { return _bytes.empty(); }
 
@@ -51,7 +46,7 @@ public:
     std::strong_ordering tri_compare(const schema& s, partition_key_view other) const {
         return with_linearized([&] (bytes_view v) {
             auto lf = other.legacy_form(s);
-            return lexicographical_tri_compare(
+            return std::lexicographical_compare_three_way(
                     v.begin(), v.end(), lf.begin(), lf.end(),
                     [](uint8_t b1, uint8_t b2) { return  b1 <=> b2; });
         });

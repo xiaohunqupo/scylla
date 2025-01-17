@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "schema/schema_fwd.hh"
 #include "query-request.hh"
-#include "partition_slice_builder.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/partition_version.hh"
 #include "tracing/tracing.hh"
@@ -25,7 +25,7 @@ namespace cache {
 class autoupdating_underlying_reader final {
     row_cache& _cache;
     read_context& _read_context;
-    flat_mutation_reader_v2_opt _reader;
+    mutation_reader_opt _reader;
     utils::phased_barrier::phase_type _reader_creation_phase = 0;
     dht::partition_range _range = { };
     std::optional<dht::decorated_key> _last_key;
@@ -74,7 +74,7 @@ public:
         }
         auto mfopt = co_await (*_reader)();
         if (mfopt) {
-            assert(mfopt->is_partition_start());
+            SCYLLA_ASSERT(mfopt->is_partition_start());
             _new_last_key = mfopt->as_partition_start().key();
         }
         co_return std::move(mfopt);
@@ -109,7 +109,7 @@ public:
     const dht::partition_range& range() const {
         return _range;
     }
-    flat_mutation_reader_v2& underlying() { return *_reader; }
+    mutation_reader& underlying() { return *_reader; }
     dht::ring_position_view population_range_start() const {
         return _last_key ? dht::ring_position_view::for_after_key(*_last_key)
                          : dht::ring_position_view::for_range_start(_range);
@@ -122,11 +122,10 @@ class read_context final : public enable_lw_shared_from_this<read_context> {
     reader_permit _permit;
     const dht::partition_range& _range;
     const query::partition_slice& _slice;
-    std::optional<query::partition_slice> _native_slice;
-    const io_priority_class& _pc;
     tracing::trace_state_ptr _trace_state;
     mutation_reader::forwarding _fwd_mr;
     bool _range_query;
+    const tombstone_gc_state* _tombstone_gc_state;
     // When reader enters a partition, it must be set up for reading that
     // partition from the underlying mutation source (_underlying) in one of two ways:
     //
@@ -149,7 +148,7 @@ public:
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            const io_priority_class& pc,
+            const tombstone_gc_state* gc_state,
             tracing::trace_state_ptr trace_state,
             mutation_reader::forwarding fwd_mr)
         : _cache(cache)
@@ -157,15 +156,12 @@ public:
         , _permit(std::move(permit))
         , _range(range)
         , _slice(slice)
-        , _pc(pc)
         , _trace_state(std::move(trace_state))
         , _fwd_mr(fwd_mr)
         , _range_query(!query::is_single_partition(range))
+        , _tombstone_gc_state(gc_state)
         , _underlying(_cache, *this)
     {
-        if (_slice.options.contains(query::partition_slice::option::reversed)) {
-            _native_slice = query::legacy_reverse_slice_to_native_reverse_slice(*_schema, _slice);
-        }
         ++_cache._tracker._stats.reads;
         if (!_range_query) {
             _key = range.start()->value().as_decorated_key();
@@ -186,10 +182,9 @@ public:
     reader_permit permit() const { return _permit; }
     const dht::partition_range& range() const { return _range; }
     const query::partition_slice& slice() const { return _slice; }
-    bool is_reversed() const { return _slice.options.contains(query::partition_slice::option::reversed); }
+    bool is_reversed() const { return _slice.is_reversed(); }
     // Returns a slice in the native format (for reversed reads, in native-reversed format).
-    const query::partition_slice& native_slice() const { return is_reversed() ? *_native_slice : _slice; }
-    const io_priority_class& pc() const { return _pc; }
+    const query::partition_slice& native_slice() const { return _slice; }
     tracing::trace_state_ptr trace_state() const { return _trace_state; }
     mutation_reader::forwarding fwd_mr() const { return _fwd_mr; }
     bool is_range_query() const { return _range_query; }
@@ -199,6 +194,7 @@ public:
     bool partition_exists() const { return _partition_exists; }
     void on_underlying_created() { ++_underlying_created; }
     bool digest_requested() const { return _slice.options.contains<query::partition_slice::option::with_digest>(); }
+    const tombstone_gc_state* tombstone_gc_state() const { return _tombstone_gc_state; }
 public:
     future<> ensure_underlying() {
         if (_underlying_snapshot) {

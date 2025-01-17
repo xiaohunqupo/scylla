@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "cql3/expr/expression.hh"
+#include "cql3/expr/evaluate.hh"
 #include "cql3/query_options.hh"
 #include "cql3/selection/selection.hh"
 #include "data_dictionary/data_dictionary.hh"
@@ -29,7 +30,7 @@ raw_value make_tinyint_raw(int8_t val);
 raw_value make_smallint_raw(int16_t val);
 raw_value make_int_raw(int32_t val);
 raw_value make_bigint_raw(int64_t val);
-raw_value make_text_raw(const sstring_view& text);
+raw_value make_text_raw(const std::string_view& text);
 raw_value make_float_raw(float val);
 raw_value make_double_raw(double val);
 
@@ -39,7 +40,7 @@ constant make_tinyint_const(int8_t val);
 constant make_smallint_const(int16_t val);
 constant make_int_const(int32_t val);
 constant make_bigint_const(int64_t val);
-constant make_text_const(const sstring_view& text);
+constant make_text_const(const std::string_view& text);
 constant make_float_const(float val);
 constant make_double_const(double val);
 
@@ -101,7 +102,7 @@ collection_constructor make_map_constructor(const std::vector<std::pair<expressi
                                             data_type key_type,
                                             data_type element_type);
 tuple_constructor make_tuple_constructor(std::vector<expression> elements, std::vector<data_type> element_types);
-usertype_constructor make_usertype_constructor(std::vector<std::pair<sstring_view, constant>> field_values);
+usertype_constructor make_usertype_constructor(std::vector<std::pair<std::string_view, constant>> field_values);
 
 ::lw_shared_ptr<column_specification> make_receiver(data_type receiver_type, sstring name = "receiver_name");
 
@@ -113,8 +114,26 @@ struct evaluation_inputs_data {
     std::vector<managed_bytes_opt> static_and_regular_columns;
     ::shared_ptr<selection::selection> selection;
     query_options options;
+    std::vector<api::timestamp_type> timestamps;
+    std::vector<int32_t> ttls;
 };
-using column_values = std::map<sstring, raw_value>;
+
+struct mutation_column_value {
+    mutation_column_value(cql3::raw_value v, api::timestamp_type ts, int32_t ttl)
+        : value(std::move(v)), timestamp(ts), ttl(ttl) {}
+    // Convenience constructor when timestamp/ttl are not interesting
+    mutation_column_value(cql3::raw_value v)
+            : value(std::move(v))
+            , timestamp(value.is_null() ? api::missing_timestamp : 12345)
+            , ttl(-1) {
+    }
+
+    cql3::raw_value value;
+    api::timestamp_type timestamp;
+    int32_t ttl;
+};
+
+using column_values = std::map<sstring, mutation_column_value>;
 
 // Creates evaluation_inputs that can be used to evaluate columns and bind variables using evaluate()
 std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evaluation_inputs(
@@ -128,6 +147,14 @@ std::pair<data_dictionary::database, std::unique_ptr<data_dictionary::impl>> mak
 
 raw_value evaluate_with_bind_variables(const expression& e, std::vector<raw_value> bind_variable_values);
 
+
 }  // namespace test_utils
 }  // namespace expr
 }  // namespace cql3
+
+template <> struct fmt::formatter<cql3::expr::test_utils::mutation_column_value> : fmt::formatter<string_view> {
+    auto format(const cql3::expr::test_utils::mutation_column_value& mcv, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}/ts={}/ttl={}}}", mcv.value, mcv.timestamp, mcv.ttl);
+
+    }
+};

@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "expr_test_utils.hh"
+#include <fmt/ranges.h>
 
 namespace cql3 {
 namespace expr {
@@ -52,7 +53,7 @@ raw_value make_bigint_raw(int64_t val) {
     return make_raw(val);
 }
 
-raw_value make_text_raw(const sstring_view& text) {
+raw_value make_text_raw(const std::string_view& text) {
     return raw_value::make_value(utf8_type->decompose(text));
 }
 
@@ -94,7 +95,7 @@ constant make_bigint_const(int64_t val) {
     return make_const(val);
 }
 
-constant make_text_const(const sstring_view& text) {
+constant make_text_const(const std::string_view& text) {
     return constant(make_text_raw(text), utf8_type);
 }
 
@@ -352,7 +353,7 @@ tuple_constructor make_tuple_constructor(std::vector<expression> elements, std::
                              .type = tuple_type_impl::get_instance(std::move(element_types))};
 }
 
-usertype_constructor make_usertype_constructor(std::vector<std::pair<sstring_view, constant>> field_values) {
+usertype_constructor make_usertype_constructor(std::vector<std::pair<std::string_view, constant>> field_values) {
     usertype_constructor::elements_map_type elements_map;
     std::vector<bytes> field_names;
     std::vector<data_type> field_types;
@@ -375,14 +376,14 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
     const schema_ptr& table_schema,
     const column_values& column_vals,
     const std::vector<raw_value>& bind_marker_values) {
-    auto throw_error = [&](const auto&... fmt_args) -> sstring {
-        sstring error_msg = format(fmt_args...);
-        sstring final_msg = format("make_evaluation_inputs error: {}. (table_schema: {}, column_vals: {})", error_msg,
+    auto throw_error = [&]<typename... Args>(fmt::format_string<Args...> fmt, Args&&... args) -> sstring {
+        sstring error_msg = seastar::format(fmt, std::forward<Args>(args)...);
+        sstring final_msg = seastar::format("make_evaluation_inputs error: {}. (table_schema: {}, column_vals: {})", error_msg,
                                    *table_schema, column_vals);
         throw std::runtime_error(final_msg);
     };
 
-    auto get_col_val = [&](const column_definition& col) -> const raw_value& {
+    auto get_col_val = [&](const column_definition& col) -> const mutation_column_value& {
         auto col_value_iter = column_vals.find(col.name_as_text());
         if (col_value_iter == column_vals.end()) {
             throw_error("no value for column {}", col.name_as_text());
@@ -392,7 +393,7 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
 
     std::vector<bytes> partition_key;
     for (const column_definition& pk_col : table_schema->partition_key_columns()) {
-        const raw_value& col_value = get_col_val(pk_col);
+        const raw_value& col_value = get_col_val(pk_col).value;
 
         if (col_value.is_null()) {
             throw_error("Passed NULL as value for {}. This is not allowed for partition key columns.",
@@ -403,7 +404,7 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
 
     std::vector<bytes> clustering_key;
     for (const column_definition& ck_col : table_schema->clustering_key_columns()) {
-        const raw_value& col_value = get_col_val(ck_col);
+        const raw_value& col_value = get_col_val(ck_col).value;
 
         if (col_value.is_null()) {
             throw_error("Passed NULL as value for {}. This is not allowed for clustering key columns.",
@@ -424,17 +425,25 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
         cql3::selection::selection::for_columns(table_schema, std::move(selection_columns));
     std::vector<managed_bytes_opt> static_and_regular_columns(table_schema->regular_columns_count() +
                                                               table_schema->static_columns_count());
+    std::vector<api::timestamp_type> static_and_regular_column_timestamps(static_and_regular_columns.size());
+    std::vector<int32_t> static_and_regular_column_ttls(static_and_regular_columns.size());
 
     for (const column_definition& col : table_schema->regular_columns()) {
-        const raw_value& col_value = get_col_val(col);
+        auto& mut_value = get_col_val(col);
+        const raw_value& col_value = mut_value.value;
         int32_t index = selection->index_of(col);
         static_and_regular_columns[index] = raw_value(col_value).to_managed_bytes_opt();
+        static_and_regular_column_timestamps[index] = mut_value.timestamp;
+        static_and_regular_column_ttls[index] = mut_value.ttl;
     }
 
     for (const column_definition& col : table_schema->static_columns()) {
-        const raw_value& col_value = get_col_val(col);
+        auto& mut_value = get_col_val(col);
+        const raw_value& col_value = mut_value.value;
         int32_t index = selection->index_of(col);
         static_and_regular_columns[index] = raw_value(col_value).to_managed_bytes_opt();
+        static_and_regular_column_timestamps[index] = mut_value.timestamp;
+        static_and_regular_column_ttls[index] = mut_value.ttl;
     }
 
     query_options options(default_cql_config, db::consistency_level::ONE, std::nullopt, bind_marker_values, true,
@@ -445,13 +454,18 @@ std::pair<evaluation_inputs, std::unique_ptr<evaluation_inputs_data>> make_evalu
                                .clustering_key = std::move(clustering_key),
                                .static_and_regular_columns = std::move(static_and_regular_columns),
                                .selection = std::move(selection),
-                               .options = std::move(options)});
+                               .options = std::move(options),
+                               .timestamps = std::move(static_and_regular_column_timestamps),
+                               .ttls = std::move(static_and_regular_column_ttls)});
 
-    evaluation_inputs inputs{.partition_key = &data->partition_key,
-                             .clustering_key = &data->clustering_key,
-                             .static_and_regular_columns = &data->static_and_regular_columns,
+    evaluation_inputs inputs{.partition_key = data->partition_key,
+                             .clustering_key = data->clustering_key,
+                             .static_and_regular_columns = data->static_and_regular_columns,
                              .selection = data->selection.get(),
-                             .options = &data->options};
+                             .options = &data->options,
+                             .static_and_regular_timestamps = data->timestamps,
+                             .static_and_regular_ttls = data->ttls,
+                             };
 
     return std::pair(std::move(inputs), std::move(data));
 }
@@ -472,6 +486,11 @@ evaluate_with_bind_variables(const expression& e, std::vector<raw_value> paramet
 // A mock implementation of data_dictionary::database, used in tests
 class mock_database_impl : public data_dictionary::impl {
     schema_ptr _table_schema;
+    // we cannot set _table_views here, as _table_schema is not necessarily
+    // a view. but if a test calls get_table_views(), the test guarantees
+    // that the _table_schema is a view, so we set _table_views is the accsseor
+    // instead.
+    mutable std::vector<view_ptr> _table_views;
     ::lw_shared_ptr<data_dictionary::keyspace_metadata> _keyspace_metadata;
 
     db::config _config;
@@ -479,16 +498,21 @@ class mock_database_impl : public data_dictionary::impl {
 public:
     explicit mock_database_impl(schema_ptr table_schema)
         : _table_schema(table_schema),
-          _keyspace_metadata(data_dictionary::keyspace_metadata::new_keyspace(_table_schema->ks_name(),
+          _keyspace_metadata(make_lw_shared<data_dictionary::keyspace_metadata>(_table_schema->ks_name(),
                                                                               "MockReplicationStrategy",
-                                                                              {},
+                                                                              locator::replication_strategy_config_options{},
+                                                                              std::nullopt,
                                                                               false,
-                                                                              {_table_schema})) {}
+                                                                              std::vector<schema_ptr>({_table_schema}))) {}
 
     static std::pair<data_dictionary::database, std::unique_ptr<mock_database_impl>> make(schema_ptr table_schema) {
         std::unique_ptr<mock_database_impl> mock_db = std::make_unique<mock_database_impl>(table_schema);
         data_dictionary::database db = make_database(mock_db.get(), nullptr);
         return std::pair(std::move(db), std::move(mock_db));
+    }
+
+    virtual const table_schema_version& get_version(data_dictionary::database db) const override {
+        throw std::bad_function_call();
     }
 
     virtual std::optional<data_dictionary::keyspace> try_find_keyspace(data_dictionary::database db,
@@ -540,7 +564,8 @@ public:
         throw std::bad_function_call();
     }
     virtual const std::vector<view_ptr>& get_table_views(data_dictionary::table t) const override {
-        return {view_ptr(_table_schema)};
+        _table_views = std::vector{view_ptr(_table_schema)};
+        return _table_views;
     }
     virtual sstring get_available_index_name(data_dictionary::database db,
                                              std::string_view ks_name,
@@ -570,6 +595,9 @@ public:
     }
     virtual replica::database& real_database(data_dictionary::database db) const override {
         throw std::bad_function_call();
+    }
+    virtual replica::database* real_database_ptr(data_dictionary::database db) const override {
+        return nullptr;
     }
 
     virtual ~mock_database_impl() = default;

@@ -1,7 +1,7 @@
 #
 # Copyright (C) 2022-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 import random
 import string
@@ -58,8 +58,7 @@ class ConditionType(enum.Enum):
     EXISTING_KEY_FAIL = enum.auto()
     NEW_KEY = enum.auto()
 
-@pytest.mark.asyncio
-async def test_broadcast_kv_store(cql) -> None:
+def test_broadcast_kv_store(cql) -> None:
     seed = random.randint(0, 2 ** 64)
     print(f"Seed: {seed}")
     random.seed(seed)

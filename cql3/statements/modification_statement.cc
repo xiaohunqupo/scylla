@@ -5,28 +5,26 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/cql_statement.hh"
-#include "types/map.hh"
 #include "cql3/statements/modification_statement.hh"
 #include "cql3/statements/strongly_consistent_modification_statement.hh"
 #include "cql3/statements/raw/modification_statement.hh"
 #include "cql3/statements/prepared_statement.hh"
+#include "cql3/expr/expr-utils.hh"
+#include "cql3/expr/evaluate.hh"
 #include "cql3/util.hh"
 #include "validation.hh"
 #include "db/consistency_level_validations.hh"
+#include <optional>
 #include <seastar/core/shared_ptr.hh>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/indirected.hpp>
-#include "db/config.hh"
 #include "transport/messages/result_message.hh"
 #include "data_dictionary/data_dictionary.hh"
+#include "replica/database.hh"
 #include <seastar/core/execution_stage.hh>
-#include "utils/UUID_gen.hh"
-#include "partition_slice_builder.hh"
 #include "cas_request.hh"
 #include "cql3/query_processor.hh"
 #include "service/storage_proxy.hh"
@@ -67,6 +65,8 @@ modification_statement::modification_statement(statement_type type_, uint32_t bo
     , _ks_sel(::is_internal_keyspace(schema_->ks_name()) ? ks_selector::SYSTEM : ks_selector::NONSYSTEM)
 { }
 
+modification_statement::~modification_statement() = default;
+
 uint32_t modification_statement::get_bound_terms() const {
     return _bound_terms;
 }
@@ -95,26 +95,24 @@ bool modification_statement::is_timestamp_set() const {
     return attrs->is_timestamp_set();
 }
 
-gc_clock::duration modification_statement::get_time_to_live(const query_options& options) const {
-    return gc_clock::duration(attrs->get_time_to_live(options));
+std::optional<gc_clock::duration> modification_statement::get_time_to_live(const query_options& options) const {
+    std::optional<int32_t> ttl = attrs->get_time_to_live(options);
+    return ttl ? std::make_optional<gc_clock::duration>(*ttl) : std::nullopt;
 }
 
 future<> modification_statement::check_access(query_processor& qp, const service::client_state& state) const {
-    const data_dictionary::database db = qp.db();
-    auto f = state.has_column_family_access(db, keyspace(), column_family(), auth::permission::MODIFY);
+    auto f = state.has_column_family_access(keyspace(), column_family(), auth::permission::MODIFY);
     if (has_conditions()) {
-        f = f.then([this, &state, db] {
-           return state.has_column_family_access(db, keyspace(), column_family(), auth::permission::SELECT);
+        f = f.then([this, &state] {
+           return state.has_column_family_access(keyspace(), column_family(), auth::permission::SELECT);
         });
     }
     return f;
 }
 
 future<std::vector<mutation>>
-modification_statement::get_mutations(query_processor& qp, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, service::query_state& qs) const {
+modification_statement::get_mutations(query_processor& qp, const query_options& options, db::timeout_clock::time_point timeout, bool local, int64_t now, service::query_state& qs, json_cache_opt& json_cache, std::vector<dht::partition_range> keys) const {
     auto cl = options.get_consistency();
-    auto json_cache = maybe_prepare_json_cache(options);
-    auto keys = build_partition_keys(options, json_cache);
     auto ranges = create_clustering_ranges(options, json_cache);
     auto f = make_ready_future<update_parameters::prefetch_data>(s);
 
@@ -182,7 +180,7 @@ bool modification_statement::applies_to(const selection::selection* selection,
     });
 
     auto inputs = expr::evaluation_inputs{
-        .static_and_regular_columns = static_and_regular_columns,
+        .static_and_regular_columns = *static_and_regular_columns,
         .selection = selection,
         .options = &options,
     };
@@ -247,19 +245,21 @@ static thread_local inheriting_concrete_execution_stage<
         const query_options&> modify_stage{"cql3_modification", modification_statement_executor::get()};
 
 future<::shared_ptr<cql_transport::messages::result_message>>
-modification_statement::execute(query_processor& qp, service::query_state& qs, const query_options& options) const {
-    return execute_without_checking_exception_message(qp, qs, options)
+modification_statement::execute(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const {
+    return execute_without_checking_exception_message(qp, qs, options, std::move(guard))
             .then(cql_transport::messages::propagate_exception_as_future<shared_ptr<cql_transport::messages::result_message>>);
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
-modification_statement::execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options) const {
+modification_statement::execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const {
     cql3::util::validate_timestamp(qp.db().get_config(), options, attrs);
     return modify_stage(this, seastar::ref(qp), seastar::ref(qs), seastar::cref(options));
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
 modification_statement::do_execute(query_processor& qp, service::query_state& qs, const query_options& options) const {
+    (void)validation::validate_column_family(qp.db(), keyspace(), column_family());
+
     tracing::add_table_name(qs.get_trace_state(), keyspace(), column_family());
 
     inc_cql_stats(qs.get_client_state().is_internal());
@@ -267,24 +267,44 @@ modification_statement::do_execute(query_processor& qp, service::query_state& qs
     _restrictions->validate_primary_key(options);
 
     if (has_conditions()) {
-        return execute_with_condition(qp, qs, options);
+        co_return co_await execute_with_condition(qp, qs, options);
     }
 
-    return execute_without_condition(qp, qs, options).then([] (coordinator_result<> res) {
-        if (!res) {
-            return make_ready_future<::shared_ptr<cql_transport::messages::result_message>>(
-                    seastar::make_shared<cql_transport::messages::result_message::exception>(std::move(res).assume_error()));
+    json_cache_opt json_cache = maybe_prepare_json_cache(options);
+    std::vector<dht::partition_range> keys = build_partition_keys(options, json_cache);
+
+    bool keys_size_one = keys.size() == 1;
+    auto token = dht::token();
+    if (keys_size_one) {
+        token = keys[0].start()->value().token();
+    } 
+
+    auto res = co_await execute_without_condition(qp, qs, options, json_cache, std::move(keys));
+    
+    if (!res) {
+        co_return seastar::make_shared<cql_transport::messages::result_message::exception>(std::move(res).assume_error());
+    }
+
+    auto result = seastar::make_shared<cql_transport::messages::result_message::void_message>();
+    if (keys_size_one) {
+        auto&& table = s->table();
+        if (_may_use_token_aware_routing && table.uses_tablets() && qs.get_client_state().is_protocol_extension_set(cql_transport::cql_protocol_extension::TABLETS_ROUTING_V1)) {
+            auto erm = table.get_effective_replication_map();
+            auto tablet_info = erm->check_locality(token);
+            if (tablet_info.has_value()) {
+                result->add_tablet_info(tablet_info->tablet_replicas, tablet_info->token_range);
+            }
         }
-        return make_ready_future<::shared_ptr<cql_transport::messages::result_message>>(
-                ::shared_ptr<cql_transport::messages::result_message>{});
-    });
+    }
+
+    co_return std::move(result);
 }
 
 future<coordinator_result<>>
-modification_statement::execute_without_condition(query_processor& qp, service::query_state& qs, const query_options& options) const {
+modification_statement::execute_without_condition(query_processor& qp, service::query_state& qs, const query_options& options, json_cache_opt& json_cache, std::vector<dht::partition_range> keys) const {
     auto cl = options.get_consistency();
     auto timeout = db::timeout_clock::now() + get_timeout(qs.get_client_state(), options);
-    return get_mutations(qp, options, timeout, false, options.get_timestamp(qs), qs).then([this, cl, timeout, &qp, &qs] (auto mutations) {
+    return get_mutations(qp, options, timeout, false, options.get_timestamp(qs), qs, json_cache, std::move(keys)).then([this, cl, timeout, &qp, &qs] (auto mutations) {
         if (mutations.empty()) {
             return make_ready_future<coordinator_result<>>(bo::success());
         }
@@ -292,6 +312,62 @@ modification_statement::execute_without_condition(query_processor& qp, service::
         return qp.proxy().mutate_with_triggers(std::move(mutations), cl, timeout, false, qs.get_trace_state(), qs.get_permit(), db::allow_per_partition_rate_limit::yes, this->is_raw_counter_shard_write());
     });
 }
+
+namespace {
+
+future<::shared_ptr<cql_transport::messages::result_message>>
+process_forced_rebounce(unsigned shard, query_processor& qp, const query_options& options) {
+    static int64_t counter = {0};
+    static logging::logger logger("modification_statement");
+    if (counter <= 0) {
+        const auto counter_opt = utils::get_local_injector().inject_parameter<decltype(counter)>("forced_bounce_to_shard_counter");
+        decltype(counter) counter_value = 0;
+        if (!counter_opt) {
+            logger.warn("forced_bounce_to_shard_counter is not set. Using default value 1.");
+        } else {
+            try {
+                counter_value = boost::lexical_cast<decltype(counter_value)>(*counter_opt);
+            } catch (const boost::bad_lexical_cast& e) {
+                logger.warn("Incorrect forced_bounce_to_shard_counter value: [{}]. Using default value 1.", *counter_opt);
+            }
+        }
+        if (counter_value <= 0) {
+            counter_value = 1;
+        }
+        counter = counter_value;
+    }
+
+    const auto prev_counter_value = counter;
+    if (prev_counter_value <= 1) {
+        logger.info("Disabling forced_bounce_to_shard_counter.");
+        co_await utils::error_injection_type::disable_on_all("forced_bounce_to_shard_counter");
+        counter = 0;
+    } else {
+        --counter;
+    }
+
+    // While counter > 1 select a different shard to re-bounce to.
+    // On the last iteration, re-bounce to the correct shard.
+    if (counter != 0) {
+        const auto shard_num = smp::count;
+        assert(shard_num > 0);
+        const auto local_shard = this_shard_id();
+        auto target_shard = local_shard + 1;
+        if (target_shard == shard) {
+            ++target_shard;
+        }
+        if (target_shard > shard_num - 1) {
+            target_shard = 0;
+        }
+        shard = target_shard;
+    }
+
+    logger.info("Applying forced_bounce_to_shard_counter, re-bouncing to shard {}.", shard);
+    co_return co_await make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
+        qp.bounce_to_shard(shard, std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls())));
+}
+
+} // namespace
 
 future<::shared_ptr<cql_transport::messages::result_message>>
 modification_statement::execute_with_condition(query_processor& qp, service::query_state& qs, const query_options& options) const {
@@ -313,23 +389,44 @@ modification_statement::execute_with_condition(query_processor& qp, service::que
         throw exceptions::invalid_request_exception(format("Unrestricted partition key in a conditional {}",
                     type.is_update() ? "update" : "deletion"));
     }
+    if (ranges.empty()) {
+        throw exceptions::invalid_request_exception(format("Unrestricted clustering key in a conditional {}",
+                    type.is_update() ? "update" : "deletion"));
+    }
 
     auto request = seastar::make_shared<cas_request>(s, std::move(keys));
     // cas_request can be used for batches as well single statements; Here we have just a single
     // modification in the list of CAS commands, since we're handling single-statement execution.
     request->add_row_update(*this, std::move(ranges), std::move(json_cache), options);
 
-    auto shard = service::storage_proxy::cas_shard(*s, request->key()[0].start()->value().as_decorated_key().token());
+    auto token = request->key()[0].start()->value().as_decorated_key().token();
+
+    auto shard = service::storage_proxy::cas_shard(*s, token);
+
+    if (utils::get_local_injector().is_enabled("forced_bounce_to_shard_counter")) {
+        return process_forced_rebounce(shard, qp, options);
+    }
+
     if (shard != this_shard_id()) {
         return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
                 qp.bounce_to_shard(shard, std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()))
             );
     }
 
+    std::optional<locator::tablet_routing_info> tablet_info = locator::tablet_routing_info{locator::tablet_replica_set(), std::pair<dht::token, dht::token>()};
+
+    auto&& table = s->table();
+    if (_may_use_token_aware_routing && table.uses_tablets() && qs.get_client_state().is_protocol_extension_set(cql_transport::cql_protocol_extension::TABLETS_ROUTING_V1)) {
+        auto erm = table.get_effective_replication_map();
+        tablet_info = erm->check_locality(token);
+    }
+
     return qp.proxy().cas(s, request, request->read_command(qp), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
-            cl_for_paxos, cl_for_learn, statement_timeout, cas_timeout).then([this, request] (bool is_applied) {
-        return request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
+            cl_for_paxos, cl_for_learn, statement_timeout, cas_timeout).then([this, request, tablet_replicas = std::move(tablet_info->tablet_replicas), token_range = tablet_info->token_range] (bool is_applied) {
+        auto result = request->build_cas_result_set(_metadata, _columns_of_cas_result_set, is_applied);
+        result->add_tablet_info(tablet_replicas, token_range);
+        return result;
     });
 }
 
@@ -376,31 +473,32 @@ void modification_statement::build_cas_result_set_metadata() {
 
 void
 modification_statement::process_where_clause(data_dictionary::database db, expr::expression where_clause, prepare_context& ctx) {
-    _restrictions = restrictions::statement_restrictions(db, s, type, where_clause, ctx,
-            applies_only_to_static_columns(), _selects_a_collection, false);
+    _restrictions = restrictions::analyze_statement_restrictions(db, s, type, where_clause, ctx,
+            applies_only_to_static_columns(), _selects_a_collection, false /* allow_filtering */, restrictions::check_indexes::no);
     /*
      * If there's no clustering columns restriction, we may assume that EXISTS
      * check only selects static columns and hence we can use any row from the
      * partition to check conditions.
      */
     if (_if_exists || _if_not_exists) {
-        assert(!_has_static_column_conditions && !_has_regular_column_conditions);
+        SCYLLA_ASSERT(!_has_static_column_conditions && !_has_regular_column_conditions);
         if (s->has_static_columns() && !_restrictions->has_clustering_columns_restriction()) {
             _has_static_column_conditions = true;
         } else {
             _has_regular_column_conditions = true;
         }
     }
-    if (has_token(_restrictions->get_partition_key_restrictions())) {
+    if (_restrictions->has_token_restrictions()) {
         throw exceptions::invalid_request_exception(format("The token function cannot be used in WHERE clauses for UPDATE and DELETE statements: {}",
                 to_string(_restrictions->get_partition_key_restrictions())));
     }
     if (!_restrictions->get_non_pk_restriction().empty()) {
-        auto column_names = ::join(", ", _restrictions->get_non_pk_restriction()
-                                         | boost::adaptors::map_keys
-                                         | boost::adaptors::indirected
-                                         | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_text)));
-        throw exceptions::invalid_request_exception(format("Invalid where clause contains non PRIMARY KEY columns: {}", column_names));
+        throw exceptions::invalid_request_exception(seastar::format("Invalid where clause contains non PRIMARY KEY columns: {}",
+                                                                    fmt::join(_restrictions->get_non_pk_restriction()
+                                         | std::views::keys
+                                         | std::views::transform([](const column_definition* c) {
+                                             return c->name_as_text();
+                                         }), ", ")));
     }
     const expr::expression& ck_restrictions = _restrictions->get_clustering_columns_restrictions();
     if (has_slice(ck_restrictions) && !allow_clustering_key_slices()) {
@@ -466,7 +564,7 @@ modification_statement::prepare(data_dictionary::database db, cql_stats& stats) 
     auto meta = get_prepare_context();
     auto statement = prepare_statement(db, meta, stats);
     auto partition_key_bind_indices = meta.get_partition_key_bind_indexes(*schema);
-    return std::make_unique<prepared_statement>(std::move(statement), meta, std::move(partition_key_bind_indices));
+    return std::make_unique<prepared_statement>(audit_info(), std::move(statement), meta, std::move(partition_key_bind_indices));
 }
 
 ::shared_ptr<cql3::statements::modification_statement>
@@ -500,6 +598,7 @@ modification_statement::prepare(data_dictionary::database db, prepare_context& c
     if (!prepared_stmt->has_conditions() && prepared_stmt->_restrictions.has_value()) {
         ctx.clear_pk_function_calls_cache();
     }
+    prepared_stmt->_may_use_token_aware_routing = ctx.get_partition_key_bind_indexes(*schema).size() != 0;
     return prepared_stmt;
 }
 
@@ -522,6 +621,7 @@ static
 expr::expression
 column_condition_prepare(const expr::expression& expr, data_dictionary::database db, const sstring& keyspace, const schema& schema){
     auto prepared = expr::prepare_expression(expr, db, keyspace, &schema, make_lw_shared<column_specification>("", "", make_shared<column_identifier>("IF condition", true), boolean_type));
+    expr::verify_no_aggregate_functions(prepared, "IF clause");
 
     expr::for_each_expression<expr::column_value>(prepared, [] (const expr::column_value& cval) {
       auto def = cval.col;
@@ -564,13 +664,13 @@ modification_statement::prepare_conditions(data_dictionary::database db, const s
 
         if (_if_not_exists) {
             // To have both 'IF NOT EXISTS' and some other conditions doesn't make sense.
-            // So far this is enforced by the parser, but let's assert it for sanity if ever the parse changes.
-            assert(!_conditions);
-            assert(!_if_exists);
+            // So far this is enforced by the parser, but let's SCYLLA_ASSERT it for sanity if ever the parse changes.
+            SCYLLA_ASSERT(!_conditions);
+            SCYLLA_ASSERT(!_if_exists);
             stmt.set_if_not_exist_condition();
         } else if (_if_exists) {
-            assert(!_conditions);
-            assert(!_if_not_exists);
+            SCYLLA_ASSERT(!_conditions);
+            SCYLLA_ASSERT(!_if_not_exists);
             stmt.set_if_exist_condition();
         } else {
             stmt._condition = column_condition_prepare(*_conditions, db, keyspace(), schema);
@@ -579,6 +679,10 @@ modification_statement::prepare_conditions(data_dictionary::database db, const s
         }
         stmt.build_cas_result_set_metadata();
     }
+}
+
+audit::statement_category modification_statement::category() const {
+    return audit::statement_category::DML;
 }
 
 }  // namespace raw

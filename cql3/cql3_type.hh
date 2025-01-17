@@ -5,20 +5,22 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
-#include "types.hh"
+#include "types/types.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "exceptions/exceptions.hh"
 #include <iosfwd>
 #include "enum_set.hh"
 
 namespace data_dictionary {
 class database;
 class user_types_metadata;
+}
+namespace auth {
+class resource;
 }
 
 namespace cql3 {
@@ -62,7 +64,10 @@ public:
         static shared_ptr<raw> set(shared_ptr<raw> t);
         static shared_ptr<raw> tuple(std::vector<shared_ptr<raw>> ts);
         static shared_ptr<raw> frozen(shared_ptr<raw> t);
-        friend std::ostream& operator<<(std::ostream& os, const raw& r);
+        friend sstring format_as(const raw& r) {
+            return r.to_string();
+        }
+        friend class auth::resource;
     };
 
 private:
@@ -70,8 +75,8 @@ private:
     class raw_collection;
     class raw_ut;
     class raw_tuple;
-    friend std::ostream& operator<<(std::ostream& os, const cql3_type& t) {
-        return os << t.to_string();
+    friend std::string_view format_as(const cql3_type& t) {
+        return t.to_string();
     }
 
 public:
@@ -248,7 +253,7 @@ inline bool operator==(const cql3_type& a, const cql3_type& b) {
 
     public static class UserDefined implements CQL3Type
     {
-        // Keeping this separatly from type just to simplify toString()
+        // Keeping this separately from type just to simplify toString()
         private final String name;
         private final UserType type;
 
@@ -354,3 +359,10 @@ inline bool operator==(const cql3_type& a, const cql3_type& b) {
 #endif
 
 }
+
+template <>
+struct fmt::formatter<cql3::cql3_type>: fmt::formatter<string_view> {
+    auto format(const cql3::cql3_type& t, fmt::format_context& ctx) const {
+        return formatter<string_view>::format(format_as(t), ctx);
+    }
+};

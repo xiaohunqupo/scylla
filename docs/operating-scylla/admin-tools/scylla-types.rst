@@ -1,7 +1,5 @@
-Scylla Types
+ScyllaDB Types
 ==============
-
-.. versionadded:: 5.0
 
 Introduction
 -------------

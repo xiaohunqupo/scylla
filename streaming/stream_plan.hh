@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -14,7 +14,6 @@
 #include <seastar/core/sstring.hh>
 #include "gms/inet_address.hh"
 #include "query-request.hh"
-#include "dht/i_partitioner.hh"
 #include "streaming/stream_fwd.hh"
 #include "streaming/stream_coordinator.hh"
 #include "streaming/stream_detail.hh"
@@ -36,6 +35,7 @@ private:
     plan_id _plan_id;
     sstring _description;
     stream_reason _reason;
+    service::frozen_topology_guard _topo_guard;
     std::vector<stream_event_handler*> _handlers;
     shared_ptr<stream_coordinator> _coordinator;
     bool _range_added = false;
@@ -47,11 +47,13 @@ public:
      *
      * @param description Stream type that describes this StreamPlan
      */
-    stream_plan(stream_manager& mgr, sstring description, stream_reason reason = stream_reason::unspecified)
+    stream_plan(stream_manager& mgr, sstring description, stream_reason reason = stream_reason::unspecified,
+                service::frozen_topology_guard topo_guard = {})
         : _mgr(mgr)
         , _plan_id(plan_id{utils::UUID_gen::get_time_UUID()})
         , _description(description)
         , _reason(reason)
+        , _topo_guard(topo_guard)
         , _coordinator(make_shared<stream_coordinator>())
     {
     }
@@ -65,7 +67,7 @@ public:
      * @param ranges ranges to fetch
      * @return this object for chaining
      */
-    stream_plan& request_ranges(inet_address from, sstring keyspace, dht::token_range_vector ranges);
+    stream_plan& request_ranges(locator::host_id from, sstring keyspace, dht::token_range_vector ranges);
 
     /**
      * Request data in {@code columnFamilies} under {@code keyspace} and {@code ranges} from specific node.
@@ -77,7 +79,7 @@ public:
      * @param columnFamilies specific column families
      * @return this object for chaining
      */
-    stream_plan& request_ranges(inet_address from, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families);
+    stream_plan& request_ranges(locator::host_id from, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families);
 
     /**
      * Add transfer task to send data of specific keyspace and ranges.
@@ -88,7 +90,7 @@ public:
      * @param ranges ranges to send
      * @return this object for chaining
      */
-    stream_plan& transfer_ranges(inet_address to, sstring keyspace, dht::token_range_vector ranges);
+    stream_plan& transfer_ranges(locator::host_id to, sstring keyspace, dht::token_range_vector ranges);
 
     /**
      * Add transfer task to send data of specific {@code columnFamilies} under {@code keyspace} and {@code ranges}.
@@ -100,7 +102,7 @@ public:
      * @param columnFamilies specific column families
      * @return this object for chaining
      */
-    stream_plan& transfer_ranges(inet_address to, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families);
+    stream_plan& transfer_ranges(locator::host_id to, sstring keyspace, dht::token_range_vector ranges, std::vector<sstring> column_families);
 
     stream_plan& listeners(std::vector<stream_event_handler*> handlers);
 public:

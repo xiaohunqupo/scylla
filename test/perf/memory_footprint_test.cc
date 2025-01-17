@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include <boost/range/irange.hpp>
 
 #include <seastar/util/defer.hh>
@@ -186,7 +187,7 @@ static sizes calculate_sizes(cache_tracker& tracker, const mutation_settings& se
 
     auto cache_initial_occupancy = tracker.region().occupancy().used_space();
 
-    assert(mt->occupancy().used_space() == 0);
+    SCYLLA_ASSERT(mt->occupancy().used_space() == 0);
 
     std::vector<mutation> muts;
     for (size_t i = 0; i < settings.partition_count; ++i) {
@@ -204,16 +205,12 @@ static sizes calculate_sizes(cache_tracker& tracker, const mutation_settings& se
 
     tmpdir sstable_dir;
     sstables::test_env::do_with_async([&] (sstables::test_env& env) {
-        for (auto v  : sstables::all_sstable_versions) {
-            auto sst = env.make_sstable(s,
-                sstable_dir.path().string(),
-                1 /* generation */,
-                v,
-                sstables::sstable::format_types::big);
+        for (auto v  : sstables::writable_sstable_versions) {
+            auto sst = env.make_sstable(s, v);
             auto mt2 = make_lw_shared<replica::memtable>(s);
             mt2->apply(*mt, env.make_reader_permit()).get();
-            write_memtable_to_sstable_for_test(*mt2, sst).get();
-            sst->load().get();
+            write_memtable_to_sstable(*mt2, sst).get();
+            sst->open_data().get();
             result.sstable[v] = sst->data_size();
         }
     }).get();
@@ -261,7 +258,7 @@ int main(int argc, char** argv) {
             std::cout << " - in memtable:  " << sizes.memtable << "\n";
             std::cout << " - in sstable:\n";
             for (auto v : sizes.sstable) {
-                std::cout << "   " << sstables::to_string(v.first) << ":   " << v.second << "\n";
+                std::cout << "   " << fmt::to_string(v.first) << ":   " << v.second << "\n";
             }
             std::cout << " - frozen:       " << sizes.frozen << "\n";
             std::cout << " - canonical:    " << sizes.canonical << "\n";
@@ -269,6 +266,12 @@ int main(int argc, char** argv) {
 
             std::cout << "\n";
             size_calculator::print_cache_entry_size();
+
+            auto cache_st = tracker.region().collect_stats();
+            std::cout << "LSA stats:" << "\n";
+            for (auto [ name, size ] : cache_st) {
+                std::cout << "  " << name << ": " << size << "\n";
+            }
         });
     });
 }

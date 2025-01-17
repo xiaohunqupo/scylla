@@ -5,10 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <seastar/core/metrics.hh>
-#include "types.hh"
+#include "types/types.hh"
 #include "tracing/trace_keyspace_helper.hh"
 #include "cql3/statements/batch_statement.hh"
 #include "cql3/statements/modification_statement.hh"
@@ -16,9 +16,10 @@
 #include "cql3/cql_config.hh"
 #include "types/set.hh"
 #include "types/map.hh"
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
-#include "utils/fb_utilities.hh"
 #include "utils/class_registrator.hh"
+#include "service/storage_proxy.hh"
 
 namespace tracing {
 
@@ -208,9 +209,14 @@ trace_keyspace_helper::trace_keyspace_helper(tracing& tr)
     });
 }
 
-future<> trace_keyspace_helper::start(cql3::query_processor& qp) {
+future<> trace_keyspace_helper::start(cql3::query_processor& qp, service::migration_manager& mm) {
     _qp_anchor = &qp;
-    return table_helper::setup_keyspace(qp, KEYSPACE_NAME, "2", _dummy_query_state, { &_sessions, &_sessions_time_idx, &_events, &_slow_query_log, &_slow_query_log_time_idx });
+    _mm_anchor = &mm;
+    return table_helper::setup_keyspace(qp, mm, KEYSPACE_NAME, "org.apache.cassandra.locator.SimpleStrategy", "2", _dummy_query_state, { &_sessions, &_sessions_time_idx, &_events, &_slow_query_log, &_slow_query_log_time_idx });
+}
+
+gms::inet_address trace_keyspace_helper::my_address() const noexcept {
+    return _qp_anchor->proxy().my_address();
 }
 
 void trace_keyspace_helper::write_one_session_records(lw_shared_ptr<one_session_records> records) {
@@ -229,7 +235,7 @@ void trace_keyspace_helper::write_one_session_records(lw_shared_ptr<one_session_
                 tlogger.warn("Tracing is enabled but {}", e.what());
             }
         } catch (std::logic_error& e) {
-            tlogger.error(e.what());
+            tlogger.error("{}", e.what());
         } catch (...) {
             // TODO: Handle some more exceptions maybe?
         }
@@ -243,14 +249,14 @@ void trace_keyspace_helper::write_records_bulk(records_bulk& bulk) {
     });
 }
 
-cql3::query_options trace_keyspace_helper::make_session_mutation_data(const one_session_records& session_records) {
+cql3::query_options trace_keyspace_helper::make_session_mutation_data(gms::inet_address my_address, const one_session_records& session_records) {
     const session_record& record = session_records.session_rec;
     auto millis_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(record.started_at.time_since_epoch()).count();
     std::vector<std::pair<data_value, data_value>> parameters_values_vector;
     parameters_values_vector.reserve(record.parameters.size());
     std::for_each(record.parameters.begin(), record.parameters.end(), [&parameters_values_vector] (auto& val_pair) { parameters_values_vector.emplace_back(val_pair.first, val_pair.second); });
     auto my_map_type = map_type_impl::get_instance(utf8_type, utf8_type, true);
-    std::vector<sstring_view> names {
+    std::vector<std::string_view> names {
         "session_id",
         "command",
         "client",
@@ -268,7 +274,7 @@ cql3::query_options trace_keyspace_helper::make_session_mutation_data(const one_
         cql3::raw_value::make_value(uuid_type->decompose(session_records.session_id)),
         cql3::raw_value::make_value(utf8_type->decompose(type_to_string(record.command))),
         cql3::raw_value::make_value(inet_addr_type->decompose(record.client.addr())),
-        cql3::raw_value::make_value(inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr())),
+        cql3::raw_value::make_value(inet_addr_type->decompose(my_address.addr())),
         cql3::raw_value::make_value(int32_type->decompose(elapsed_to_micros(record.elapsed))),
         cql3::raw_value::make_value(make_map_value(my_map_type, map_type_impl::native_type(std::move(parameters_values_vector))).serialize()),
         cql3::raw_value::make_value(utf8_type->decompose(record.request)),
@@ -283,7 +289,7 @@ cql3::query_options trace_keyspace_helper::make_session_mutation_data(const one_
             db::consistency_level::ANY, std::move(names), std::move(values), false, cql3::query_options::specific_options::DEFAULT);
 }
 
-cql3::query_options trace_keyspace_helper::make_session_time_idx_mutation_data(const one_session_records& session_records) {
+cql3::query_options trace_keyspace_helper::make_session_time_idx_mutation_data(gms::inet_address my_address, const one_session_records& session_records) {
     auto started_at_duration = session_records.session_rec.started_at.time_since_epoch();
     // timestamp in minutes when the query began
     auto minutes_in_millis = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration_cast<std::chrono::minutes>(started_at_duration)).count();
@@ -301,7 +307,7 @@ cql3::query_options trace_keyspace_helper::make_session_time_idx_mutation_data(c
             db::consistency_level::ANY, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT);
 }
 
-cql3::query_options trace_keyspace_helper::make_slow_query_mutation_data(const one_session_records& session_records, const utils::UUID& start_time_id) {
+cql3::query_options trace_keyspace_helper::make_slow_query_mutation_data(gms::inet_address my_address, const one_session_records& session_records, const utils::UUID& start_time_id) {
     const session_record& record = session_records.session_rec;
     auto millis_since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(record.started_at.time_since_epoch()).count();
 
@@ -324,7 +330,7 @@ cql3::query_options trace_keyspace_helper::make_slow_query_mutation_data(const o
     auto my_set_type = set_type_impl::get_instance(utf8_type, true);
 
     std::vector<cql3::raw_value> values({
-        cql3::raw_value::make_value(inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr())),
+        cql3::raw_value::make_value(inet_addr_type->decompose(my_address.addr())),
         cql3::raw_value::make_value(int32_type->decompose((int32_t)(this_shard_id()))),
         cql3::raw_value::make_value(uuid_type->decompose(session_records.session_id)),
         cql3::raw_value::make_value(timestamp_type->decompose(millis_since_epoch)),
@@ -344,7 +350,7 @@ cql3::query_options trace_keyspace_helper::make_slow_query_mutation_data(const o
             db::consistency_level::ANY, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT);
 }
 
-cql3::query_options trace_keyspace_helper::make_slow_query_time_idx_mutation_data(const one_session_records& session_records, const utils::UUID& start_time_id) {
+cql3::query_options trace_keyspace_helper::make_slow_query_time_idx_mutation_data(gms::inet_address my_address, const one_session_records& session_records, const utils::UUID& start_time_id) {
     auto started_at_duration = session_records.session_rec.started_at.time_since_epoch();
     // timestamp in minutes when the query began
     auto minutes_in_millis = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration_cast<std::chrono::minutes>(started_at_duration)).count();
@@ -356,7 +362,7 @@ cql3::query_options trace_keyspace_helper::make_slow_query_time_idx_mutation_dat
         cql3::raw_value::make_value(timestamp_type->decompose(millis_since_epoch)),
         cql3::raw_value::make_value(uuid_type->decompose(session_records.session_id)),
         cql3::raw_value::make_value(timeuuid_type->decompose(start_time_id)),
-        cql3::raw_value::make_value(inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr())),
+        cql3::raw_value::make_value(inet_addr_type->decompose(my_address.addr())),
         cql3::raw_value::make_value(int32_type->decompose(int32_t(this_shard_id()))),
         cql3::raw_value::make_value(int32_type->decompose(int32_t(session_records.session_rec.slow_query_record_ttl.count())))
     });
@@ -365,16 +371,16 @@ cql3::query_options trace_keyspace_helper::make_slow_query_time_idx_mutation_dat
             db::consistency_level::ANY, std::nullopt, std::move(values), false, cql3::query_options::specific_options::DEFAULT);
 }
 
-std::vector<cql3::raw_value> trace_keyspace_helper::make_event_mutation_data(one_session_records& session_records, const event_record& record) {
+std::vector<cql3::raw_value> trace_keyspace_helper::make_event_mutation_data(gms::inet_address my_address, one_session_records& session_records, const event_record& record) {
     auto backend_state_ptr = static_cast<trace_keyspace_backend_sesssion_state*>(session_records.backend_state_ptr.get());
 
     std::vector<cql3::raw_value> values({
         cql3::raw_value::make_value(uuid_type->decompose(session_records.session_id)),
         cql3::raw_value::make_value(timeuuid_type->decompose(utils::UUID_gen::get_time_UUID(table_helper::make_monotonic_UUID_tp(backend_state_ptr->last_nanos, record.event_time_point)))),
         cql3::raw_value::make_value(utf8_type->decompose(record.message)),
-        cql3::raw_value::make_value(inet_addr_type->decompose(utils::fb_utilities::get_broadcast_address().addr())),
+        cql3::raw_value::make_value(inet_addr_type->decompose(my_address.addr())),
         cql3::raw_value::make_value(int32_type->decompose(elapsed_to_micros(record.elapsed))),
-        cql3::raw_value::make_value(utf8_type->decompose(_local_tracing.get_thread_name())),
+        cql3::raw_value::make_value(utf8_type->decompose(fmt::format("{}/{}", _local_tracing.get_thread_name(), record.scheduling_group_name))),
         cql3::raw_value::make_value(long_type->decompose(int64_t(session_records.parent_id.get_id()))),
         cql3::raw_value::make_value(long_type->decompose(int64_t(session_records.my_span_id.get_id()))),
         cql3::raw_value::make_value(int32_type->decompose((int32_t)(session_records.ttl.count())))
@@ -383,25 +389,25 @@ std::vector<cql3::raw_value> trace_keyspace_helper::make_event_mutation_data(one
     return values;
 }
 
-future<> trace_keyspace_helper::apply_events_mutation(cql3::query_processor& qp, lw_shared_ptr<one_session_records> records, std::deque<event_record>& events_records) {
+future<> trace_keyspace_helper::apply_events_mutation(cql3::query_processor& qp, service::migration_manager& mm, lw_shared_ptr<one_session_records> records, std::deque<event_record>& events_records) {
     if (events_records.empty()) {
         return now();
     }
 
-    return _events.cache_table_info(qp, _dummy_query_state).then([this, &qp, records, &events_records] {
+    return _events.cache_table_info(qp, mm, _dummy_query_state).then([this, &qp, records, &events_records] {
         tlogger.trace("{}: storing {} events records: parent_id {} span_id {}", records->session_id, events_records.size(), records->parent_id, records->my_span_id);
 
         std::vector<cql3::statements::batch_statement::single_statement> modifications(events_records.size(), cql3::statements::batch_statement::single_statement(_events.insert_stmt(), false));
         std::vector<cql3::raw_value_vector_with_unset> values;
 
         values.reserve(events_records.size());
-        std::for_each(events_records.begin(), events_records.end(), [&values, all_records = records, this] (event_record& one_event_record) { values.emplace_back(make_event_mutation_data(*all_records, one_event_record)); });
+        std::for_each(events_records.begin(), events_records.end(), [&values, all_records = records, this] (event_record& one_event_record) { values.emplace_back(make_event_mutation_data(my_address(), *all_records, one_event_record)); });
 
         return do_with(
             cql3::query_options::make_batch_options(cql3::query_options(cql3::default_cql_config, db::consistency_level::ANY, std::nullopt, std::vector<cql3::raw_value>{}, false, cql3::query_options::specific_options::DEFAULT), std::move(values)),
             cql3::statements::batch_statement(cql3::statements::batch_statement::type::UNLOGGED, std::move(modifications), cql3::attributes::none(), qp.get_cql_stats()),
             [this, &qp] (auto& batch_options, auto& batch) {
-                return batch.execute(qp, _dummy_query_state, batch_options).then([] (shared_ptr<cql_transport::messages::result_message> res) { return now(); });
+                return batch.execute(qp, _dummy_query_state, batch_options, std::nullopt).then([] (shared_ptr<cql_transport::messages::result_message> res) { return now(); });
             }
         );
     });
@@ -431,17 +437,18 @@ future<> trace_keyspace_helper::flush_one_session_mutations(lw_shared_ptr<one_se
         return with_semaphore(write_sem, 1, [this, records, session_record_is_ready, &events_records] {
             // This code is inside the _pending_writes gate and the qp pointer
             // is cleared on ::stop() after the gate is closed.
-            assert(_qp_anchor != nullptr);
+            SCYLLA_ASSERT(_qp_anchor != nullptr && _mm_anchor != nullptr);
             cql3::query_processor& qp = *_qp_anchor;
-            return apply_events_mutation(qp, records, events_records).then([this, &qp, session_record_is_ready, records] {
+            service::migration_manager& mm = *_mm_anchor;
+            return apply_events_mutation(qp, mm, records, events_records).then([this, &qp, &mm, session_record_is_ready, records] {
                 if (session_record_is_ready) {
 
                     // if session is finished - store a session and a session time index entries
                     tlogger.trace("{}: going to store a session event", records->session_id);
-                    return _sessions.insert(qp, _dummy_query_state, make_session_mutation_data, std::ref(*records)).then([this, &qp, records] {
+                    return _sessions.insert(qp, mm, _dummy_query_state, make_session_mutation_data, my_address(), std::ref(*records)).then([this, &qp, &mm, records] {
                         tlogger.trace("{}: going to store a {} entry", records->session_id, _sessions_time_idx.name());
-                        return _sessions_time_idx.insert(qp, _dummy_query_state, make_session_time_idx_mutation_data, std::ref(*records));
-                    }).then([this, &qp, records] {
+                        return _sessions_time_idx.insert(qp, mm, _dummy_query_state, make_session_time_idx_mutation_data, my_address(), std::ref(*records));
+                    }).then([this, &qp, &mm, records] {
                         if (!records->do_log_slow_query) {
                             return now();
                         }
@@ -449,9 +456,9 @@ future<> trace_keyspace_helper::flush_one_session_mutations(lw_shared_ptr<one_se
                         // if slow query log is requested - store a slow query log and a slow query log time index entries
                         auto start_time_id = utils::UUID_gen::get_time_UUID(table_helper::make_monotonic_UUID_tp(_slow_query_last_nanos, records->session_rec.started_at));
                         tlogger.trace("{}: going to store a slow query event", records->session_id);
-                        return _slow_query_log.insert(qp, _dummy_query_state, make_slow_query_mutation_data, std::ref(*records), start_time_id).then([this, &qp, records, start_time_id] {
+                        return _slow_query_log.insert(qp, mm, _dummy_query_state, make_slow_query_mutation_data, my_address(), std::ref(*records), start_time_id).then([this, &qp, &mm, records, start_time_id] {
                             tlogger.trace("{}: going to store a {} entry", records->session_id, _slow_query_log_time_idx.name());
-                            return _slow_query_log_time_idx.insert(qp, _dummy_query_state, make_slow_query_time_idx_mutation_data, std::ref(*records), start_time_id);
+                            return _slow_query_log_time_idx.insert(qp, mm, _dummy_query_state, make_slow_query_time_idx_mutation_data, my_address(), std::ref(*records), start_time_id);
                         });
                     });
                 } else {

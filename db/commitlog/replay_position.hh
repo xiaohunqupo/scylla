@@ -4,17 +4,16 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include <stdint.h>
-#include <seastar/core/shared_ptr.hh>
 #include "schema/schema_fwd.hh"
 #include "utils/hash.hh"
 #include "sstables/version.hh"
-
+#include "seastarx.hh"
 
 namespace db {
 
@@ -42,18 +41,7 @@ struct replay_position {
         }
     }
 
-    bool operator<(const replay_position & r) const {
-        return id < r.id ? true : (r.id < id ? false : pos < r.pos);
-    }
-    bool operator<=(const replay_position & r) const {
-        return !(r < *this);
-    }
-    bool operator==(const replay_position & r) const {
-        return id == r.id && pos == r.pos;
-    }
-    bool operator!=(const replay_position & r) const {
-        return !(*this == r);
-    }
+    auto operator<=>(const replay_position&) const noexcept = default;
 
     unsigned shard_id() const {
         return unsigned(id >> max_ts_bits);
@@ -102,9 +90,6 @@ private:
     replay_position _rp;
 };
 
-
-std::ostream& operator<<(std::ostream& out, const replay_position& s);
-
 }
 
 namespace std {
@@ -115,3 +100,8 @@ struct hash<db::replay_position> {
     }
 };
 }
+
+template <> struct fmt::formatter<db::replay_position> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const db::replay_position&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <fmt/std.h>
 #include "replication.hh"
 
 // Test Raft library with declarative test definitions
@@ -301,7 +302,7 @@ RAFT_TEST_CASE(rpc_load_conf_from_log, (test_case{
 
 
 // 3 node cluster {A, B, C}.
-// Shrinked later to 2 nodes and then expanded back to 3 nodes.
+// Shrunk later to 2 nodes and then expanded back to 3 nodes.
 // Test that both configuration changes update RPC configuration correspondingly
 // on all nodes.
 RAFT_TEST_CASE(rpc_propose_conf_change, (test_case{
@@ -440,7 +441,7 @@ RAFT_TEST_CASE(rpc_configuration_truncate_restore_from_snp, (test_case{
 // the crash + network partition and synchronization with B, since
 // the effective RPC cfg would be {A, B, C} both for
 // joint cfg = {.current = {A, B}, .previous = {A, B, C}}
-// and the previously commited cfg = {A, B, C}.
+// and the previously committed cfg = {A, B, C}.
 //
 // After that, test for the second case: switch leader back to A and
 // try to expand the cluster back to initial state (re-add

@@ -3,17 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <string_view>
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/net/inet_address.hh>
 #include "utils/UUID_gen.hh"
-#include <boost/asio/ip/address_v4.hpp>
 #include <seastar/net/ip.hh>
 #include <boost/multiprecision/cpp_int.hpp>
-#include "types.hh"
+#include "types/types.hh"
 #include "types/tuple.hh"
 #include "compound.hh"
 #include "db/marshal/type_parser.hh"
@@ -24,6 +23,7 @@
 #include "types/list.hh"
 #include "types/set.hh"
 #include "test/lib/exception_utils.hh"
+#include "test/lib/test_utils.hh"
 
 using namespace std::literals::chrono_literals;
 using namespace std::literals::string_view_literals;
@@ -161,7 +161,7 @@ BOOST_AUTO_TEST_CASE(test_long_type_string_conversions) {
 
 BOOST_AUTO_TEST_CASE(test_timeuuid_type_string_conversions) {
     auto now = utils::UUID_gen::get_time_UUID();
-    BOOST_REQUIRE(timeuuid_type->equal(timeuuid_type->from_string(now.to_sstring()), timeuuid_type->decompose(now)));
+    BOOST_REQUIRE(timeuuid_type->equal(timeuuid_type->from_string(fmt::to_string(now)), timeuuid_type->decompose(now)));
     auto uuid = utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"));
     BOOST_REQUIRE(timeuuid_type->equal(timeuuid_type->from_string("D2177dD0-EAa2-11de-a572-001B779C76e3"), timeuuid_type->decompose(uuid)));
 
@@ -169,7 +169,7 @@ BOOST_AUTO_TEST_CASE(test_timeuuid_type_string_conversions) {
     test_parsing_fails(timeuuid_type, "D2177dD0-EAa2-11de-a572-001B779C76e3a");
     test_parsing_fails(timeuuid_type, "D2177dD0-EAa2-11de-a572001-B779C76e3");
     test_parsing_fails(timeuuid_type, "D2177dD0EAa211dea572001B779C76e3");
-    test_parsing_fails(timeuuid_type, utils::make_random_uuid().to_sstring());
+    test_parsing_fails(timeuuid_type, fmt::to_string(utils::make_random_uuid()));
 }
 
 BOOST_AUTO_TEST_CASE(test_simple_date_type_string_conversions) {
@@ -232,9 +232,9 @@ BOOST_AUTO_TEST_CASE(test_uuid_type_comparison) {
 
 BOOST_AUTO_TEST_CASE(test_uuid_type_string_conversions) {
     auto now = utils::UUID_gen::get_time_UUID();
-    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(now.to_sstring()), uuid_type->decompose(now)));
+    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(fmt::to_string(now)), uuid_type->decompose(now)));
     auto random = utils::make_random_uuid();
-    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(random.to_sstring()), uuid_type->decompose(random)));
+    BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string(fmt::to_string(random)), uuid_type->decompose(random)));
     auto uuid = utils::UUID(sstring("d2177dd0-eaa2-11de-a572-001b779c76e3"));
     BOOST_REQUIRE(uuid_type->equal(uuid_type->from_string("D2177dD0-EAa2-11de-a572-001B779C76e3"), uuid_type->decompose(uuid)));
 
@@ -278,27 +278,27 @@ void test_timestamp_like_string_conversions(data_type timestamp_type) {
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-03T12:30:00+1230"), timestamp_type->decompose(tp)));
     BOOST_REQUIRE(timestamp_type->equal(timestamp_type->from_string("2015-07-02T23:00-0100"), timestamp_type->decompose(tp)));
 
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "2015-07-03T00:00:00");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "2015-07-03T00:00:00.000Z");
 
     // test fractional milliseconds
     tp = db_clock::time_point(db_clock::duration(1435881600123));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "2015-07-03T00:00:00.123000");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "2015-07-03T00:00:00.123Z");
 
     // test time_stamps around the unix epoch time
     tp = db_clock::time_point(db_clock::duration(0));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "1970-01-01T00:00:00");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "1970-01-01T00:00:00.000Z");
     tp = db_clock::time_point(db_clock::duration(456));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "1970-01-01T00:00:00.456000");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "1970-01-01T00:00:00.456Z");
     tp = db_clock::time_point(db_clock::duration(-456));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "1969-12-31T23:59:59.544000");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "1969-12-31T23:59:59.544Z");
 
     // test time_stamps around year 0
     tp = db_clock::time_point(db_clock::duration(-62167219200000));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "0000-01-01T00:00:00");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "0000-01-01T00:00:00.000Z");
     tp = db_clock::time_point(db_clock::duration(-62167219199211));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "0000-01-01T00:00:00.789000");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "0000-01-01T00:00:00.789Z");
     tp = db_clock::time_point(db_clock::duration(-62167219200789));
-    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "-0001-12-31T23:59:59.211000");
+    BOOST_REQUIRE_EQUAL(timestamp_type->to_string(timestamp_type->decompose(tp)), "-0001-12-31T23:59:59.211Z");
 
     auto now = time(nullptr);
     ::tm local_now;
@@ -908,7 +908,7 @@ BOOST_AUTO_TEST_CASE(test_collection_type_compatibility) {
     auto lf_b = list_type_impl::get_instance(bytes_type, false);
 
     test_case tests[] = {
-            { nc, m__bi, int32_type },  // collection vs. primitiv
+            { nc, m__bi, int32_type },  // collection vs. primitive
             { cc, m__bi, m__bi },       // identity
             { nc, m__bi, m__ib },       // key not compatible
             { nc, mf_bi, mf_ib },       //  "

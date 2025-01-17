@@ -1,3 +1,9 @@
+> CREATE KEYSPACE ks
+>     WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND
+>     tablets = {'enabled': false};
+OK
+> USE ks;
+OK
 > --
 > -- basic: ensure the grammar works
 > --
@@ -54,7 +60,7 @@ OK
 +-----+-----+
 > -- update if exists with a scan: proper error message
 > update lwt set b = 2 where b = 1 if exists;
-Error from server: code=2200 [Invalid query] message="Cannot execute this query as it might involve data filtering and thus may have unpredictable performance. If you want to execute this query despite the performance unpredictability, use ALLOW FILTERING"
+Error from server: code=2200 [Invalid query] message="Invalid where clause contains non PRIMARY KEY columns: b"
 > select * from lwt allow filtering;
 +-----+-----+
 | a   | b   |
@@ -968,7 +974,7 @@ Error from server: code=2200 [Invalid query] message="Missing mandatory PRIMARY 
 |   1 |   1 | ['d']     | [1, 2]     |
 +-----+-----+-----------+------------+
 > update lwt set flistint = flistint + [3] where a = 1 and b = 1 if exists;
-Error from server: code=2200 [Invalid query] message="Invalid operation (flistint = flistint + [3]) for frozen collection column 666c697374696e74"
+Error from server: code=2200 [Invalid query] message="Invalid operation (flistint = flistint + [3]) for frozen collection column flistint"
 > select * from lwt allow filtering;
 +-----+-----+-----------+------------+
 |   a |   b | smapint   | flistint   |
@@ -1047,8 +1053,7 @@ OK
 +-------------+-----+
 > -- OR predicate: Cassandra users do not deserve it :(
 > update lwt set c=0 where a = 1 if c = 1 or c = 1;
-<Error from server: code=2000 [Syntax error in CQL query] message="line 1:40  : syntax error...
-">
+<Error from server: code=2000 [Syntax error in CQL query] message="line 1:40 : Syntax error">
 > -- null
 > update lwt set c=0 where a = 1 if c = null;
 +-------------+-----+
@@ -1490,7 +1495,7 @@ OK
 |-------------+-----|
 | False       |   5 |
 +-------------+-----+
-> -- Compare with another column: cassandra doesnt allow anyting but a
+> -- Compare with another column: cassandra doesn't allow anything but a
 > -- constant on the right hand side :(
 > update lwt set i = 7 where a = 1 if i = t;
 <Error from server: code=2000 [Syntax error in CQL query] message="line 1:41 no viable alternative at input ';'">
@@ -1866,7 +1871,7 @@ Error from server: code=2200 [Invalid query] message="null is not supported insi
 > update lwt set s = {false} where a = 1 if s = 1;
 Error from server: code=2200 [Invalid query] message="Invalid INTEGER constant (1) for "s" of type set<boolean>"
 > update lwt set s = {true} + s where a = 1 if s = {false};
-Error from server: code=2200 [Invalid query] message="Invalid operation (s = {true} + s) for non list column 73"
+Error from server: code=2200 [Invalid query] message="Invalid operation (s = {true} + s) for non list column s"
 > -- sets
 > -- null value == empty set
 > update lwt set s = {} where a = 1 if s = {};
@@ -1902,7 +1907,7 @@ Error from server: code=2200 [Invalid query] message="null is not supported insi
 > update lwt set s = {false} where a = 1 if s = 1;
 Error from server: code=2200 [Invalid query] message="Invalid INTEGER constant (1) for "s" of type set<boolean>"
 > update lwt set s = {true} + s where a = 1 if s = {false};
-Error from server: code=2200 [Invalid query] message="Invalid operation (s = {true} + s) for non list column 73"
+Error from server: code=2200 [Invalid query] message="Invalid operation (s = {true} + s) for non list column s"
 > drop table lwt;
 OK
 > --
@@ -1937,9 +1942,9 @@ OK
 | False       | [False] |
 +-------------+---------+
 > update lwt set b[true] = false where a = 1 if b[true] != true;
-Error from server: code=2200 [Invalid query] message="Invalid operation (b[true] = false) for frozen collection column 62"
+Error from server: code=2200 [Invalid query] message="Invalid operation (b[true] = false) for frozen collection column b"
 > update lwt set b = b + {false:true} where a = 1 if b[true] = true;
-Error from server: code=2200 [Invalid query] message="Invalid operation (b = b + {false:true}) for frozen collection column 62"
+Error from server: code=2200 [Invalid query] message="Invalid operation (b = b + {false:true}) for frozen collection column b"
 > select b from lwt where a = 1;
 +---------+
 | b       |
@@ -2089,7 +2094,7 @@ Error from server: code=2200 [Invalid query] message="Invalid FLOAT constant (-1
 | True        | [False] |
 +-------------+---------+
 > update lwt set c = [true] + c where a = 1 if c = [false];
-Error from server: code=2200 [Invalid query] message="Invalid operation (c = [true] + c) for frozen list column 63"
+Error from server: code=2200 [Invalid query] message="Invalid operation (c = [true] + c) for frozen list column c"
 > update lwt set c = [true,true,true,false,false,false] where a = 1 if exists;
 +-------------+-----+------+--------+------+
 | [applied]   |   a | b    | c      | s    |
@@ -2141,7 +2146,7 @@ Error from server: code=2200 [Invalid query] message="null is not supported insi
 > update lwt set s = {true, false} where a = 1 if s{true} = false;
 <Error from server: code=2000 [Syntax error in CQL query] message="line 1:49 no viable alternative at input '{'">
 > update lwt set s = s + {true} where a = 1 if s = {true, false};
-Error from server: code=2200 [Invalid query] message="Invalid operation (s = s + {true}) for frozen collection column 73"
+Error from server: code=2200 [Invalid query] message="Invalid operation (s = s + {true}) for frozen collection column s"
 > update lwt set s = {true, true} where a = 1 if exists;
 +-------------+-----+------+------+-----+
 | [applied]   |   a | b    | c    | s   |
@@ -2824,12 +2829,12 @@ OK
 Error from server: code=2200 [Invalid query] message="Columns "ColumnDefinition{name=a, type=org.apache.cassandra.db.marshal.Int32Type, kind=PARTITION_KEY, componentIndex=0, droppedAt=-9223372036854775808}" cannot be restricted by both a normal relation and a token relation"
 > -- error: can't use eq and non-eq restriction
 > update lwt set c = 1 where a = 1 and b = 1 and a < 0 if c = 1;
-Error from server: code=2200 [Invalid query] message="Only EQ and IN relation are supported on the partition key (unless you use the token() function or allow filtering)"
+Error from server: code=2200 [Invalid query] message="Only EQ and IN relation are supported on the partition key (unless you use the token() function or ALLOW FILTERING)"
 > update lwt set c = 1 where a = 1 and b = 1 and a < 0 if c = 1;
-Error from server: code=2200 [Invalid query] message="Only EQ and IN relation are supported on the partition key (unless you use the token() function or allow filtering)"
+Error from server: code=2200 [Invalid query] message="Only EQ and IN relation are supported on the partition key (unless you use the token() function or ALLOW FILTERING)"
 > -- error: partition key must be fully restricted
 > update lwt set c = 1 where a > 0 and a < 0 and b = 1 if c = 1;
-Error from server: code=2200 [Invalid query] message="Only EQ and IN relation are supported on the partition key (unless you use the token() function or allow filtering)"
+Error from server: code=2200 [Invalid query] message="Only EQ and IN relation are supported on the partition key (unless you use the token() function or ALLOW FILTERING)"
 > -- error: partition key and IN is not supported
 > update lwt set c = 1 where a in () and b = 1 if c = 1;
 Error from server: code=2200 [Invalid query] message="IN on the partition key is not supported with conditional updates"
@@ -2970,5 +2975,9 @@ Error from server: code=2200 [Invalid query] message="DELETE statements must res
 +---------+
 > -- stop this travesty
 > drop table t;
+OK
+> 
+> -- cleanup
+> DROP KEYSPACE ks;
 OK
 > 

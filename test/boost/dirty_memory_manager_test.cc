@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -11,12 +11,13 @@
 #include <boost/intrusive/parent_from_member.hpp>
 #include <algorithm>
 #include <chrono>
-#include <random>
 
 #include <seastar/core/circular_buffer.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread_cputime_clock.hh>
 #include <seastar/core/when_all.hh>
@@ -24,19 +25,15 @@
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
-#include <deque>
-#include "utils/lsa/weak_ptr.hh"
+#ifndef SEASTAR_DEFAULT_ALLOCATOR
 #include "utils/phased_barrier.hh"
-
+#endif
 #include "utils/logalloc.hh"
 #include "replica/dirty_memory_manager.hh"
 #include "utils/managed_ref.hh"
 #include "utils/managed_bytes.hh"
-#include "utils/chunked_vector.hh"
 #include "test/lib/log.hh"
-#include "log.hh"
-#include "test/lib/random_utils.hh"
-#include "test/lib/make_random_string.hh"
+#include "utils/log.hh"
 
 [[gnu::unused]]
 static auto x = [] {
@@ -406,7 +403,7 @@ SEASTAR_TEST_CASE(test_region_groups_basic_throttling_active_reclaim_worst_offen
         // allocate three regions with three different sizes (segment boundary must be used due to
         // LSA granularity).
         //
-        // The function can only be executed when all three are freed - which exercises continous
+        // The function can only be executed when all three are freed - which exercises continuous
         // reclaim, but they must be freed in descending order of their sizes
         test_reclaimer simple(logalloc::segment_size);
 

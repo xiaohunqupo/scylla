@@ -3,13 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cql3/statements/request_validations.hh"
-#include "seastar/util/defer.hh"
+#include "exceptions/exceptions.hh"
+#include "schema/schema.hh"
+#include <seastar/util/defer.hh>
 #include "cql3/prepare_context.hh"
+#include "cql3/expr/expr-utils.hh"
 #include "types/list.hh"
+#include <iterator>
+#include <ranges>
 
 namespace cql3 {
 namespace expr {
@@ -95,10 +100,19 @@ void validate_token_relation(const std::vector<const column_definition*> column_
             pk.end(), [](auto* c1, auto& c2) {
                 return c1 == &c2; // same, not "equal".
         })) {
-
+        std::vector<const column_definition*> unique_columns;
+        std::ranges::unique_copy(column_defs, std::back_inserter(unique_columns));
+        if (unique_columns.size() < column_defs.size()) {
+            throw exceptions::invalid_request_exception(
+                "The token() function contains duplicate partition key components");
+        }
+        if (unique_columns.size() < pk.size()) {
+            throw exceptions::invalid_request_exception(
+                "The token() function must be applied to all partition key components or none of them");
+        }
         throw exceptions::invalid_request_exception(
-                format("The token function arguments must be in the partition key order: {}",
-                        std::to_string(column_defs)));
+                seastar::format("The token function arguments must be in the partition key order: {}",
+                       fmt::join(pk | std::views::transform(std::mem_fn(&column_definition::name_as_text)), ", ")));
     }
 }
 
@@ -137,7 +151,10 @@ void preliminary_binop_vaidation_checks(const binary_operator& binop) {
         }
     }
 
-    if (is<token>(binop.lhs)) {
+    // Right now a token() on the LHS means that there's a partition token there.
+    // In the future with relaxed grammar this might no longer be true and this check will have to be revisisted.
+    // Moving the check after preparation would break tests and cassandra compatibility.
+    if (is_token_function(binop.lhs)) {
         if (binop.op == oper_t::IN) {
             throw exceptions::invalid_request_exception("IN cannot be used with the token function");
         }
@@ -166,6 +183,7 @@ binary_operator validate_and_prepare_new_restriction(const binary_operator& rest
 
     // Prepare the restriction
     binary_operator prepared_binop = prepare_binary_operator(restriction, db, *schema);
+    expr::verify_no_aggregate_functions(prepared_binop, "WHERE clause");
 
     // Fill prepare context
     const column_value* lhs_pk_col_search_res = find_in_expression<column_value>(prepared_binop.lhs,
@@ -199,9 +217,9 @@ binary_operator validate_and_prepare_new_restriction(const binary_operator& rest
         }
 
         validate_multi_column_relation(lhs_cols, prepared_binop.op);
-    } else if (auto lhs_token = as_if<token>(&prepared_binop.lhs)) {
+    } else if (is_token_function(prepared_binop.lhs)) {
         // Token restriction
-        std::vector<const column_definition*> column_defs = to_column_definitions(lhs_token->args);
+        std::vector<const column_definition*> column_defs = to_column_definitions(as<function_call>(prepared_binop.lhs).args);
         validate_token_relation(column_defs, prepared_binop.op, *schema);
     } else {
         // Anything else

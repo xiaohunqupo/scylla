@@ -1,15 +1,22 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for batch operations - BatchWriteItem, BatchGetItem.
 # Note that various other tests in other files also use these operations,
 # so they are actually tested by other tests as well.
 
-import pytest
 import random
-from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_query, multiset, scylla_inject_error
+import sys
+import traceback
+
+import pytest
+import urllib3
+from botocore.exceptions import ClientError, HTTPClientError
+
+from test.alternator.conftest import new_dynamodb_session
+from test.alternator.util import random_string, full_query, multiset, scylla_inject_error
+
 
 # Test ensuring that items inserted by a batched statement can be properly extracted
 # via GetItem. Schema has both hash and sort keys.
@@ -185,7 +192,7 @@ def test_batch_write_invalid_operation(test_table_s):
             for item in items:
                 batch.put_item(item)
     for p in [p1, p2]:
-        assert not 'item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+        assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
     # test missing key attribute:
     p1 = random_string()
     p2 = random_string()
@@ -195,7 +202,7 @@ def test_batch_write_invalid_operation(test_table_s):
             for item in items:
                 batch.put_item(item)
     for p in [p1, p2]:
-        assert not 'item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+        assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
 
 # In test_item.py we have a bunch of test_empty_* tests on different ways to
 # create an empty item (which in Scylla requires the special CQL row marker
@@ -267,6 +274,27 @@ def test_batch_get_item_hash(test_table_s):
     got_items = reply['Responses'][test_table_s.name]
     assert multiset(got_items) == multiset(items)
 
+# A single GetBatchItem batch can ask for items from multiple tables, let's
+# test that too.
+def test_batch_get_item_two_tables(test_table, test_table_s):
+    items1 = [{'p': random_string(), 'c': random_string(), 'v': random_string()} for i in range(3)]
+    items2 = [{'p': random_string(), 'v': random_string()} for i in range(3)]
+    with test_table.batch_writer() as batch:
+        for item in items1:
+            batch.put_item(item)
+    with test_table_s.batch_writer() as batch:
+        for item in items2:
+            batch.put_item(item)
+    keys1 = [{k: x[k] for k in ('p', 'c')} for x in items1]
+    keys2 = [{k: x[k] for k in ('p')} for x in items2]
+    reply = test_table_s.meta.client.batch_get_item(RequestItems = {
+        test_table.name: {'Keys': keys1, 'ConsistentRead': True},
+        test_table_s.name: {'Keys': keys2, 'ConsistentRead': True}})
+    got_items1 = reply['Responses'][test_table.name]
+    got_items2 = reply['Responses'][test_table_s.name]
+    assert multiset(got_items1) == multiset(items1)
+    assert multiset(got_items2) == multiset(items2)
+
 # Test what do we get if we try to read two *missing* values in addition to
 # an existing one. It turns out the missing items are simply not returned,
 # with no sign they are missing.
@@ -310,6 +338,23 @@ def test_batch_get_item_projection_expression(test_table):
         got_items = reply['Responses'][test_table.name]
         expected_items = [{k: item[k] for k in wanted if k in item} for item in items]
         assert multiset(got_items) == multiset(expected_items)
+
+# Test BatchGetItem with ProjectionExpression using an attribute from ExpressionAttributeNames
+def test_batch_get_item_projection_expression_with_attribute_name(test_table):
+    items = [{'p': random_string(), 'c': random_string(), 'val2': random_string()} for i in range(10)]
+    with test_table.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    keys = [{k: x[k] for k in ('p', 'c')} for x in items]
+    reply = test_table.meta.client.batch_get_item(RequestItems = {test_table.name: {'Keys': keys, 'ProjectionExpression': '#ppp', 'ConsistentRead': True,
+        "ExpressionAttributeNames": {"#ppp": "p"}}})
+    got_items = reply['Responses'][test_table.name]
+    expected_items = [{'p': item['p']} for item in items]
+    assert multiset(got_items) == multiset(expected_items)
+    # Same as above but we should return validation error when there is some unused name.
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table.meta.client.batch_get_item(RequestItems = {test_table.name: {'Keys': keys, 'ProjectionExpression': '#ppp', 'ConsistentRead': True,
+            "ExpressionAttributeNames": {"#ppp": "p", "#unused": "unused"}}})
 
 # Test that we return the required UnprocessedKeys/UnprocessedItems parameters
 def test_batch_unprocessed(test_table_s):
@@ -358,6 +403,43 @@ def test_batch_write_item_large(test_table_sn):
     assert full_query(test_table_sn, KeyConditionExpression='p=:p', ExpressionAttributeValues={':p': p}
         ) == [{'p': p, 'c': i, 'content': long_content} for i in range(25)]
 
+# Test if client breaking connection during HTTP response
+# streaming doesn't break the server.
+def test_batch_write_item_large_broken_connection(test_table_sn, request, dynamodb):
+    fn_name = sys._getframe().f_code.co_name
+    ses = new_dynamodb_session(request, dynamodb)
+
+    p = random_string()
+    long_content = random_string(100)*500
+    write_reply = test_table_sn.meta.client.batch_write_item(RequestItems = {
+        test_table_sn.name: [{'PutRequest': {'Item': {'p': p, 'c': i, 'content': long_content}}} for i in range(25)],
+    })
+    assert 'UnprocessedItems' in write_reply and write_reply['UnprocessedItems'] == dict()
+
+    read_fun = urllib3.HTTPResponse.read_chunked
+    triggered = False
+    def broken_read_fun(self, amt=None, decode_content=None):
+        ret =  read_fun(self, amt, decode_content)
+        st = traceback.extract_stack()
+        # Try to not disturb other tests if executed in parallel
+        if fn_name in str(st):
+            self._fp.fp.raw.close() # close the socket
+            nonlocal triggered
+            triggered = True
+        return ret
+    urllib3.HTTPResponse.read_chunked = broken_read_fun
+
+    try:
+        # This disruption doesn't always work so we repeat it.
+        for _ in range(1, 20):
+            with pytest.raises(HTTPClientError):
+                # Our monkey patched read_chunked function will make client unusable
+                # so we need to use separate session so that it doesn't affect other tests.
+                ses.meta.client.query(TableName=test_table_sn.name, KeyConditionExpression='p=:p', ExpressionAttributeValues={':p': p})
+            assert triggered
+    finally:
+        urllib3.HTTPResponse.read_chunked = read_fun
+
 # DynamoDB limits the number of items written by a BatchWriteItem operation
 # to 25, even if they are small. Exceeding this limit results in a
 # ValidationException error - and none of the items in the batch are written.
@@ -374,7 +456,7 @@ def test_batch_write_item_too_many(test_table_sn):
             test_table_sn.name: [{'DeleteRequest': {'Key': {'p': p, 'c': i}}} for i in range(30)]
     })
 
-# According to the DynamoDB documention, a single BatchGetItem operation is
+# According to the DynamoDB documentation, a single BatchGetItem operation is
 # limited to retrieving up to 100 items or a total of 16 MB of data,
 # whichever is smaller. If we read less than those limits in a single
 # BatchGetItem operation, it should work - though may still return only

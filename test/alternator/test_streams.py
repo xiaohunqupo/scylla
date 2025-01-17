@@ -1,19 +1,47 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for stream operations: ListStreams, DescribeStream, GetShardIterator,
 # GetRecords.
 
-import pytest
 import time
 import urllib.request
-
-from botocore.exceptions import ClientError
-from util import list_tables, unique_table_name, create_test_table, random_string, freeze
 from contextlib import contextmanager, ExitStack
 from urllib.error import URLError
+
+import pytest
 from boto3.dynamodb.types import TypeDeserializer
+from botocore.exceptions import ClientError
+
+from test.alternator.util import unique_table_name, create_test_table, new_test_table, random_string, freeze, list_tables
+
+# All tests in this file are expected to fail with tablets due to #16317.
+# To ensure that Alternator Streams is still being tested, instead of
+# xfailing these tests, we temporarily coerce the tests below to avoid
+# using default tablets setting, even if it's available. We do this by
+# using the following tags when creating each table below:
+TAGS = [{'Key': 'experimental:initial_tablets', 'Value': 'none'}]
+
+# Before Alternator Streams is supported with tablets (#16317), let's verify
+# that enabling Streams results in an orderly error. This test should be
+# deleted when #16317 is fixed.
+def test_streams_enable_error_with_tablets(dynamodb, scylla_only):
+    # Test attempting to create a table already with streams
+    with pytest.raises(ClientError, match='ValidationException.*tablets'):
+        with new_test_table(dynamodb,
+            Tags=[{'Key': 'experimental:initial_tablets', 'Value': '4'}],
+            StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
+            KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
+            AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
+            pass
+    # Test attempting to add a stream to an existing table
+    with new_test_table(dynamodb,
+        Tags=[{'Key': 'experimental:initial_tablets', 'Value': '4'}],
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ]) as table:
+        with pytest.raises(ClientError, match='ValidationException.*tablets'):
+            table.update(StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'});
 
 stream_types = [ 'OLD_IMAGE', 'NEW_IMAGE', 'KEYS_ONLY', 'NEW_AND_OLD_IMAGES']
 
@@ -51,6 +79,7 @@ def create_stream_test_table(dynamodb, StreamViewType=None):
     if StreamViewType != None:
         spec = {'StreamEnabled': True, 'StreamViewType': StreamViewType}
     table = create_test_table(dynamodb, StreamSpecification=spec,
+        Tags=TAGS,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' },
                     { 'AttributeName': 'c', 'KeyType': 'RANGE' }
         ],
@@ -458,7 +487,7 @@ def test_get_records_nonexistent_iterator(dynamodbstreams):
 # StreamViewType settings (KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES).
 # Unfortunately changing the StreamViewType setting of an existing stream is
 # not allowed (see test_streams_change_type), and while removing and re-adding
-# a stream is posssible, it is very slow. So we create four different fixtures
+# a stream is possible, it is very slow. So we create four different fixtures
 # with the four different StreamViewType settings for these four fixtures.
 #
 # It turns out that DynamoDB makes reusing the same table in different tests
@@ -475,6 +504,7 @@ def test_get_records_nonexistent_iterator(dynamodbstreams):
 
 def create_table_ss(dynamodb, dynamodbstreams, type):
     table = create_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }, { 'AttributeName': 'c', 'KeyType': 'RANGE' }],
         AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' }, { 'AttributeName': 'c', 'AttributeType': 'S' }],
         StreamSpecification={ 'StreamEnabled': True, 'StreamViewType': type })
@@ -604,7 +634,7 @@ def compare_events(expected_events, output, mode):
     expected_events_map = {}
     for event in expected_events:
         expected_type, expected_key, expected_old_image, expected_new_image = event
-        # For simplicity, we actually use the entire key, not just the partiton
+        # For simplicity, we actually use the entire key, not just the partition
         # key. We only lose a bit of testing power we didn't plan to test anyway
         # (that events for different items in the same partition are ordered).
         key = freeze(expected_key)
@@ -685,7 +715,7 @@ def compare_events(expected_events, output, mode):
             return False
     return True
 
-# Convenience funtion used to implement several tests below. It runs a given
+# Convenience function used to implement several tests below. It runs a given
 # function "updatefunc" which is supposed to do some updates to the table
 # and also return an expected_events list. do_test() then fetches the streams
 # data and compares it to the expected_events using compare_events().
@@ -807,6 +837,7 @@ def test_streams_updateitem_old_image_empty_item(test_table_ss_old_image, dynamo
 @pytest.fixture(scope="function")
 def test_table_ss_old_image_and_lsi(dynamodb, dynamodbstreams):
     table = create_test_table(dynamodb,
+        Tags=TAGS,
         KeySchema=[
             {'AttributeName': 'p', 'KeyType': 'HASH'},
             {'AttributeName': 'c', 'KeyType': 'RANGE'}],
@@ -1218,7 +1249,7 @@ def test_streams_starting_sequence_number(test_table_ss_keys_only, dynamodbstrea
 # a specific bug, in the following tests we do a all the different operations,
 # PutItem, DeleteItem, BatchWriteItem and UpdateItem, and check the resulting
 # stream for correctness.
-# The following tests focus on mulitple operations on the *same* item. Those
+# The following tests focus on multiple operations on the *same* item. Those
 # should appear in the stream in the correct order.
 def do_updates_1(table, p, c):
     events = []
@@ -1233,7 +1264,7 @@ def do_updates_1(table, p, c):
     # deleting an item appears as a REMOVE event. Note no new_image at all, but there is an old_image.
     table.delete_item(Key={'p': p, 'c': c})
     events.append(['REMOVE', {'p': p, 'c': c}, {'p': p, 'c': c, 'y': 3}, None])
-    # deleting a non-existant item doesn't appear in the log at all.
+    # deleting a non-existent item doesn't appear in the log at all.
     table.delete_item(Key={'p': p, 'c': c})
     # If update_item creates an item, the event is INSERT as well.
     table.update_item(Key={'p': p, 'c': c},
@@ -1249,7 +1280,7 @@ def do_updates_1(table, p, c):
     # completely missing from the DynamoDB stream - the test continues to
     # pass even though we didn't add another expected event, and even though
     # the preimage in the following expected event includes this "b" we will
-    # remove. I couldn't reproduce this apparant DynamoDB bug in a smaller test.
+    # remove. I couldn't reproduce this apparent DynamoDB bug in a smaller test.
     #table.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE b')
     # Test BatchWriteItem as well. This modifies the item, so will be a MODIFY event.
     table.meta.client.batch_write_item(RequestItems = {table.name: [{'PutRequest': {'Item': {'p': p, 'c': c, 'x': 5}}}]})
@@ -1281,6 +1312,7 @@ def test_streams_1_new_and_old_images(test_table_ss_new_and_old_images, dynamodb
 def test_table_stream_with_result(dynamodb, dynamodbstreams):
     tablename = unique_table_name()
     result = dynamodb.meta.client.create_table(TableName=tablename,
+        Tags=TAGS,
         BillingMode='PAY_PER_REQUEST',
         StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' },
@@ -1548,6 +1580,29 @@ def test_stream_arn_unchanging(dynamodb, dynamodbstreams):
         assert 'Streams' in streams
         assert len(streams['Streams']) == 1
         assert streams['Streams'][0]['StreamArn'] == arn
+
+# Enabling a stream shouldn't cause any extra table to appear in ListTables.
+# In issue #19911, enabling streams on a table called xyz caused the name
+# "xyz_scylla_cdc_log" to appear in ListTables. The following test creates
+# a table with a long unique name, and ensures that only one table containing
+# this name as a substring is listed.
+# In test_gsi.py and test_lsi.py we have similar tests for GSI and LSI.
+# Reproduces #19911
+def test_stream_list_tables(dynamodb):
+    with new_test_table(dynamodb,
+        Tags=TAGS,
+        StreamSpecification={'StreamEnabled': True, 'StreamViewType': 'KEYS_ONLY'},
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' } ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' }, ]
+    ) as table:
+            # Check that the test table is listed by ListTable, but its long
+            # and unique name (created by unique_table_name()) isn't a proper
+            # substring of any other table's name.
+            tables = list_tables(dynamodb)
+            assert table.name in tables
+            for listed_name in tables:
+                if table.name != listed_name:
+                    assert table.name not in listed_name
 
 # TODO: tests on multiple partitions
 # TODO: write a test that disabling the stream and re-enabling it works, but

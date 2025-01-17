@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -17,6 +17,7 @@ namespace data_dictionary {
 class impl {
 public:
     virtual ~impl();
+    virtual const table_schema_version& get_version(database) const = 0;
     virtual std::optional<keyspace> try_find_keyspace(database db, std::string_view name) const = 0;
     virtual std::vector<keyspace> get_keyspaces(database db) const = 0;
     virtual std::vector<sstring> get_user_keyspaces(database db) const = 0;
@@ -39,6 +40,7 @@ public:
     virtual const db::extensions& get_extensions(database db) const = 0;
     virtual const gms::feature_service& get_features(database db) const = 0;
     virtual replica::database& real_database(database db) const = 0;
+    virtual replica::database* real_database_ptr(database db) const = 0;
 protected:
     // Tools for type erasing an unerasing
     static database make_database(const impl* i, const void* db) {

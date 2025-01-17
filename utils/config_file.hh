@@ -4,18 +4,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <fmt/format.h>
-#include <fmt/ostream.h>
+
 #include <unordered_map>
-#include <iosfwd>
 #include <string_view>
 
-#include <boost/program_options.hpp>
+#include <boost/program_options/options_description.hpp>
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
@@ -51,7 +50,7 @@ public:
 };
 
 template <typename T>
-extern const config_type config_type_for;
+extern const config_type& config_type_for();
 
 class config_file {
     static thread_local unsigned s_shard_id;
@@ -66,9 +65,32 @@ public:
     typedef std::vector<sstring> string_list;
 
     enum class value_status {
-        Used,
-        Unused,
-        Invalid,
+        Used, ///< a valid option which changes scylla's behavior. only the
+              ///< "Used" options are added to the command line options,
+              ///< and can be specified with command line.
+        Unused, ///< an option inherited or not yet implemented.
+                ///< We want to minimize their "visibility" from user. So
+                ///< despite that they are still accepted in the config file,
+                ///< they are not considered as valid options if specified
+                ///< using the command line anymore.
+                ///< initially, we had loads of these options from Cassandra.
+                ///< they are also used for options supported by the older
+                ///< versions of Scylla.
+                ///< (In the past used to deprecate an option,
+                ///< now there's a separate Deprecated enumerator for that purpose)
+        Invalid, ///< an option inherited, but we don't intend to
+                 ///< implement it. on the contrary, we print a warning message
+                 ///< at seeing each of these options if specified when booting
+                 ///< up. these options are kept around only to ease the
+                 ///< migration process so user can keep using their existing
+                 ///< settings.
+                 ///< (In the past used to deprecate an option,
+                 ///< now there's a separate Deprecated enumerator for that purpose)
+        Deprecated, ///< an option that was used once, but became deprecated.
+                    ///< If specified in configuration file or as a cmd line param,
+                    ///< we'll parse it and print a warning saying it's deprecated.
+                    ///< You may expect such option will become Unused/Invalid
+                    ///< or will be removed altogether some day.
     };
 
     enum class liveness {
@@ -126,9 +148,9 @@ public:
         bool matches(std::string_view name) const;
         virtual void add_command_line_option(bpo::options_description_easy_init&) = 0;
         virtual void set_value(const YAML::Node&) = 0;
-        virtual bool set_value(sstring, config_source = config_source::Internal) = 0;
+        virtual bool set_value(sstring, config_source) = 0;
         virtual future<> set_value_on_all_shards(const YAML::Node&) = 0;
-        virtual future<bool> set_value_on_all_shards(sstring, config_source = config_source::Internal) = 0;
+        virtual future<bool> set_value_on_all_shards(sstring, config_source) = 0;
         virtual value_status status() const noexcept = 0;
         virtual config_source source() const noexcept = 0;
         sstring source_name() const noexcept;
@@ -156,7 +178,7 @@ public:
         std::vector<T> _allowed_values;
     protected:
         updateable_value_source<T>& the_value() {
-            any_value* av =_cf->_per_shard_values[_cf->s_shard_id][_per_shard_values_offset].get();
+            any_value* av = _cf->_per_shard_values[_cf->s_shard_id][_per_shard_values_offset].get();
             return static_cast<the_value_type*>(av)->value;
         }
         const updateable_value_source<T>& the_value() const {
@@ -171,7 +193,7 @@ public:
 
         named_value(config_file* file, std::string_view name, std::string_view alias, liveness liveness_, value_status vs, const T& t = T(), std::string_view desc = {},
                 std::initializer_list<T> allowed_values = {})
-            : config_src(file, name, alias, &config_type_for<T>, desc)
+            : config_src(file, name, alias, &config_type_for<T>(), desc)
             , _value_status(vs)
             , _liveness(liveness_)
             , _allowed_values(std::move(allowed_values)) {
@@ -200,7 +222,7 @@ public:
         }
         MyType & operator()(const T& t, config_source src = config_source::Internal) {
             if (!_allowed_values.empty() && std::find(_allowed_values.begin(), _allowed_values.end(), t) == _allowed_values.end()) {
-                throw std::invalid_argument(format("Invalid value for {}: got {} which is not inside the set of allowed values {}", name(), t, _allowed_values));
+                throw std::invalid_argument(fmt::format("Invalid value for {}: got {} which is not inside the set of allowed values {}", name(), t, _allowed_values));
             }
             the_value().set(t);
             if (src > config_source::None) {
@@ -210,7 +232,7 @@ public:
         }
         MyType & operator()(T&& t, config_source src = config_source::Internal) {
             if (!_allowed_values.empty() && std::find(_allowed_values.begin(), _allowed_values.end(), t) == _allowed_values.end()) {
-                throw std::invalid_argument(format("Invalid value for {}: got {} which is not inside the set of allowed values {}", name(), t, _allowed_values));
+                throw std::invalid_argument(fmt::format("Invalid value for {}: got {} which is not inside the set of allowed values {}", name(), t, _allowed_values));
             }
             the_value().set(std::move(t));
             if (src > config_source::None) {
@@ -235,18 +257,20 @@ public:
 
         void add_command_line_option(bpo::options_description_easy_init&) override;
         void set_value(const YAML::Node&) override;
-        bool set_value(sstring, config_source = config_source::Internal) override;
+        bool set_value(sstring, config_source) override;
         // For setting a single value on all shards,
         // without having to call broadcast_to_all_shards
         // that broadcasts all values to all shards.
         future<> set_value_on_all_shards(const YAML::Node&) override;
-        future<bool> set_value_on_all_shards(sstring, config_source = config_source::Internal) override;
+        future<bool> set_value_on_all_shards(sstring, config_source) override;
     };
 
     typedef std::reference_wrapper<config_src> cfg_ref;
 
     config_file(std::initializer_list<cfg_ref> = {});
     config_file(const config_file&) = delete;
+
+    virtual ~config_file() = default;
 
     void add(cfg_ref, std::unique_ptr<any_value> value);
     void add(std::initializer_list<cfg_ref>);
@@ -257,6 +281,8 @@ public:
 
     boost::program_options::options_description_easy_init&
     add_options(boost::program_options::options_description_easy_init&);
+    boost::program_options::options_description_easy_init&
+    add_deprecated_options(boost::program_options::options_description_easy_init&);
 
     /**
      * Default behaviour for yaml parser is to throw on
@@ -287,6 +313,10 @@ public:
     }
     future<> broadcast_to_all_shards();
 private:
+    virtual bool are_live_updatable_config_params_changeable_via_cql() const {
+        return false;
+    }
+
     configs
         _cfgs;
 };

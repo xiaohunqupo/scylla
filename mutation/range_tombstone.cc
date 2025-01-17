@@ -3,26 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "range_tombstone.hh"
-#include "mutation/mutation_fragment.hh"
-#include "mutation/mutation_fragment_v2.hh"
 
 #include <boost/range/algorithm/upper_bound.hpp>
-
-std::ostream& operator<<(std::ostream& out, const range_tombstone& rt) {
-    if (rt) {
-        return out << "{range_tombstone: start=" << rt.position() << ", end=" << rt.end_position() << ", " << rt.tomb << "}";
-    } else {
-        return out << "{range_tombstone: none}";
-    }
-}
-
-std::ostream& operator<<(std::ostream& out, const range_tombstone_change& rt) {
-    return out << "{range_tombstone_change: pos=" << rt.position() << ", " << rt.tombstone() << "}";
-}
+#include <boost/range/numeric.hpp>
 
 std::optional<range_tombstone> range_tombstone::apply(const schema& s, range_tombstone&& src)
 {

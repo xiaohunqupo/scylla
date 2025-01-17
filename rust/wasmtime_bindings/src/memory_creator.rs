@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 use anyhow::{anyhow, Result};
+use std::ops::Range;
 use std::{cmp, ptr, u32};
 use wasmtime::LinearMemory;
 
@@ -83,6 +84,12 @@ unsafe impl LinearMemory for ScyllaLinearMemory {
     }
     fn as_ptr(&self) -> *mut u8 {
         self.ptr
+    }
+    fn wasm_accessible(&self) -> Range<usize> {
+        Range {
+            start: self.ptr as usize,
+            end: self.ptr as usize + self.size,
+        }
     }
 }
 

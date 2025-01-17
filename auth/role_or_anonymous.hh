@@ -3,15 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <string_view>
 #include <functional>
-#include <iosfwd>
 #include <optional>
+#include <fmt/core.h>
 
 #include <seastar/core/sstring.hh>
 
@@ -26,15 +26,8 @@ public:
     role_or_anonymous() = default;
     role_or_anonymous(std::string_view name) : name(name) {
     }
+    friend bool operator==(const role_or_anonymous&, const role_or_anonymous&) noexcept = default;
 };
-
-std::ostream& operator<<(std::ostream&, const role_or_anonymous&);
-
-bool operator==(const role_or_anonymous&, const role_or_anonymous&) noexcept;
-
-inline bool operator!=(const role_or_anonymous& mr1, const role_or_anonymous& mr2) noexcept {
-    return !(mr1 == mr2);
-}
 
 bool is_anonymous(const role_or_anonymous&) noexcept;
 
@@ -50,3 +43,8 @@ struct hash<auth::role_or_anonymous> {
 };
 
 }
+
+template <> struct fmt::formatter<auth::role_or_anonymous> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const auth::role_or_anonymous&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

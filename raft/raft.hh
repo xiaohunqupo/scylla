@@ -3,22 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
+#include "utils/assert.hh"
 #include <vector>
 #include <unordered_set>
 #include <functional>
-#include <source_location>
-#include "utils/source_location-compat.hh"
 #include <boost/container/deque.hpp>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/abort_source.hh>
 #include "bytes_ostream.hh"
-#include "utils/UUID.hh"
 #include "internal.hh"
 #include "logical_clock.hh"
 
@@ -39,11 +36,11 @@ using server_id = internal::tagged_id<struct server_id_tag>;
 using group_id = raft::internal::tagged_id<struct group_id_tag>;
 
 // This type represents the raft term
-using term_t = internal::tagged_uint64<struct term_tag>;
+using term_t = raft::internal::tagged_uint64<struct term_tag>;
 // This type represensts the index into the raft log
-using index_t = internal::tagged_uint64<struct index_tag>;
+using index_t = raft::internal::tagged_uint64<struct index_tag>;
 // Identifier for a read barrier request
-using read_id = internal::tagged_uint64<struct read_id_tag>;
+using read_id = raft::internal::tagged_uint64<struct read_id_tag>;
 
 // Opaque connection properties. May contain ip:port pair for instance.
 // This value is disseminated between cluster member
@@ -74,8 +71,6 @@ struct server_address {
     bool operator<(const server_address& rhs) const {
         return id < rhs.id;
     }
-
-    friend std::ostream& operator<<(std::ostream&, const server_address&);
 };
 
 struct config_member {
@@ -97,8 +92,6 @@ struct config_member {
     bool operator<(const config_member& rhs) const {
         return addr < rhs.addr;
     }
-
-    friend std::ostream& operator<<(std::ostream&, const config_member&);
 };
 
 struct server_address_hash {
@@ -233,11 +226,9 @@ struct configuration {
 
     // Transition from C_old + C_new to C_new.
     void leave_joint() {
-        assert(is_joint());
+        SCYLLA_ASSERT(is_joint());
         previous.clear();
     }
-
-    friend std::ostream& operator<<(std::ostream&, const configuration&);
 };
 
 struct log_entry {
@@ -296,7 +287,7 @@ struct timeout_error : public error {
 };
 
 struct state_machine_error: public error {
-    state_machine_error(std::source_location l = std::source_location::current())
+    state_machine_error(seastar::compat::source_location l = seastar::compat::source_location::current())
         : error(fmt::format("State machine error at {}:{}", l.file_name(), l.line())) {}
 };
 
@@ -304,6 +295,15 @@ struct state_machine_error: public error {
 // It's unspecified if any actions caused by rpc were actually performed on the target node.
 struct transport_error: public error {
     using error::error;
+};
+
+// Can be thrown by two-way RPCs when the destination is not seen as alive by the failure detector.
+// If thrown, the request was not sent at all.
+struct destination_not_alive_error: public transport_error {
+    server_id destination;
+
+    destination_not_alive_error(server_id destination, seastar::compat::source_location l = seastar::compat::source_location::current())
+            : transport_error(fmt::format("Failed to send {} to {}: node is not seen as alive by the failure detector", l.function_name(), destination)) {}
 };
 
 struct command_is_too_big_error: public error {
@@ -321,7 +321,7 @@ struct no_other_voting_member : public error {
 };
 
 struct request_aborted : public error {
-    request_aborted() : error("Request is aborted by a caller") {}
+    request_aborted(const std::string& error_msg) : error(error_msg) {}
 };
 
 inline bool is_uncertainty(const std::exception& e) {
@@ -487,7 +487,8 @@ struct transient_error: public error {
     }
 
     friend std::ostream& operator<<(std::ostream& os, const transient_error& e) {
-        return os << "transient_error, message: " << e.what() << ", leader: " << e.leader;
+        fmt::print(os, "transient_error, message: {}, leader: {}", e.what(), e.leader);
+        return os;
     }
 };
 
@@ -529,7 +530,7 @@ static constexpr logical_clock::duration ELECTION_TIMEOUT = logical_clock::durat
 
 // rpc, persistence and state_machine classes will have to be implemented by the
 // raft user to provide network, persistency and busyness logic support
-// repectively.
+// respectively.
 class rpc;
 class persistence;
 
@@ -549,7 +550,7 @@ public:
     // more than one entry all of them will be committed simultaneously.
     // Will be eventually called on all replicas, for all committed commands.
     // Raft owns the data since it may be still replicating.
-    // Raft will not call another apply until the retuned future
+    // Raft will not call another apply until the returned future
     // will not become ready.
     virtual future<> apply(std::vector<command_cref> command) = 0;
 
@@ -755,6 +756,18 @@ public:
     // apply call 'state_machine::load_snapshot(snapshot::id)'
     // Called during Raft server initialization only, should not
     // run in parallel with store.
+    //
+    // If you want to create a Raft cluster with a non-empty state
+    // machine, so that joining servers always receive a snapshot,
+    // you should:
+    // - make sure that members of the initial configuration have
+    //   the same state machine state,
+    // - set the initial snapshot index on members of the initial
+    //   configuration to 1,
+    // - set the initial snapshot index on all subsequently joining
+    //   servers to 0.
+    // This also works if you start with an empty state machine,
+    // so consider it as the go-to default.
     virtual future<snapshot_descriptor> load_snapshot_descriptor() = 0;
 
     // Persist given log entries.
@@ -800,3 +813,17 @@ public:
 
 } // namespace raft
 
+template <>
+struct fmt::formatter<raft::server_address> : fmt::formatter<string_view> {
+    auto format(const raft::server_address&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<raft::config_member> : fmt::formatter<string_view> {
+    auto format(const raft::config_member&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<raft::configuration> : fmt::formatter<string_view> {
+    auto format(const raft::configuration&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

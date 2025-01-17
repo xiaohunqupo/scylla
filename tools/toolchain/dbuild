@@ -16,10 +16,10 @@ EOF
     exit 1
 }
 
-if which docker >/dev/null 2>&1 ; then
-  tool=${DBUILD_TOOL-docker}
-elif which podman >/dev/null 2>&1 ; then
+if which podman >/dev/null 2>&1 ; then
   tool=${DBUILD_TOOL-podman}
+elif which docker >/dev/null 2>&1 ; then
+  tool=${DBUILD_TOOL-docker}
 else
   die "Please make sure you install either podman or docker on this machine to run dbuild"
 fi
@@ -154,10 +154,8 @@ if [ -z "$is_podman" ]; then
        --pids-limit -1
        )
 else
-    TMP_PASSWD=$(mktemp --tmpdir passwd.XXXXXX)
-    FULLNAME=$(getent passwd $USER | cut -d ':' -f 5)
-    echo "$USER:x:0:0:$FULLNAME:$HOME:/bin/bash" > "$TMP_PASSWD"
-    docker_common_args+=(-v "$TMP_PASSWD:/etc/passwd:ro")
+    docker_common_args+=(
+        --userns keep-id)
     # --pids-limit is not supported on podman with cgroupsv1
     # detection code from
     #   https://unix.stackexchange.com/questions/617764/how-do-i-check-if-system-is-using-cgroupv1
@@ -187,12 +185,24 @@ if [ -e ~/.gdbinit ]; then
     docker_common_args+=(-v "$HOME/.gdbinit:$HOME/.gdbinit:ro")
 fi
 
+# By default use "unlimited" as the hard limit
+hard_limit=$(ulimit -Hn)
+if [[ "${OSTYPE}" == "darwin"* ]]; then
+  # Docker-on-osx cannot parse "unlimited" as hard limit value, hence set to a high value
+  hard_limit=1024000
+fi
+
+if [[ -n "$interactive" || -t 0 ]]; then
+    docker_common_args+=("--tty")
+fi
+
 docker_common_args+=(
        --security-opt seccomp=unconfined \
        --security-opt label=disable \
        --network host \
        --cap-add SYS_PTRACE \
-       --ulimit nofile=$(ulimit -Sn):$(ulimit -Hn) \
+       --privileged \
+       --ulimit nofile=$(ulimit -Sn):$hard_limit \
        -v "$PWD:$PWD" \
        -v "$tmpdir:/tmp" \
        -v "$MAVEN_LOCAL_REPO:$MAVEN_LOCAL_REPO" \
@@ -205,7 +215,6 @@ docker_common_args+=(
        "$image" \
        "${args[@]}"
 )
-
 cleanup() {
     rm -rf "$tmpdir"
     if [ -v TMP_PASSWD ]; then

@@ -3,20 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <map>
+#include <optional>
 #include <set>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
-
-#include "exceptions/exceptions.hh"
-
+#include "seastarx.hh"
 
 class compressor {
     sstring _name;
@@ -105,7 +104,6 @@ public:
     void validate();
     std::map<sstring, sstring> get_options() const;
     bool operator==(const compression_parameters& other) const;
-    bool operator!=(const compression_parameters& other) const;
 
     static compression_parameters no_compression() {
         return compression_parameters(nullptr);

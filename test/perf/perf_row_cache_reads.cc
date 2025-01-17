@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <seastar/core/distributed.hh>
@@ -25,7 +25,7 @@
 #include "test/lib/random_utils.hh"
 #include "test/lib/simple_schema.hh"
 #include "querier.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "reader_concurrency_semaphore.hh"
 
 /// Tests read scenarios from cache.
@@ -176,10 +176,9 @@ void test_scan_with_range_delete_over_rows() {
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            const io_priority_class& pc,
             tracing::trace_state_ptr trace,
             streamed_mutation::forwarding fwd) {
-        return cache.make_reader(s, permit, range, slice, pc, std::move(trace), std::move(fwd));
+        return cache.make_reader(s, permit, range, slice, std::move(trace), std::move(fwd));
     });
 
     std::cout << "Rows: " << ck_index << std::endl;
@@ -191,7 +190,7 @@ void test_scan_with_range_delete_over_rows() {
 
         auto d = duration_in_seconds([&] {
             auto slice = partition_slice_builder(*s).build();
-            auto q = query::querier(cache_ms, s, semaphore.make_permit(), pr, slice, default_priority_class(), nullptr);
+            auto q = query::querier(cache_ms, s, semaphore.make_permit(), pr, slice, nullptr);
             auto close_q = deferred_close(q);
             q.consume_page(noop_compacted_fragments_consumer(),
                            std::numeric_limits<uint32_t>::max(),
@@ -222,7 +221,7 @@ void test_scan_with_range_delete_over_rows() {
 
 int main(int argc, char** argv) {
     app_template app;
-    return app.run(argc, argv, [&app] {
+    return app.run(argc, argv, [] {
         return seastar::async([&] {
             engine().at_exit([] {
                 cancelled = true;

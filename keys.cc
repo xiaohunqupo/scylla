@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <iostream>
@@ -12,59 +12,8 @@
 #include "dht/i_partitioner.hh"
 #include "clustering_bounds_comparator.hh"
 #include <boost/algorithm/string.hpp>
-#include "utils/utf8.hh"
 
 logging::logger klog("keys");
-
-std::ostream& operator<<(std::ostream& out, const partition_key& pk) {
-    return out << "pk{" << to_hex(managed_bytes_view(pk.representation())) << "}";
-}
-
-template<typename T>
-static std::ostream& print_key(std::ostream& out, const T& key_with_schema) {
-    const auto& [schema, key] = key_with_schema;
-    auto type_iterator = key.get_compound_type(schema)->types().begin();
-    bool first = true;
-    for (auto&& e : key.components(schema)) {
-        if (!first) {
-            out << ":";
-        }
-        first = false;
-        out << (*type_iterator)->to_string(to_bytes(e));
-        ++type_iterator;
-    }
-    return out;
-}
-
-std::ostream& operator<<(std::ostream& out, const partition_key::with_schema_wrapper& pk) {
-    const auto& [schema, key] = pk;
-    auto type_iterator = key.get_compound_type(schema)->types().begin();
-    bool first = true;
-    for (auto&& e : key.components(schema)) {
-        if (!first) {
-            out << ":";
-        }
-        first = false;
-        auto keystr = (*type_iterator)->to_string(to_bytes(e));
-        out << (utils::utf8::validate((const uint8_t *) keystr.data(), keystr.size()) ? keystr : "<non-utf8-key>");
-        ++type_iterator;
-    }
-    return out;
-}
-
-std::ostream& operator<<(std::ostream& out, const clustering_key_prefix::with_schema_wrapper& ck) {
-    return print_key(out, ck);
-}
-
-std::ostream& operator<<(std::ostream& out, const partition_key_view& pk) {
-    return with_linearized(pk.representation(), [&] (bytes_view v) {
-        return std::ref(out << "pk{" << to_hex(v) << "}");
-    });
-}
-
-std::ostream& operator<<(std::ostream& out, const clustering_key_prefix& ckp) {
-    return out << "ckp{" << to_hex(managed_bytes_view(ckp.representation())) << "}";
-}
 
 const legacy_compound_view<partition_key_view::c_type>
 partition_key_view::legacy_form(const schema& s) const {
@@ -103,18 +52,24 @@ partition_key partition_key::from_nodetool_style_string(const schema_ptr s, cons
     return partition_key::from_range(std::move(r));
 }
 
-std::ostream& operator<<(std::ostream& out, const bound_kind k) {
+auto fmt::formatter<bound_kind>::format(bound_kind k, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    std::string_view name;
     switch (k) {
     case bound_kind::excl_end:
-        return out << "excl end";
+        name = "excl end";
+        break;
     case bound_kind::incl_start:
-        return out << "incl start";
+        name = "incl start";
+        break;
     case bound_kind::incl_end:
-        return out << "incl end";
+        name = "incl end";
+        break;
     case bound_kind::excl_start:
-        return out << "excl start";
+        name = "excl start";
+        break;
     }
-    abort();
+    return fmt::format_to(ctx.out(), "{}", name);
 }
 
 bound_kind invert_kind(bound_kind k) {
@@ -152,3 +107,11 @@ int32_t weight(bound_kind k) {
 }
 
 const thread_local clustering_key_prefix bound_view::_empty_prefix = clustering_key::make_empty();
+
+std::ostream&
+operator<<(std::ostream& os, const exploded_clustering_prefix& ecp) {
+    // Can't pass to_hex() to transform(), since it is overloaded, so wrap:
+    auto enhex = [] (auto&& x) { return fmt_hex(x); };
+    fmt::print(os, "prefix{{{}}}", fmt::join(ecp._v | std::views::transform(enhex), ":"));
+    return os;
+}

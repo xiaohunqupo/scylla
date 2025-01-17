@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -57,7 +57,7 @@ sstring generate_random_salt_bytes(RandomNumberEngine& g) {
 ///
 scheme identify_best_supported_scheme();
 
-const char* prefix_for_scheme(scheme) noexcept;
+std::string_view prefix_for_scheme(scheme) noexcept;
 
 ///
 /// Generate a implementation-specific salt string for hashing passwords.
@@ -88,7 +88,7 @@ sstring hash_with_salt(const sstring& pass, const sstring& salt);
 /// Prior to applying the hashing function, random salt is amended to the cleartext. The random salt bytes are generated
 /// according to the random number engine `g`.
 ///
-/// The result is the encrypted cyphertext, and also the salt used but in a implementation-specific format.
+/// The result is the encrypted ciphertext, and also the salt used but in a implementation-specific format.
 ///
 /// \throws \ref std::system_error when the implementation-specific implementation fails to hash the cleartext.
 ///

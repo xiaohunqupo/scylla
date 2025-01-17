@@ -1,8 +1,8 @@
-==============
-Scylla Repair
-==============
+===============
+ScyllaDB Repair
+===============
 
-During the regular operation, a Scylla cluster continues to function and remains ‘always-on’ even in the face of failures such as:
+During the regular operation, a ScyllaDB cluster continues to function and remains ‘always-on’ even in the face of failures such as:
 
 * A down node
 * A network partition
@@ -11,10 +11,11 @@ During the regular operation, a Scylla cluster continues to function and remains
 * Process crashes (before a flush)
 * A replica that cannot write due to a lack of resources
 
-As long as the cluster can satisfy the required consistency level (usually quorum), availability and consistency will be maintained. However, in order to automatically mitigate data inconsistency (entropy), Scylla uses three processes:
+As long as the cluster can satisfy the required consistency level (usually quorum), availability and consistency will be maintained. However, in order to automatically mitigate data inconsistency (entropy), ScyllaDB uses three processes:
 
 * :doc:`Hinted Handoff </architecture/anti-entropy/hinted-handoff>`
 * :doc:`Read Repair </architecture/anti-entropy/read-repair>`
+* :doc:`Repair Based Node Operations </operating-scylla/procedures/cluster-management/repair-based-node-operation>`
 * Repair - described in the following sections
 
 Repair Overview
@@ -22,9 +23,9 @@ Repair Overview
 
 Data stored on nodes may become inconsistent with other replicas over time. For this reason, repairs are a necessary part of database maintenance.
 
-Scylla repair is a process that runs in the background and synchronizes the data between nodes so that all the replicas hold the same data.
+ScyllaDB repair is a process that runs in the background and synchronizes the data between nodes so that all the replicas hold the same data.
 Running repairs is necessary to ensure that data on a given node is consistent with the other nodes in the cluster. 
-You can manually run the ``nodetool repair`` command or schedule repair with `Scylla Manager <https://manager.docs.scylladb.com/stable/repair>`_, 
+You can manually run the ``nodetool repair`` command or schedule repair with `ScyllaDB Manager <https://manager.docs.scylladb.com/stable/repair>`_, 
 which can run repairs for you.
 
 .. note:: Run the :doc:`nodetool repair </operating-scylla/nodetool-commands/repair/>` command regularly. If you delete data frequently, it should be more often than the value of ``gc_grace_seconds`` (by default: 10 days), for example, every week. Use the **nodetool repair -pr** on each node in the cluster, sequentially.
@@ -36,13 +37,11 @@ In most cases, the proportion of data that is out of sync is very small.  In a f
 Row-level Repair
 ----------------
 
-.. versionadded:: 3.1 Scylla Open Source
+ScyllaDB uses row-level repair.
 
-In previous versions of Scylla (prior to 3.1), repairs were done on the partition level. Scylla 3.1 introduced row-level repair where the repair process only transferred the mismatched rows, instead of the entire partition.   
+Row-level repair improves ScyllaDB in two ways:
 
-Row-level repair improves Scylla in two ways:
-
-* Minimizes data transfer. With row-level repair, Scylla calculates the checksum for each row and uses set reconciliation algorithms to find the mismatches between nodes. As a result, only the mismatched rows are exchanged, which eliminates unnecessary data transmission over the network.
+* Minimizes data transfer. With row-level repair, ScyllaDB calculates the checksum for each row and uses set reconciliation algorithms to find the mismatches between nodes. As a result, only the mismatched rows are exchanged, which eliminates unnecessary data transmission over the network.
 
 * Minimize disk reads by :
 
@@ -50,34 +49,10 @@ Row-level repair improves Scylla in two ways:
   * keeping the data in a temporary buffer.
   * using the cached data to calculate the checksum and send it to the replicas.
 
-Repair Base Operation
----------------------
-
-.. versionadded:: 4.0 Scylla Open Source (disabled)
-
-ScyllaDB has two mechanisms to synchronize data between nodes:
-
-* Streaming - used for cluster topology changes, such as adding or removing nodes.
-* Row Level Repair - an offline process that compares and syncs data between nodes .
-
-With *Repair Base Operation*, Scylla uses row-level repair as the unified underlying mechanism for repair operation **and** all node operations, e.g., bootstrap, decommission, remove node, replace node, rebuild node.
-
-This safer process makes the node operations resumable, syncing only the inconsistent data.
-Also, replaced nodes now accept writes, which means there is no longer a need to repair after replacing a node.
-
-**This feature is disabled by default.**
-
-
-You can enable or disable this feature with a configuration parameter in the *scylla.yaml*:
-
-.. code-block:: none
-
-   enable_repair_based_node_ops: [true|false]
-
 See also
 
-* `Scylla Manager documentation <https://manager.docs.scylladb.com/>`_
+* `ScyllaDB Manager documentation <https://manager.docs.scylladb.com/>`_
 
-* `Blog: Scylla Open Source 3.1: Efficiently Maintaining Consistency with Row-Level Repair <https://www.scylladb.com/2019/08/13/scylla-open-source-3-1-efficiently-maintaining-consistency-with-row-level-repair/>`_
+* `Blog: ScyllaDB Open Source 3.1: Efficiently Maintaining Consistency with Row-Level Repair <https://www.scylladb.com/2019/08/13/scylla-open-source-3-1-efficiently-maintaining-consistency-with-row-level-repair/>`_
 
 

@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "types.hh"
+#include "types/types.hh"
 #include "utils/rjson.hh"
 
 bytes from_json_object(const abstract_type &t, const rjson::value& value);

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -20,6 +20,7 @@
 #include "utils/managed_ref.hh"
 #include "utils/managed_bytes.hh"
 #include "utils/managed_vector.hh"
+#include "dht/i_partitioner.hh"
 
 #include <seastar/core/fstream.hh>
 
@@ -148,7 +149,7 @@ public:
 //
 class clustered_index_cursor {
 public:
-    // Position of indexed elements in the data file realative to the start of the partition.
+    // Position of indexed elements in the data file relative to the start of the partition.
     using offset_in_partition = uint64_t;
 
     struct skip_info {
@@ -179,6 +180,8 @@ public:
     // Must be called for non-decreasing positions.
     // The caller must ensure that pos remains valid until the future resolves.
     virtual future<std::optional<skip_info>> advance_to(position_in_partition_view pos) = 0;
+
+    virtual skip_info current_block() = 0;
 
     // Determines the data file offset relative to the start of the partition such that fragments
     // from the range (-inf, pos] are located before that offset.
@@ -296,6 +299,10 @@ public:
     bool empty() const { return _entries.empty(); }
     size_t size() const { return _entries.size(); }
 
+    void clear_one_entry() {
+        _entries.pop_back();
+    }
+
     size_t external_memory_usage() const {
         size_t size = _entries.external_memory_usage();
         for (auto&& e : _entries) {
@@ -310,11 +317,19 @@ using index_list = partition_index_page;
 }
 
 inline std::ostream& operator<<(std::ostream& out, const sstables::promoted_index_block_position_view& pos) {
-    std::visit([&out] (const auto& pos) mutable { out << pos; }, pos);
+    std::visit([&out] (const auto& pos) mutable { fmt::print(out, "{}", pos); }, pos);
     return out;
 }
 
 inline std::ostream& operator<<(std::ostream& out, const sstables::promoted_index_block_position& pos) {
-    std::visit([&out] (const auto& pos) mutable { out << pos; }, pos);
+    std::visit([&out] (const auto& pos) mutable { fmt::print(out, "{}", pos); }, pos);
     return out;
 }
+
+template<>
+struct fmt::formatter<sstables::clustered_index_cursor::skip_info> : fmt::formatter<std::string_view> {
+    auto format(const sstables::clustered_index_cursor::skip_info& info, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+        return fmt::format_to(ctx.out(), "skip_info{{offset: {}, tombstone: ({}, {})}}",
+                              info.offset, info.active_tombstone_pos, info.active_tombstone);
+    }
+};

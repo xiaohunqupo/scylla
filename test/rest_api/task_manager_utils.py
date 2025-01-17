@@ -30,9 +30,6 @@ def wait_for_task(rest_api, task_id):
     resp.raise_for_status()
     return resp.json()
 
-async def wait_for_task_async(rest_api, task_id):
-    rest_api.send("GET", f"task_manager/wait_task/{task_id}")
-
 def get_task_status_recursively(rest_api, task_id):
     resp = rest_api.send("GET", f"task_manager/task_status_recursive/{task_id}")
     resp.raise_for_status()
@@ -56,4 +53,26 @@ def check_status_correctness(status, expected_status):
 
 def assert_task_does_not_exist(rest_api, task_id):
     resp = rest_api.send("GET", f"task_manager/task_status/{task_id}")
-    assert resp.status_code == requests.codes.internal_server_error, f"Task {task_id} is kept in memory"
+    assert resp.status_code == requests.codes.bad_request, f"Task {task_id} is kept in memory"
+
+def get_children(status_tree, parent_id):
+    return [s for s in status_tree if s["parent_id"] == parent_id]
+
+def check_child_parent_relationship(rest_api, status_tree, parent, allow_no_children):
+    assert allow_no_children or parent.get("children_ids", []), f"Child tasks were not created for {parent}"
+
+    for child in get_children(status_tree, parent["id"]):
+        child_id = child["id"]
+        assert child["kind"] == "node", "Child task isn't marked as local"
+        assert parent["sequence_number"] == child["sequence_number"], f"Child task with id {child_id} did not inherit parent's sequence number"
+        assert child["parent_id"] == parent["id"], f"Parent id of task with id {child_id} is not set"
+        check_child_parent_relationship(rest_api, status_tree, child, True)
+
+def drain_module_tasks(rest_api, module_name):
+    tasks = [task for task in list_tasks(rest_api, module_name, True)]
+    for task in tasks:
+        # Wait for task and unregister it.
+        resp = rest_api.send("GET", f"task_manager/wait_task/{task['task_id']}")
+        resp = rest_api.send("GET", f"task_manager/task_status/{task['task_id']}")
+        # The task may be already unregistered.
+        assert resp.status_code == requests.codes.ok or resp.status_code == requests.codes.bad_request, "Invalid status code"

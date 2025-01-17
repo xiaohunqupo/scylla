@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
@@ -15,7 +15,6 @@
 #include "service/storage_proxy.hh"
 #include "validation.hh"
 #include "view_info.hh"
-#include "db/extensions.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "cql3/query_processor.hh"
 
@@ -35,17 +34,12 @@ future<> alter_view_statement::check_access(query_processor& qp, const service::
         const data_dictionary::database db = qp.db();
         auto&& s = db.find_schema(keyspace(), column_family());
         if (s->is_view())  {
-            return state.has_column_family_access(db, keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
+            return state.has_column_family_access(keyspace(), s->view_info()->base_name(), auth::permission::ALTER);
         }
     } catch (const data_dictionary::no_such_column_family& e) {
         // Will be validated afterwards.
     }
     return make_ready_future<>();
-}
-
-void alter_view_statement::validate(query_processor&, const service::client_state& state) const
-{
-    // validated in prepare_schema_mutations()
 }
 
 view_ptr alter_view_statement::prepare_view(data_dictionary::database db) const {
@@ -62,7 +56,7 @@ view_ptr alter_view_statement::prepare_view(data_dictionary::database db) const 
     _properties->validate(db, keyspace(), schema_extensions);
 
     auto builder = schema_builder(schema);
-    _properties->apply_to_builder(builder, std::move(schema_extensions));
+    _properties->apply_to_builder(builder, std::move(schema_extensions), db, keyspace());
 
     if (builder.get_gc_grace_seconds() == 0) {
         throw exceptions::invalid_request_exception(
@@ -81,8 +75,8 @@ view_ptr alter_view_statement::prepare_view(data_dictionary::database db) const 
     return view_ptr(builder.build());
 }
 
-future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> alter_view_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
-    auto m = co_await qp.get_migration_manager().prepare_view_update_announcement(prepare_view(qp.db()), ts);
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>, cql3::cql_warnings_vec>> alter_view_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
+    auto m = co_await service::prepare_view_update_announcement(qp.proxy(), prepare_view(qp.db()), ts);
 
     using namespace cql_transport;
     auto ret = ::make_shared<event::schema_change>(
@@ -91,12 +85,12 @@ future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<
             keyspace(),
             column_family());
 
-    co_return std::make_pair(std::move(ret), std::move(m));
+    co_return std::make_tuple(std::move(ret), std::move(m), std::vector<sstring>());
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
 alter_view_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<alter_view_statement>(*this));
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<alter_view_statement>(*this));
 }
 
 }

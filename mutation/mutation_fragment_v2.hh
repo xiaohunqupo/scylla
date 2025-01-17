@@ -3,21 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "mutation_partition.hh"
 #include "mutation_fragment.hh"
 #include "position_in_partition.hh"
 
+#include <fmt/core.h>
 #include <optional>
 #include <seastar/util/optimized_optional.hh>
 
-#include <seastar/core/future-util.hh>
-
-#include "db/timeout_clock.hh"
 #include "reader_permit.hh"
 
 // Mutation fragment which represents a range tombstone boundary.
@@ -74,7 +71,14 @@ public:
         position_in_partition::equal_compare eq(s);
         return _tomb == other._tomb && eq(_pos, other._pos);
     }
-    friend std::ostream& operator<<(std::ostream& out, const range_tombstone_change&);
+};
+
+template<>
+struct fmt::formatter<range_tombstone_change> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const range_tombstone_change& rt, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{{range_tombstone_change: pos={}, {}}}", rt.position(), rt.tombstone());
+    }
 };
 
 template<typename T, typename ReturnType>
@@ -156,6 +160,7 @@ private:
     mutation_fragment_v2() = default;
     explicit operator bool() const noexcept { return bool(_data); }
     void destroy_data() noexcept;
+    void reset_memory(const schema& s, std::optional<reader_resources> res = {});
     friend class optimized_optional<mutation_fragment_v2>;
 
     friend class position_in_partition;
@@ -168,7 +173,7 @@ public:
         , _data(std::make_unique<data>(std::move(permit)))
     {
         new (&_data->_clustering_row) clustering_row(std::forward<Args>(args)...);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        _data->_memory.reset_to(reader_resources::with_memory(calculate_memory_usage(s)));
     }
 
     mutation_fragment_v2(const schema& s, reader_permit permit, static_row&& r);
@@ -196,7 +201,7 @@ public:
                 new (&_data->_partition_end) partition_end(o._data->_partition_end);
                 break;
         }
-        _data->_memory.reset(o._data->_memory.resources());
+        _data->_memory.reset_to(o._data->_memory.resources());
     }
     mutation_fragment_v2(mutation_fragment_v2&& other) = default;
     mutation_fragment_v2& operator=(mutation_fragment_v2&& other) noexcept {
@@ -233,19 +238,19 @@ public:
 
     void mutate_as_static_row(const schema& s, std::invocable<static_row&> auto&& fn) {
         fn(_data->_static_row);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        _data->_memory.reset_to(reader_resources::with_memory(calculate_memory_usage(s)));
     }
     void mutate_as_clustering_row(const schema& s, std::invocable<clustering_row&> auto&& fn) {
         fn(_data->_clustering_row);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        _data->_memory.reset_to(reader_resources::with_memory(calculate_memory_usage(s)));
     }
     void mutate_as_range_tombstone_change(const schema& s, std::invocable<range_tombstone_change&> auto&& fn) {
         fn(_data->_range_tombstone_chg);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        _data->_memory.reset_to(reader_resources::with_memory(calculate_memory_usage(s)));
     }
     void mutate_as_partition_start(const schema& s, std::invocable<partition_start&> auto&& fn) {
         fn(_data->_partition_start);
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+        _data->_memory.reset_to(reader_resources::with_memory(calculate_memory_usage(s)));
     }
 
     static_row&& as_static_row() && { return std::move(_data->_static_row); }
@@ -266,7 +271,7 @@ public:
     template<typename Consumer>
     requires MutationFragmentConsumerV2<Consumer, decltype(std::declval<Consumer>().consume(std::declval<range_tombstone_change>()))>
     decltype(auto) consume(Consumer& consumer) && {
-        _data->_memory.reset();
+        _data->_memory.reset_to_zero();
         switch (_kind) {
         case kind::static_row:
             return consumer.consume(std::move(_data->_static_row));
@@ -351,9 +356,9 @@ public:
         printer(const printer&) = delete;
         printer(printer&&) = delete;
 
-        friend std::ostream& operator<<(std::ostream& os, const printer& p);
+        friend fmt::formatter<printer>;
     };
-    friend std::ostream& operator<<(std::ostream& os, const printer& p);
+    friend fmt::formatter<printer>;
 
 private:
     size_t calculate_memory_usage(const schema& s) const {
@@ -361,7 +366,36 @@ private:
     }
 };
 
+template <> struct fmt::formatter<mutation_fragment_v2::printer> : fmt::formatter<string_view> {
+    auto format(const mutation_fragment_v2::printer&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
 std::ostream& operator<<(std::ostream&, mutation_fragment_v2::kind);
+
+template <> struct fmt::formatter<mutation_fragment_v2::kind> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(mutation_fragment_v2::kind k, FormatContext& ctx) const {
+        string_view name = "UNEXPECTED";
+        switch (k) {
+        case mutation_fragment_v2::kind::static_row:
+            name = "static row";
+            break;
+        case mutation_fragment_v2::kind::clustering_row:
+            name = "clustering row";
+            break;
+       case mutation_fragment_v2::kind::range_tombstone_change:
+            name = "range tombstone change";
+            break;
+        case mutation_fragment_v2::kind::partition_start:
+            name = "partition start";
+            break;
+        case mutation_fragment_v2::kind::partition_end:
+            name = "partition end";
+            break;
+        }
+        return formatter<string_view>::format(name, ctx);
+    }
+};
 
 // F gets a stream element as an argument and returns the new value which replaces that element
 // in the transformed stream.

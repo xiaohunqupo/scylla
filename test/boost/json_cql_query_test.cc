@@ -3,19 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <boost/range/irange.hpp>
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 
 #include <seastar/net/inet_address.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 
@@ -27,6 +27,8 @@
 #include "types/user.hh"
 #include "types/list.hh"
 #include "utils/rjson.hh"
+
+BOOST_AUTO_TEST_SUITE(json_cql_query_test)
 
 using namespace std::literals::chrono_literals;
 
@@ -57,7 +59,7 @@ SEASTAR_TEST_CASE(test_select_json_types) {
                 "    w int,"
                 ");").get();
 
-        e.require_table_exists("ks", "all_types").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "all_types"));
         e.execute_cql(
             "INSERT INTO all_types (a, b, c, d, e, f, \"G\", \"H\", \"I\", j, k, l, m, n, o, p, q, r, s, u) VALUES ("
                 "    'ascii',"
@@ -82,7 +84,7 @@ SEASTAR_TEST_CASE(test_select_json_types) {
                 "    1y2mo3w4d5h6m7s8ms9us10ns"
                 ");").get();
 
-        auto msg = e.execute_cql("SELECT JSON a, b, c, d, e, f, \"G\", \"H\", \"I\", j, k, l, m, n, o, p, q, r, s, u, w, unixtimestampof(k) FROM all_types WHERE a = 'ascii'").get0();
+        auto msg = e.execute_cql("SELECT JSON a, b, c, d, e, f, \"G\", \"H\", \"I\", j, k, l, m, n, o, p, q, r, s, u, w, unixtimestampof(k) FROM all_types WHERE a = 'ascii'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 utf8_type->decompose(
@@ -95,7 +97,7 @@ SEASTAR_TEST_CASE(test_select_json_types) {
                     "\"\\\"G\\\"\": \"127.0.0.1\", " // note the double quoting on case-sensitive column names
                     "\"\\\"H\\\"\": 3, "
                     "\"\\\"I\\\"\": \"zażółć gęślą jaźń\", "
-                    "\"j\": \"2001-10-18T14:15:55.134000\", "
+                    "\"j\": \"2001-10-18 14:15:55.134Z\", "
                     "\"k\": \"d2177dd0-eaa2-11de-a572-001b779c76e3\", "
                     "\"l\": \"d2177dd0-eaa2-11de-a572-001b779c76e3\", "
                     "\"m\": \"varchar\", "
@@ -104,10 +106,10 @@ SEASTAR_TEST_CASE(test_select_json_types) {
                     "\"p\": 3, "
                     "\"q\": 3, "
                     "\"r\": \"1970-01-02\", "
-                    "\"s\": 00:00:00.000000001, "
+                    "\"s\": \"00:00:00.000000001\", "
                     "\"u\": \"1y2mo25d5h6m7s8ms9us10ns\", "
                     "\"w\": null, "
-                    "\"unixtimestampof(k)\": 1261009589805}"
+                    "\"system.unixtimestampof(k)\": 1261009589805}"
                 )
             }
          });
@@ -115,7 +117,7 @@ SEASTAR_TEST_CASE(test_select_json_types) {
         msg = e.execute_cql("SELECT toJson(a), toJson(b), toJson(c), toJson(d), toJson(e), toJson(f),"
                 "toJson(\"G\"), toJson(\"H\"), toJson(\"I\"), toJson(j), toJson(k), toJson(l), toJson(m), toJson(n),"
                 "toJson(o), toJson(p), toJson(q), toJson(r), toJson(s), toJson(u), toJson(w),"
-                "toJson(unixtimestampof(k)), toJson(toJson(toJson(p))) FROM all_types WHERE a = 'ascii'").get0();
+                "toJson(unixtimestampof(k)), toJson(toJson(toJson(p))) FROM all_types WHERE a = 'ascii'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 utf8_type->decompose("\"ascii\""),
@@ -127,7 +129,7 @@ SEASTAR_TEST_CASE(test_select_json_types) {
                 utf8_type->decompose("\"127.0.0.1\""),
                 utf8_type->decompose("3"),
                 utf8_type->decompose("\"zażółć gęślą jaźń\""),
-                utf8_type->decompose("\"2001-10-18T14:15:55.134000\""),
+                utf8_type->decompose("\"2001-10-18 14:15:55.134Z\""),
                 utf8_type->decompose("\"d2177dd0-eaa2-11de-a572-001b779c76e3\""),
                 utf8_type->decompose("\"d2177dd0-eaa2-11de-a572-001b779c76e3\""),
                 utf8_type->decompose("\"varchar\""),
@@ -136,7 +138,7 @@ SEASTAR_TEST_CASE(test_select_json_types) {
                 utf8_type->decompose("3"),
                 utf8_type->decompose("3"),
                 utf8_type->decompose("\"1970-01-02\""),
-                utf8_type->decompose("00:00:00.000000001"),
+                utf8_type->decompose("\"00:00:00.000000001\""),
                 utf8_type->decompose("\"1y2mo25d5h6m7s8ms9us10ns\""),
                 utf8_type->decompose("null"),
                 utf8_type->decompose("1261009589805"),
@@ -156,7 +158,7 @@ SEASTAR_TEST_CASE(test_select_json_collections) {
                 "    d list<frozen<list<tinyint>>>"
                 ");").get();
 
-        e.require_table_exists("ks", "collections").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "collections"));
 
         e.execute_cql(
             "INSERT INTO collections (a, b, c, d) VALUES ("
@@ -166,7 +168,7 @@ SEASTAR_TEST_CASE(test_select_json_collections) {
                 "    [[ 3 , 1, 4, 1, 5, 9 ], [ ], [ 1, 1, 2 ]]"
                 ");").get();
 
-        auto msg = e.execute_cql("SELECT JSON * FROM collections WHERE a = 'key'").get0();
+        auto msg = e.execute_cql("SELECT JSON * FROM collections WHERE a = 'key'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 utf8_type->decompose(
@@ -178,7 +180,7 @@ SEASTAR_TEST_CASE(test_select_json_collections) {
             }
          });
 
-        msg = e.execute_cql("SELECT toJson(a), toJson(b), toJson(c), toJson(d) FROM collections WHERE a = 'key'").get0();
+        msg = e.execute_cql("SELECT toJson(a), toJson(b), toJson(c), toJson(d) FROM collections WHERE a = 'key'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 utf8_type->decompose("\"key\""),
@@ -225,7 +227,7 @@ SEASTAR_TEST_CASE(test_insert_json_types) {
                 "    u duration,"
                 ");").get();
 
-        e.require_table_exists("ks", "all_types").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "all_types"));
         e.execute_cql(
             "INSERT INTO all_types JSON '"
                 "{\"a\": \"ascii\", "
@@ -250,7 +252,7 @@ SEASTAR_TEST_CASE(test_insert_json_types) {
                 "\"u\": \"1y2mo25d5h6m7s8ms9us10ns\"}"
                 "'").get();
 
-        auto msg = e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii'").get0();
+        auto msg = e.execute_cql("SELECT * FROM all_types WHERE a = 'ascii'").get();
         struct tm t = { 0 };
         t.tm_year = 2001 - 1900;
         t.tm_mon = 10 - 1;
@@ -285,7 +287,7 @@ SEASTAR_TEST_CASE(test_insert_json_types) {
         e.execute_cql("UPDATE all_types SET n = fromJson('\"2147483648\"') WHERE a = fromJson('\"ascii\"');").get();
         e.execute_cql("UPDATE all_types SET o = fromJson('\"3.45\"') WHERE a = fromJson('\"ascii\"');").get();
 
-        msg = e.execute_cql("SELECT a, b, \"I\", n, o FROM all_types WHERE a = 'ascii'").get0();
+        msg = e.execute_cql("SELECT a, b, \"I\", n, o FROM all_types WHERE a = 'ascii'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 ascii_type->decompose(sstring("ascii")),
@@ -336,7 +338,7 @@ SEASTAR_TEST_CASE(test_insert_json_types) {
         )").get(), marshal_exception);
 
         e.execute_cql("CREATE TABLE multi_column_pk_table (p1 int, p2 int, p3 int, c1 int, c2 int, v int, PRIMARY KEY((p1, p2, p3), c1, c2));").get();
-        e.require_table_exists("ks", "multi_column_pk_table").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "multi_column_pk_table"));
 
         e.execute_cql("INSERT INTO multi_column_pk_table JSON '"
                 "{\"p1\": 1, "
@@ -347,7 +349,7 @@ SEASTAR_TEST_CASE(test_insert_json_types) {
                 "\"v\": 6 "
                 "}'").get();
 
-        msg = e.execute_cql("SELECT * FROM multi_column_pk_table").get0();
+        msg = e.execute_cql("SELECT * FROM multi_column_pk_table").get();
         assert_that(msg).is_rows().with_rows({
             {
                 int32_type->decompose(1),
@@ -371,7 +373,7 @@ SEASTAR_TEST_CASE(test_insert_json_collections) {
                 "    d list<frozen<list<tinyint>>>"
                 ");").get();
 
-        e.require_table_exists("ks", "collections").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "collections"));
 
         e.execute_cql(
             "INSERT INTO collections JSON '"
@@ -381,7 +383,7 @@ SEASTAR_TEST_CASE(test_insert_json_collections) {
                 "\"d\": [[3, 1, 4, 1, 5, 9], [], [1, 1, 2]]}"
                 "'").get();
 
-        auto msg = e.execute_cql("SELECT JSON * FROM collections WHERE a = 'key'").get0();
+        auto msg = e.execute_cql("SELECT JSON * FROM collections WHERE a = 'key'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 utf8_type->decompose(
@@ -394,7 +396,7 @@ SEASTAR_TEST_CASE(test_insert_json_collections) {
          });
 
         e.execute_cql("INSERT INTO collections JSON '{\"a\": \"key2\"}'").get();
-        msg = e.execute_cql("SELECT JSON * FROM collections WHERE a = 'key2'").get0();
+        msg = e.execute_cql("SELECT JSON * FROM collections WHERE a = 'key2'").get();
         assert_that(msg).is_rows().with_rows({
             {
                 utf8_type->decompose(
@@ -421,12 +423,12 @@ SEASTAR_TEST_CASE(test_insert_json_null_frozen_collections) {
                 "    u frozen<ut>"
                 ");").get();
 
-        e.require_table_exists("ks", "collections").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "collections"));
 
         e.execute_cql("INSERT INTO collections JSON '{\"k\": 0}'").get();
         e.execute_cql("INSERT INTO collections JSON '{\"k\": 1, \"m\": null, \"s\": null, \"l\": null, \"u\": null}'").get();
 
-        assert_that(e.execute_cql("SELECT JSON * FROM collections WHERE k = 0").get0()).is_rows().with_rows({
+        assert_that(e.execute_cql("SELECT JSON * FROM collections WHERE k = 0").get()).is_rows().with_rows({
             {
                 utf8_type->decompose(
                     "{\"k\": 0, "
@@ -438,7 +440,7 @@ SEASTAR_TEST_CASE(test_insert_json_null_frozen_collections) {
             }
          });
 
-        assert_that(e.execute_cql("SELECT JSON * FROM collections WHERE k = 1").get0()).is_rows().with_rows({
+        assert_that(e.execute_cql("SELECT JSON * FROM collections WHERE k = 1").get()).is_rows().with_rows({
             {
                 utf8_type->decompose(
                     "{\"k\": 1, "
@@ -571,7 +573,7 @@ SEASTAR_TEST_CASE(test_prepared_json) {
                 "    d list<float>"
                 ");").get();
 
-        e.require_table_exists("ks", "json_data").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "json_data"));
 
         cql3::prepared_cache_key_type prepared_id = e.prepare(
             "begin batch \n"
@@ -579,7 +581,7 @@ SEASTAR_TEST_CASE(test_prepared_json) {
                 "  insert into json_data json ?; \n"
                 "  insert into json_data json :named_bound1; \n"
                 "  insert into json_data json ?; \n"
-                "apply batch;").get0();
+                "apply batch;").get();
 
         std::vector<cql3::raw_value> raw_values;
         raw_values.emplace_back(cql3::raw_value::make_value(utf8_type->decompose(
@@ -593,22 +595,22 @@ SEASTAR_TEST_CASE(test_prepared_json) {
 
         e.execute_prepared(prepared_id, raw_values).get();
 
-        auto msg = e.execute_cql("select json * from json_data where a='a1'").get0();
+        auto msg = e.execute_cql("select json * from json_data where a='a1'").get();
         assert_that(msg).is_rows().with_rows({{
                 utf8_type->decompose(
                     "{\"a\": \"a1\", \"b\": {\"0\": \"zero\", \"3\": \"three\", \"6\": \"six\"}, \"c\": 1.23, \"d\": [1.25, 3.75, 2.5]}")
         }});
-        msg = e.execute_cql("select json * from json_data where a='a2'").get0();
+        msg = e.execute_cql("select json * from json_data where a='a2'").get();
         assert_that(msg).is_rows().with_rows({{
                 utf8_type->decompose(
                     "{\"a\": \"a2\", \"b\": {\"0\": \"zero\", \"6\": \"six\"}, \"c\": 1.23, \"d\": [3.75, 2.5]}")
         }});
-        msg = e.execute_cql("select json * from json_data where a='a3'").get0();
+        msg = e.execute_cql("select json * from json_data where a='a3'").get();
         assert_that(msg).is_rows().with_rows({{
                 utf8_type->decompose(
                     "{\"a\": \"a3\", \"b\": {\"0\": \"zero\", \"3\": \"three\"}, \"c\": 1.23, \"d\": [1.25, 2.5]}")
         }});
-        msg = e.execute_cql("select json * from json_data where a='a4'").get0();
+        msg = e.execute_cql("select json * from json_data where a='a4'").get();
         assert_that(msg).is_rows().with_rows({{
                 utf8_type->decompose(
                     "{\"a\": \"a4\", \"b\": {\"1\": \"one\"}, \"c\": 1.23, \"d\": [1]}")
@@ -627,11 +629,11 @@ SEASTAR_TEST_CASE(test_json_default_unset) {
                 "    d int,"
                 "PRIMARY KEY (a, b));").get();
 
-        e.require_table_exists("ks", "json_data").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "json_data"));
 
         e.execute_cql("INSERT INTO json_data JSON '{\"a\": \"abc\", \"b\": 2, \"c\": 1}'").get();
 
-        auto msg = e.execute_cql("select * from json_data where a='abc'").get0();
+        auto msg = e.execute_cql("select * from json_data where a='abc'").get();
         assert_that(msg).is_rows().with_rows({{
             {utf8_type->decompose(sstring("abc"))},
             {int32_type->decompose(2)},
@@ -641,7 +643,7 @@ SEASTAR_TEST_CASE(test_json_default_unset) {
 
         e.execute_cql("INSERT INTO json_data JSON '{\"a\": \"abc\", \"b\": 2, \"d\": 5}' DEFAULT UNSET").get();
 
-        msg = e.execute_cql("select * from json_data where a='abc'").get0();
+        msg = e.execute_cql("select * from json_data where a='abc'").get();
         assert_that(msg).is_rows().with_rows({{
             {utf8_type->decompose(sstring("abc"))},
             {int32_type->decompose(2)},
@@ -651,7 +653,7 @@ SEASTAR_TEST_CASE(test_json_default_unset) {
 
         e.execute_cql("INSERT INTO json_data JSON '{\"a\": \"abc\", \"b\": 2, \"d\": 4}' DEFAULT NULL").get();
 
-        msg = e.execute_cql("select * from json_data where a='abc'").get0();
+        msg = e.execute_cql("select * from json_data where a='abc'").get();
         assert_that(msg).is_rows().with_rows({{
             {utf8_type->decompose(sstring("abc"))},
             {int32_type->decompose(2)},
@@ -673,7 +675,7 @@ SEASTAR_TEST_CASE(test_json_insert_null) {
 
        e.execute_cql("INSERT INTO mytable JSON '{\"myid\" : \"id2\", \"mytext\" : \"text234\", \"mytext1\" : \"text235\", \"mytext2\" : null}';").get();
 
-        auto msg = e.execute_cql("SELECT * FROM mytable;").get0();
+        auto msg = e.execute_cql("SELECT * FROM mytable;").get();
         assert_that(msg).is_rows().with_rows({{
             {utf8_type->decompose(sstring("id2"))},
             {utf8_type->decompose(sstring("text234"))},
@@ -696,7 +698,7 @@ SEASTAR_TEST_CASE(test_json_tuple) {
 
         auto tt = tuple_type_impl::get_instance({int32_type, utf8_type, float_type});
 
-        auto msg = e.execute_cql("SELECT * FROM t;").get0();
+        auto msg = e.execute_cql("SELECT * FROM t;").get();
         assert_that(msg).is_rows().with_rows({{
             {int32_type->decompose(7)},
             {tt->decompose(make_tuple_value(tt, tuple_type_impl::native_type({int32_t(5), sstring("test123"), float(2.5)})))},
@@ -704,7 +706,7 @@ SEASTAR_TEST_CASE(test_json_tuple) {
 
         e.execute_cql("INSERT INTO t (id, v) VALUES (3, (5, 'test543', 4.5));").get();
 
-        msg = e.execute_cql("SELECT JSON * FROM t WHERE id = 3;").get0();
+        msg = e.execute_cql("SELECT JSON * FROM t WHERE id = 3;").get();
         assert_that(msg).is_rows().with_rows({{
             utf8_type->decompose(sstring("{\"id\": 3, \"v\": [5, \"test543\", 4.5]}"))
         }});
@@ -724,7 +726,7 @@ static future<> test_json_udt(bool frozen) {
 
         auto ut = user_type_impl::get_instance("ks", "utype", std::vector{bytes("first"), bytes("second"), bytes("third")}, {int32_type, utf8_type, float_type}, !frozen);
 
-        auto msg = e.execute_cql("SELECT * FROM t;").get0();
+        auto msg = e.execute_cql("SELECT * FROM t;").get();
         assert_that(msg).is_rows().with_rows({{
             {int32_type->decompose(7)},
             {ut->decompose(make_user_value(ut, user_type_impl::native_type({int32_t(5), sstring("test123"), float(2.5)})))},
@@ -732,14 +734,14 @@ static future<> test_json_udt(bool frozen) {
 
         e.execute_cql("INSERT INTO t (id, v) VALUES (3, (5, 'test543', 4.5));").get();
 
-        msg = e.execute_cql("SELECT JSON * FROM t WHERE id = 3;").get0();
+        msg = e.execute_cql("SELECT JSON * FROM t WHERE id = 3;").get();
         assert_that(msg).is_rows().with_rows({{
             utf8_type->decompose(sstring("{\"id\": 3, \"v\": {\"first\": 5, \"second\": \"test543\", \"third\": 4.5}}"))
         }});
 
         e.execute_cql("INSERT INTO t (id, v) VALUES (3, {\"first\": 3, \"third\": 4.5});").get();
 
-        msg = e.execute_cql("SELECT JSON * FROM t WHERE id = 3;").get0();
+        msg = e.execute_cql("SELECT JSON * FROM t WHERE id = 3;").get();
         assert_that(msg).is_rows().with_rows({{
             utf8_type->decompose(sstring("{\"id\": 3, \"v\": {\"first\": 3, \"second\": null, \"third\": 4.5}}"))
         }});
@@ -752,7 +754,7 @@ static future<> test_json_udt(bool frozen) {
         e.execute_cql(format("CREATE TABLE t2(id int PRIMARY KEY, v {});", frozen ? "frozen<utype2>" : "utype2")).get();
 
         e.execute_cql("INSERT INTO t2 (id, v) VALUES (1, (7));").get();
-        msg = e.execute_cql("SELECT JSON * FROM t2 WHERE id = 1;").get0();
+        msg = e.execute_cql("SELECT JSON * FROM t2 WHERE id = 1;").get();
         assert_that(msg).is_rows().with_rows({{
             utf8_type->decompose(sstring("{\"id\": 1, \"v\": {\"WeirdNameThatNeedsEscaping\\\\n,)\": 7}}"))
         }});
@@ -785,7 +787,9 @@ SEASTAR_TEST_CASE(test_unpack_decimal){
         auto lt = list_type_impl::get_instance(ut, true);
         auto lt_val = lt->decompose(make_list_value(lt, list_type_impl::native_type{{ut_val}}));
 
-        auto msg = e.execute_cql("select * from t where id = 1;").get0();
+        auto msg = e.execute_cql("select * from t where id = 1;").get();
         assert_that(msg).is_rows().with_rows({{int32_type->decompose(1), lt_val}});
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -99,6 +99,7 @@ private:
     friend class impl;
     database(const impl* ops, const void* database);
 public:
+    const table_schema_version& get_version() const;
     keyspace find_keyspace(std::string_view name) const;
     std::optional<keyspace> try_find_keyspace(std::string_view name) const;
     bool has_keyspace(std::string_view name) const;  // throws no_keyspace
@@ -119,11 +120,12 @@ public:
     schema_ptr find_indexed_table(std::string_view ks_name, std::string_view index_name) const;
     sstring get_available_index_name(std::string_view ks_name, std::string_view table_name,
                                                std::optional<sstring> index_name_root) const;
-    schema_ptr get_cdc_base_table(sstring_view ks_name, std::string_view table_name) const;
+    schema_ptr get_cdc_base_table(std::string_view ks_name, std::string_view table_name) const;
     schema_ptr get_cdc_base_table(const schema&) const;
     const db::extensions& extensions() const;
     const gms::feature_service& features() const;
     replica::database& real_database() const; // For transition; remove
+    replica::database* real_database_ptr() const;
 };
 
 }

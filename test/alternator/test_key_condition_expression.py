@@ -1,15 +1,17 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the KeyConditionExpression parameter of the Query operation.
 # KeyConditionExpression is a newer version of the older "KeyConditions"
 # syntax. That older syntax is tested in test_query.py and test_key_conditions.py.
 
 import pytest
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
-import random
-from util import random_string, full_query, multiset
+
+from test.alternator.util import random_string, full_query, multiset
+
 
 # The test_table_{sn,ss,sb}_with_sorted_partition fixtures are the regular
 # test_table_{sn,ss,sb} fixture with a partition inserted with many items.
@@ -245,7 +247,7 @@ def test_key_condition_expression_parser(test_table_sn_with_sorted_partition):
         ExpressionAttributeValues={':p': p, ':c': 3})
     expected_items = [item for item in items if item['c'] == 3]
     assert(got_items == expected_items)
-    # Strangely, although one pair of unnecesary parentheses are allowed
+    # Strangely, although one pair of unnecessary parentheses are allowed
     # in each level, DynamoDB forbids more than one - it refuses to accept
     # the expression ((c=:c) AND ((p=:p))) with one too many redundant levels
     # of parentheses. However, we chose not to implement this extra check
@@ -544,7 +546,6 @@ def test_key_condition_expression_unsigned_bytes(test_table_sb):
 # the KeyConditionExpression string, it uses boto3's "Key" condition builder.
 # That shouldn't make any difference, however - that builder also builds a
 # string.
-from boto3.dynamodb.conditions import Key
 def test_query_key_condition_expression(dynamodb, filled_test_table):
     test_table, items = filled_test_table
     paginator = dynamodb.meta.client.get_paginator('query')

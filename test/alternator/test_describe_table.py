@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the DescribeTable operation.
 # Some attributes used only by a specific major feature will be tested
@@ -18,7 +18,7 @@ import pytest
 from botocore.exceptions import ClientError
 import re
 import time
-from util import multiset
+from test.alternator.util import multiset
 
 # Test that DescribeTable correctly returns the table's name and state
 def test_describe_table_basic(test_table):
@@ -105,7 +105,7 @@ def test_describe_table_provisioned_throughput(test_table):
 
 # This is a silly test for the RestoreSummary attribute in DescribeTable -
 # it should not exist in a table not created by a restore. When testing
-# the backup/restore feature, we will have more meaninful tests for the
+# the backup/restore feature, we will have more meaningful tests for the
 # value of this attribute in that case.
 def test_describe_table_restore_summary(test_table):
     got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']

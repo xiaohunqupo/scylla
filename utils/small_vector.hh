@@ -3,20 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include <compare>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <new>
 #include <utility>
+#include <ranges>
 #include <algorithm>
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
+#include <malloc.h>
+#include <iostream>
+#include <fmt/ostream.h>
 
 namespace utils {
 
@@ -101,7 +106,7 @@ private:
     }
 
     void reserve_at_least(size_t n) {
-        if (__builtin_expect(_begin + n > _capacity_end, false)) {
+        if (__builtin_expect(n > capacity(), false)) {
             expand(std::max(n, capacity() * 2));
         }
     }
@@ -137,6 +142,19 @@ public:
             _end = std::uninitialized_copy(first, last, _end);
         } else {
             std::copy(first, last, std::back_inserter(*this));
+        }
+    }
+
+    // This constructor supports converting ranges to small vectors via
+    // std::range::to<utils::small_vector<T, N>>().
+    small_vector(std::from_range_t, std::ranges::range auto&& range) : small_vector() {
+        using Range = decltype(range);
+        if constexpr (std::ranges::sized_range<Range> || std::ranges::forward_range<Range>) {
+            auto n = std::ranges::distance(range);
+            reserve(n);
+            _end = std::ranges::uninitialized_copy(range, std::ranges::subrange(_end, _end + n)).out;
+        } else {
+            std::ranges::copy(range, std::back_inserter(*this));
         }
     }
 
@@ -233,8 +251,19 @@ public:
         }
     }
 
+    static constexpr size_t internal_capacity() noexcept {
+        return N;
+    }
+
+    size_t external_memory_usage() const {
+        if (uses_internal_storage()) {
+            return 0;
+        }
+        return ::malloc_usable_size(_begin);
+    }
+
     void reserve(size_t n) {
-        if (__builtin_expect(_begin + n > _capacity_end, false)) {
+        if (__builtin_expect(n > capacity(), false)) {
             expand(n);
         }
     }
@@ -442,27 +471,19 @@ public:
         std::swap(*this, other);
     }
 
-    bool operator==(const small_vector& other) const noexcept {
-        return size() == other.size() && std::equal(_begin, _end, other.begin());
+    auto operator<=>(const small_vector& other) const noexcept requires std::three_way_comparable<T> {
+        return std::lexicographical_compare_three_way(this->begin(), this->end(),
+                                                      other.begin(), other.end());
     }
 
-    bool operator!=(const small_vector& other) const noexcept {
-        return !(*this == other);
+    bool operator==(const small_vector& other) const noexcept {
+        return size() == other.size() && std::equal(_begin, _end, other.begin());
     }
 };
 
 template <typename T, size_t N>
 std::ostream& operator<<(std::ostream& os, const utils::small_vector<T, N>& v) {
-    os << "{";
-    bool first = true;
-    for (auto&& e : v) {
-        if (!first) {
-            os << ", ";
-        }
-        first = false;
-        os << e;
-    }
-    os << "}";
+    fmt::print(os, "{}", v);
     return os;
 }
 

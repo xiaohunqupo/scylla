@@ -6,18 +6,26 @@
 CQLSh: the CQL shell
 --------------------
 
-cqlsh is a command line shell for interacting with Cassandra through CQL (the Cassandra Query Language).  It is shipped
-with every Cassandra package and can be found in the bin/ directory alongside the Cassandra executable.  cqlsh utilizes
-the Python native protocol driver and connects to the single node specified on the command line.
+cqlsh is a command line shell for interacting with ScyllaDB through CQL 
+(the Cassandra Query Language). It is shipped with every ScyllaDB package 
+and can be found in the ``bin/`` directory. In addition, it is available on 
+`Docker Hub <https://hub.docker.com/r/scylladb/scylla-cqlsh>`_ and in 
+the `Python Package Index (PyPI) <https://pypi.org/project/scylla-cqlsh/>`_.
+
+cqlsh utilizes the Python native protocol driver and connects to the single 
+node specified on the command line.
+
+See the `scylla-cqlsh <https://github.com/scylladb/scylla-cqlsh>`_ repository 
+on GitHub for usage examples.
 
 
 Compatibility
 ^^^^^^^^^^^^^
 
-cqlsh is compatible with Python 2.7.
+cqlsh is compatible with Python 3.8 - Python 3.11.
 
-In general, a given version of cqlsh is only guaranteed to work with the version of Cassandra that it was released with.
-In some cases, cqlsh may work with older or newer versions of Cassandra, but this is not officially supported.
+A given version of cqlsh is only guaranteed to work with the version of ScyllaDB that it was released with.
+cqlsh may work with older or newer versions of ScyllaDB without any guarantees.
 
 
 Optional Dependencies
@@ -72,13 +80,13 @@ Options:
   ``/usr/bin/google-chrome-stable %s``).
 
 ``--ssl``
-  Use SSL when connecting to Cassandra
+  Use SSL when connecting to ScyllaDB.
 
 ``-u`` ``--user``
-  Username to authenticate against Cassandra with
+  Username to authenticate against ScyllaDB.
 
 ``-p`` ``--password``
-  The password to authenticate against Cassandra with should
+  The password to authenticate against ScyllaDB, which should
   be used in conjunction with ``--user``
 
 ``-k`` ``--keyspace``
@@ -162,17 +170,17 @@ consistency ``ALL`` is not guaranteed to be enough).
 
 SHOW VERSION
 ~~~~~~~~~~~~
-This command is useful if you want to check which Cassandra version is compatible with your Scylla version.
+This command is useful if you want to check which Cassandra version is compatible with your ScyllaDB version.
 Note that the two standards are not 100% identical and this command is simply a comparison tool.
 
-If you want to display your current Scylla Version, refer to :ref:`Check your current version of Scylla <check-your-current-version-of-scylla>`.
+If you want to display your current ScyllaDB version, refer to :ref:`Check your current version of ScyllaDB <check-your-current-version-of-scylla>`.
 
 The display shows:
 
 * The cqlsh tool version that you're using
-* The Apache Cassandra version that your version of Scylla is most compatible with
-* The CQL protocol standard that your version of Scylla is most compatible with
-* The native protocol standard that your version of Scylla is most compatible with
+* The Apache Cassandra version that your version of ScyllaDB is most compatible with
+* The CQL protocol standard that your version of ScyllaDB is most compatible with
+* The native protocol standard that your version of ScyllaDB is most compatible with
 
 Example:
 
@@ -191,7 +199,7 @@ Returns:
 SHOW HOST
 ~~~~~~~~~
 
-Prints the IP address and port of the Cassandra node that cqlsh is connected to in addition to the cluster name.
+Prints the IP address and port of the ScyllaDB node that cqlsh is connected to in addition to the cluster name.
 
 Example:
 
@@ -324,7 +332,7 @@ contents of a single column are large.
 LOGIN
 ~~~~~
 
-Authenticate as a specified Cassandra user for the current session.
+Authenticate as a specified ScyllaDB user for the current session.
 
 `Usage`::
 
@@ -380,6 +388,9 @@ dumping all or portions of the schema.
 
 In any of the commands, ``DESC`` may be used in place of ``DESCRIBE``.
 
+You may also omit what you want to describe and just simply use ``DESCRIBE <name>``. This will look for the object 
+ in a specific order: keyspace, table, view, index, user-defined type, user-defined function, user-defined aggregate.
+
 The ``DESCRIBE CLUSTER`` command prints the cluster name and partitioner::
 
 
@@ -388,8 +399,11 @@ The ``DESCRIBE CLUSTER`` command prints the cluster name and partitioner::
     Cluster: Test Cluster
     Partitioner: Murmur3Partitioner
 
-The ``DESCRIBE SCHEMA`` command prints the DDL statements needed to recreate the entire schema.  This is especially
-useful for dumping the schema in order to clone a cluster or restore from a backup.
+The ``DESCRIBE SCHEMA`` command prints the DDL statements needed to recreate the entire schema. The higher tiers of the statement
+can also include information that can be used to restore authentication/authorization and service levels. This is especially
+useful for cloning a cluster or restoring its state from a backup.
+
+See :doc:`a dedicated article </cql/describe-schema>` to learn more.
 
 .. _cqlsh-copy-to:
 
@@ -528,7 +542,7 @@ Options that are common to both ``COPY TO`` and ``COPY FROM``.
 
 See also:
 
-CQLSH `lesson <https://university.scylladb.com/courses/data-modeling/lessons/basic-data-modeling-2/topic/cql-cqlsh-and-basic-cql-syntax/>`_ on Scylla University
+CQLSH `lesson <https://university.scylladb.com/courses/data-modeling/lessons/basic-data-modeling-2/topic/cql-cqlsh-and-basic-cql-syntax/>`_ on ScyllaDB University
 
 * :doc:`Apache Cassandra Query Language (CQL) Reference </cql/index>`
 

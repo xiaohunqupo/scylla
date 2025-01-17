@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -213,7 +213,7 @@ updateable_value<T>::observe(std::function<void (const T&)> callback) const {
 
 // Automatically updates a value from a utils::updateable_value
 // Where they can be of different types.
-// An optional transfom function can provide an additional transformation
+// An optional transform function can provide an additional transformation
 // when updating the value, like multiplying it by a factor for unit conversion,
 // for example.
 template <typename ValueType, typename UpdateableValueType>

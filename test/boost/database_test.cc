@@ -3,30 +3,38 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
 #include <seastar/core/seastar.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/util/file.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
+#include <utility>
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/result_set_assertions.hh"
 #include "test/lib/log.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/simple_schema.hh"
+#include "test/lib/test_utils.hh"
 #include "test/lib/key_utils.hh"
 
 #include "replica/database.hh"
+#include "utils/assert.hh"
 #include "utils/lister.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/frozen_mutation.hh"
 #include "test/lib/mutation_source_test.hh"
-#include "schema/schema_registry.hh"
+#include "schema/schema_builder.hh"
 #include "service/migration_manager.hh"
 #include "sstables/sstables.hh"
 #include "sstables/generation_type.hh"
@@ -36,19 +44,24 @@
 #include "test/lib/tmpdir.hh"
 #include "db/data_listeners.hh"
 #include "multishard_mutation_query.hh"
+#include "mutation_query.hh"
 #include "transport/messages/result_message.hh"
+#include "compaction/compaction_manager.hh"
 #include "db/snapshot-ctl.hh"
+#include "db/system_keyspace.hh"
+#include "db/view/view_builder.hh"
+#include "replica/mutation_dump.hh"
 
 using namespace std::chrono_literals;
 using namespace sstables;
 
-class database_test {
+class database_test_wrapper {
     replica::database& _db;
 public:
-    explicit database_test(replica::database& db) : _db(db) { }
+    explicit database_test_wrapper(replica::database& db) : _db(db) { }
 
     reader_concurrency_semaphore& get_user_read_concurrency_semaphore() {
-        return _db._read_concurrency_sem;
+        return _db.read_concurrency_sem();
     }
     reader_concurrency_semaphore& get_streaming_read_concurrency_semaphore() {
         return _db._streaming_concurrency_sem;
@@ -56,11 +69,20 @@ public:
     reader_concurrency_semaphore& get_system_read_concurrency_semaphore() {
         return _db._system_read_concurrency_sem;
     }
+
+    size_t get_total_user_reader_concurrency_semaphore_memory() {
+        return _db._reader_concurrency_semaphores_group._total_memory;
+    }
+
+    size_t get_total_user_reader_concurrency_semaphore_weight() {
+        return _db._reader_concurrency_semaphores_group._total_weight;
+    }
 };
 
 static future<> apply_mutation(sharded<replica::database>& sharded_db, table_id uuid, const mutation& m, bool do_flush = false,
         db::commitlog::force_sync fs = db::commitlog::force_sync::no, db::timeout_clock::time_point timeout = db::no_timeout) {
-    auto shard = m.shard_of();
+    auto& t = sharded_db.local().find_column_family(uuid);
+    auto shard = t.shard_for_reads(m.token());
     return sharded_db.invoke_on(shard, [uuid, fm = freeze(m), do_flush, fs, timeout] (replica::database& db) {
         auto& t = db.find_column_family(uuid);
         return db.apply(t.schema(), fm, tracing::trace_state_ptr(), fs, timeout).then([do_flush, &t] {
@@ -69,22 +91,24 @@ static future<> apply_mutation(sharded<replica::database>& sharded_db, table_id 
     });
 }
 
+future<> do_with_cql_env_and_compaction_groups_cgs(unsigned cgs, std::function<void(cql_test_env&)> func, cql_test_config cfg = {}, thread_attributes thread_attr = {}) {
+    // clean the dir before running
+    if (cfg.db_config->data_file_directories.is_set()) {
+        co_await recursive_remove_directory(fs::path(cfg.db_config->data_file_directories()[0]));
+        co_await recursive_touch_directory(cfg.db_config->data_file_directories()[0]);
+    }
+    // TODO: perhaps map log2_compaction_groups into initial_tablets when creating the testing keyspace.
+    co_await do_with_cql_env_thread(func, cfg, thread_attr);
+}
+
 future<> do_with_cql_env_and_compaction_groups(std::function<void(cql_test_env&)> func, cql_test_config cfg = {}, thread_attributes thread_attr = {}) {
-#ifdef SEASTAR_DEBUG
-    std::vector<unsigned> x_log2_compaction_group_values = { 0 /* 1 CG */, 1 /* 2 CGs */ };
-#else
-    std::vector<unsigned> x_log2_compaction_group_values = { 0 /* 1 CG */, 1 /* 2 CGs */, 8 /* 256 CGs */ };
-#endif
+    std::vector<unsigned> x_log2_compaction_group_values = { 0 /* 1 CG */ };
     for (auto x_log2_compaction_groups : x_log2_compaction_group_values) {
-        // clean the dir before running
-        if (cfg.db_config->data_file_directories.is_set()) {
-            co_await recursive_remove_directory(fs::path(cfg.db_config->data_file_directories()[0]));
-            co_await recursive_touch_directory(cfg.db_config->data_file_directories()[0]);
-        }
-        cfg.db_config->x_log2_compaction_groups(x_log2_compaction_groups);
-        co_await do_with_cql_env_thread(func, cfg, thread_attr);
+        co_await do_with_cql_env_and_compaction_groups_cgs(x_log2_compaction_groups, func, cfg, thread_attr);
     }
 }
+
+BOOST_AUTO_TEST_SUITE(database_test)
 
 SEASTAR_TEST_CASE(test_safety_after_truncate) {
     auto cfg = make_shared<db::config>();
@@ -95,6 +119,7 @@ SEASTAR_TEST_CASE(test_safety_after_truncate) {
         sstring ks_name = "ks";
         sstring cf_name = "cf";
         auto s = db.find_schema(ks_name, cf_name);
+        auto&& table = db.find_column_family(s);
         auto uuid = s->id();
 
         std::vector<size_t> keys_per_shard;
@@ -105,7 +130,7 @@ SEASTAR_TEST_CASE(test_safety_after_truncate) {
             auto pkey = partition_key::from_single_value(*s, to_bytes(fmt::format("key{}", i)));
             mutation m(s, pkey);
             m.set_clustered_cell(clustering_key_prefix::make_empty(), "v", int32_t(42), {});
-            auto shard = m.shard_of();
+            auto shard = table.shard_for_reads(m.token());
             keys_per_shard[shard]++;
             pranges_per_shard[shard].emplace_back(dht::partition_range::make_singular(dht::decorate_key(*s, std::move(pkey))));
             apply_mutation(e.db(), uuid, m).get();
@@ -124,7 +149,7 @@ SEASTAR_TEST_CASE(test_safety_after_truncate) {
         };
         assert_query_result(keys_per_shard);
 
-        replica::database::truncate_table_on_all_shards(e.db(), "ks", "cf").get();
+        replica::database::truncate_table_on_all_shards(e.db(), e.get_system_keyspace(), "ks", "cf").get();
 
         for (auto it = keys_per_shard.begin(); it < keys_per_shard.end(); ++it) {
             *it = 0;
@@ -133,7 +158,7 @@ SEASTAR_TEST_CASE(test_safety_after_truncate) {
 
         e.db().invoke_on_all([&] (replica::database& db) -> future<> {
             auto cl = db.commitlog();
-            auto rp = co_await db::commitlog_replayer::create_replayer(e.db());
+            auto rp = co_await db::commitlog_replayer::create_replayer(e.db(), e.get_system_keyspace());
             auto paths = co_await cl->list_existing_segments();
             co_await rp.recover(paths, db::commitlog::descriptor::FILENAME_PREFIX);
         }).get();
@@ -159,11 +184,10 @@ SEASTAR_TEST_CASE(test_truncate_without_snapshot_during_writes) {
         int count = 0;
 
         auto insert_data = [&] (uint32_t begin, uint32_t end) {
-            return parallel_for_each(boost::irange(begin, end), [&] (auto i) {
+            return parallel_for_each(std::views::iota(begin, end), [&] (auto i) {
                 auto pkey = partition_key::from_single_value(*s, to_bytes(fmt::format("key-{}", tests::random::get_int<uint64_t>())));
                 mutation m(s, pkey);
                 m.set_clustered_cell(clustering_key_prefix::make_empty(), "v", int32_t(42), {});
-                auto shard = m.shard_of();
                 return apply_mutation(e.db(), uuid, m, true /* do_flush */).finally([&] {
                     ++count;
                 });
@@ -173,13 +197,35 @@ SEASTAR_TEST_CASE(test_truncate_without_snapshot_during_writes) {
         uint32_t num_keys = 1000;
 
         auto f0 = insert_data(0, num_keys);
-        auto f1 = do_until([&] { return count >= num_keys; }, [&, ts = db_clock::now()] {
-            return replica::database::truncate_table_on_all_shards(e.db(), "ks", "cf", ts, false /* with_snapshot */).then([] {
+        auto f1 = do_until([&] { return std::cmp_greater_equal(count, num_keys); }, [&, ts = db_clock::now()] {
+            return replica::database::truncate_table_on_all_shards(e.db(), e.get_system_keyspace(), "ks", "cf", ts, false /* with_snapshot */).then([] {
                 return yield();
             });
         });
         f0.get();
         f1.get();
+    }, cfg);
+}
+
+// Reproducer for:
+//   https://github.com/scylladb/scylla/issues/21719
+SEASTAR_TEST_CASE(test_truncate_saves_replay_position) {
+    auto cfg = make_shared<db::config>();
+    cfg->auto_snapshot.set(false);
+    return do_with_cql_env_and_compaction_groups([] (cql_test_env& e) {
+        BOOST_REQUIRE_GT(smp::count, 1);
+        const sstring ks_name = "ks";
+        const sstring cf_name = "cf";
+        e.execute_cql(fmt::format("CREATE TABLE {}.{} (k TEXT PRIMARY KEY, v INT);", ks_name, cf_name)).get();
+        const table_id uuid = e.local_db().find_uuid(ks_name, cf_name);
+
+        replica::database::truncate_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, cf_name, db_clock::now(), false /* with_snapshot */).get();
+
+        auto res = e.execute_cql(fmt::format("SELECT * FROM system.truncated WHERE table_uuid = {}", uuid)).get();
+        auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
+        BOOST_REQUIRE(rows);
+        auto row_count = rows->rs().result_set().size();
+        BOOST_REQUIRE_EQUAL(row_count, smp::count);
     }, cfg);
 }
 
@@ -189,6 +235,7 @@ SEASTAR_TEST_CASE(test_querying_with_limits) {
             e.execute_cql("create table ks.cf (k text, v int, primary key (k));").get();
             auto& db = e.local_db();
             auto s = db.find_schema("ks", "cf");
+            auto&& table = db.find_column_family(s);
             auto uuid = s->id();
             std::vector<size_t> keys_per_shard;
             std::vector<dht::partition_range_vector> pranges_per_shard;
@@ -199,7 +246,7 @@ SEASTAR_TEST_CASE(test_querying_with_limits) {
                 mutation m(s, pkey);
                 m.partition().apply(tombstone(api::timestamp_type(1), gc_clock::now()));
                 apply_mutation(e.db(), uuid, m).get();
-                auto shard = m.shard_of();
+                auto shard = table.shard_for_reads(m.token());
                 pranges_per_shard[shard].emplace_back(dht::partition_range::make_singular(dht::decorate_key(*s, std::move(pkey))));
             }
             for (uint32_t i = 3 * smp::count; i <= 8 * smp::count; ++i) {
@@ -207,7 +254,7 @@ SEASTAR_TEST_CASE(test_querying_with_limits) {
                 mutation m(s, pkey);
                 m.set_clustered_cell(clustering_key_prefix::make_empty(), "v", int32_t(42), 1);
                 apply_mutation(e.db(), uuid, m).get();
-                auto shard = m.shard_of();
+                auto shard = table.shard_for_reads(m.token());
                 keys_per_shard[shard]++;
                 pranges_per_shard[shard].emplace_back(dht::partition_range::make_singular(dht::decorate_key(*s, std::move(pkey))));
             }
@@ -251,21 +298,21 @@ SEASTAR_TEST_CASE(test_querying_with_limits) {
     });
 }
 
-static void test_database(void (*run_tests)(populate_fn_ex, bool)) {
-    do_with_cql_env_and_compaction_groups([run_tests] (cql_test_env& e) {
+static void test_database(void (*run_tests)(populate_fn_ex, bool), unsigned cgs) {
+    do_with_cql_env_and_compaction_groups_cgs(cgs, [run_tests] (cql_test_env& e) {
         run_tests([&] (schema_ptr s, const std::vector<mutation>& partitions, gc_clock::time_point) -> mutation_source {
             auto& mm = e.migration_manager().local();
             try {
                 auto group0_guard = mm.start_group0_operation().get();
                 auto ts = group0_guard.write_timestamp();
                 e.local_db().find_column_family(s->ks_name(), s->cf_name());
-                mm.announce(mm.prepare_column_family_drop_announcement(s->ks_name(), s->cf_name(), ts).get(), std::move(group0_guard)).get();
+                mm.announce(service::prepare_column_family_drop_announcement(mm.get_storage_proxy(), s->ks_name(), s->cf_name(), ts).get(), std::move(group0_guard), "").get();
             } catch (const replica::no_such_column_family&) {
                 // expected
             }
             auto group0_guard = mm.start_group0_operation().get();
             auto ts = group0_guard.write_timestamp();
-            mm.announce(mm.prepare_new_column_family_announcement(s, ts).get(), std::move(group0_guard)).get();
+            mm.announce(service::prepare_new_column_family_announcement(mm.get_storage_proxy(), s, ts).get(), std::move(group0_guard), "").get();
             replica::column_family& cf = e.local_db().find_column_family(s);
             auto uuid = cf.schema()->id();
             for (auto&& m : partitions) {
@@ -277,22 +324,96 @@ static void test_database(void (*run_tests)(populate_fn_ex, bool)) {
                     reader_permit permit,
                     const dht::partition_range& range,
                     const query::partition_slice& slice,
-                    const io_priority_class& pc,
                     tracing::trace_state_ptr trace_state,
                     streamed_mutation::forwarding fwd,
                     mutation_reader::forwarding fwd_mr) {
-                return cf.make_reader_v2(s, std::move(permit), range, slice, pc, std::move(trace_state), fwd, fwd_mr);
+                return cf.make_reader_v2(s, std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
             });
         }, true);
     }).get();
 }
 
-SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain) {
-    test_database(run_mutation_source_tests_plain);
+// plain cg0
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_basic_cg0) {
+    test_database(run_mutation_source_tests_plain_basic, 0);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse) {
-    test_database(run_mutation_source_tests_reverse);
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_reader_conversion_cg0) {
+    test_database(run_mutation_source_tests_plain_reader_conversion, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_fragments_monotonic_cg0) {
+    test_database(run_mutation_source_tests_plain_fragments_monotonic, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_read_back_cg0) {
+    test_database(run_mutation_source_tests_plain_read_back, 0);
+}
+
+// plain cg1
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_basic_cg1) {
+    test_database(run_mutation_source_tests_plain_basic, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_reader_conversion_cg1) {
+    test_database(run_mutation_source_tests_plain_reader_conversion, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_fragments_monotonic_cg1) {
+    test_database(run_mutation_source_tests_plain_fragments_monotonic, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_plain_read_back_cg1) {
+    test_database(run_mutation_source_tests_plain_read_back, 1);
+}
+
+// reverse cg0
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_basic_cg0) {
+    test_database(run_mutation_source_tests_reverse_basic, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_reader_conversion_cg0) {
+    test_database(run_mutation_source_tests_reverse_reader_conversion, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_fragments_monotonic_cg0) {
+    test_database(run_mutation_source_tests_reverse_fragments_monotonic, 0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_read_back_cg0) {
+    test_database(run_mutation_source_tests_reverse_read_back, 0);
+}
+
+// reverse cg1
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_basic_cg1) {
+    test_database(run_mutation_source_tests_reverse_basic, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_reader_conversion_cg1) {
+    test_database(run_mutation_source_tests_reverse_reader_conversion, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_fragments_monotonic_cg1) {
+    test_database(run_mutation_source_tests_reverse_fragments_monotonic, 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_database_with_data_in_sstables_is_a_mutation_source_reverse_read_back_cg1) {
+    test_database(run_mutation_source_tests_reverse_read_back, 1);
+}
+
+static void require_exist(const sstring& filename, bool should) {
+    auto exists = file_exists(filename).get();
+    BOOST_REQUIRE_EQUAL(exists, should);
+}
+
+static void touch_dir(const sstring& dirname) {
+    recursive_touch_directory(dirname).get();
+    require_exist(dirname, true);
+}
+
+static void touch_file(const sstring& filename) {
+    tests::touch_file(filename).get();
+    require_exist(filename, true);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_incomplete_sstables) {
@@ -309,42 +430,26 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_incomplete_sstables) {
     sstring cf = "peers-37f71aca7dc2383ba70672528af04d4f";
     sstring sst_dir = (data_dir.path() / std::string_view(ks) / std::string_view(cf)).string();
 
-    auto require_exist = [] (const sstring& name, bool should_exist) {
-        auto exists = file_exists(name).get0();
-        BOOST_REQUIRE(exists == should_exist);
-    };
-
-    auto touch_dir = [&require_exist] (const sstring& dir_name) {
-        recursive_touch_directory(dir_name).get();
-        require_exist(dir_name, true);
-    };
-
-    auto touch_file = [&require_exist] (const sstring& file_name) {
-        auto f = open_file_dma(file_name, open_flags::create).get0();
-        f.close().get();
-        require_exist(file_name, true);
-    };
-
-    auto temp_sst_dir_2 = sst_dir + "/" + sst::sst_dir_basename(generation_from_value(2));
+    auto temp_sst_dir_2 = fmt::format("{}/{}{}", sst_dir, generation_from_value(2), tempdir_extension);
     touch_dir(temp_sst_dir_2);
 
-    auto temp_sst_dir_3 = sst_dir + "/" + sst::sst_dir_basename(generation_from_value(3));
+    auto temp_sst_dir_3 = fmt::format("{}/{}{}", sst_dir, generation_from_value(3), tempdir_extension);
     touch_dir(temp_sst_dir_3);
 
-    auto temp_file_name = sst::filename(temp_sst_dir_3, ks, cf, sst::version_types::mc, generation_from_value(3), sst::format_types::big, component_type::TemporaryTOC);
+    auto temp_file_name = sst::filename(temp_sst_dir_3, ks, cf, sstables::get_highest_sstable_version(), generation_from_value(3), sst::format_types::big, component_type::TemporaryTOC);
     touch_file(temp_file_name);
 
-    temp_file_name = sst::filename(sst_dir, ks, cf, sst::version_types::mc, generation_from_value(4), sst::format_types::big, component_type::TemporaryTOC);
+    temp_file_name = sst::filename(sst_dir, ks, cf, sstables::get_highest_sstable_version(), generation_from_value(4), sst::format_types::big, component_type::TemporaryTOC);
     touch_file(temp_file_name);
-    temp_file_name = sst::filename(sst_dir, ks, cf, sst::version_types::mc, generation_from_value(4), sst::format_types::big, component_type::Data);
+    temp_file_name = sst::filename(sst_dir, ks, cf, sstables::get_highest_sstable_version(), generation_from_value(4), sst::format_types::big, component_type::Data);
     touch_file(temp_file_name);
 
-    do_with_cql_env_and_compaction_groups([&sst_dir, &ks, &cf, &require_exist, &temp_sst_dir_2, &temp_sst_dir_3] (cql_test_env& e) {
+    do_with_cql_env_and_compaction_groups([&sst_dir, &ks, &cf, &temp_sst_dir_2, &temp_sst_dir_3] (cql_test_env& e) {
         require_exist(temp_sst_dir_2, false);
         require_exist(temp_sst_dir_3, false);
 
-        require_exist(sst::filename(sst_dir, ks, cf, sst::version_types::mc, generation_from_value(4), sst::format_types::big, component_type::TemporaryTOC), false);
-        require_exist(sst::filename(sst_dir, ks, cf, sst::version_types::mc, generation_from_value(4), sst::format_types::big, component_type::Data), false);
+        require_exist(sst::filename(sst_dir, ks, cf, sstables::get_highest_sstable_version(), generation_from_value(4), sst::format_types::big, component_type::TemporaryTOC), false);
+        require_exist(sst::filename(sst_dir, ks, cf, sstables::get_highest_sstable_version(), generation_from_value(4), sst::format_types::big, component_type::Data), false);
     }, db_cfg_ptr).get();
 }
 
@@ -361,43 +466,23 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
     sstring ks = "system";
     sstring cf = "peers-37f71aca7dc2383ba70672528af04d4f";
     sstring sst_dir = (data_dir.path() / std::string_view(ks) / std::string_view(cf)).string();
-    sstring pending_delete_dir = sst_dir + "/" + sst::pending_delete_dir_basename();
+    sstring pending_delete_dir = sst_dir + "/" + sstables::pending_delete_dir;
 
-    auto require_exist = [] (const sstring& name, bool should_exist) {
-        auto exists = file_exists(name).get0();
-        if (should_exist) {
-            BOOST_REQUIRE(exists);
-        } else {
-            BOOST_REQUIRE(!exists);
-        }
-    };
-
-    auto touch_dir = [&require_exist] (const sstring& dir_name) {
-        recursive_touch_directory(dir_name).get();
-        require_exist(dir_name, true);
-    };
-
-    auto touch_file = [&require_exist] (const sstring& file_name) {
-        auto f = open_file_dma(file_name, open_flags::create).get0();
-        f.close().get();
-        require_exist(file_name, true);
-    };
-
-    auto write_file = [&require_exist] (const sstring& file_name, const sstring& text) {
-        auto f = open_file_dma(file_name, open_flags::wo | open_flags::create | open_flags::truncate).get0();
-        auto os = make_file_output_stream(f, file_output_stream_options{}).get0();
+    auto write_file = [] (const sstring& file_name, const sstring& text) {
+        auto f = open_file_dma(file_name, open_flags::wo | open_flags::create | open_flags::truncate).get();
+        auto os = make_file_output_stream(f, file_output_stream_options{}).get();
         os.write(text).get();
         os.flush().get();
         os.close().get();
         require_exist(file_name, true);
     };
 
-    auto component_basename = [&ks, &cf] (int64_t gen, component_type ctype) {
-        return sst::component_basename(ks, cf, sst::version_types::mc, generation_from_value(gen), sst::format_types::big, ctype);
+    auto component_basename = [&ks, &cf] (sstables::generation_type gen, component_type ctype) {
+        return sst::component_basename(ks, cf, sstables::get_highest_sstable_version(), gen, sst::format_types::big, ctype);
     };
 
-    auto gen_filename = [&sst_dir, &ks, &cf] (int64_t gen, component_type ctype) {
-        return sst::filename(sst_dir, ks, cf, sst::version_types::mc, generation_from_value(gen), sst::format_types::big, ctype);
+    auto gen_filename = [&sst_dir, &ks, &cf] (sstables::generation_type gen, component_type ctype) {
+        return sst::filename(sst_dir, ks, cf, sstables::get_highest_sstable_version(), gen, sst::format_types::big, ctype);
     };
 
     touch_dir(pending_delete_dir);
@@ -410,33 +495,42 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
 
     const sstring toc_text = "TOC.txt\nData.db\n";
 
+    sstables::sstable_generation_generator gen_generator(0);
+    std::vector<sstables::generation_type> gen;
+    constexpr size_t num_gens = 9;
+    std::generate_n(std::back_inserter(gen), num_gens, [&] {
+        // we assumes the integer-based generation identifier in this test, so disable
+        // uuid_identifier here
+        return gen_generator(sstables::uuid_identifiers::no);
+    });
+
     // Regular log file with single entry
-    write_file(gen_filename(2, component_type::TOC), toc_text);
-    touch_file(gen_filename(2, component_type::Data));
+    write_file(gen_filename(gen[2], component_type::TOC), toc_text);
+    touch_file(gen_filename(gen[2], component_type::Data));
     write_file(pending_delete_dir + "/sstables-2-2.log",
-               component_basename(2, component_type::TOC) + "\n");
+               component_basename(gen[2], component_type::TOC) + "\n");
 
     // Temporary log file with single entry
     write_file(pending_delete_dir + "/sstables-3-3.log.tmp",
-               component_basename(3, component_type::TOC) + "\n");
+               component_basename(gen[3], component_type::TOC) + "\n");
 
     // Regular log file with multiple entries
-    write_file(gen_filename(4, component_type::TOC), toc_text);
-    touch_file(gen_filename(4, component_type::Data));
-    write_file(gen_filename(5, component_type::TOC), toc_text);
-    touch_file(gen_filename(5, component_type::Data));
+    write_file(gen_filename(gen[4], component_type::TOC), toc_text);
+    touch_file(gen_filename(gen[4], component_type::Data));
+    write_file(gen_filename(gen[5], component_type::TOC), toc_text);
+    touch_file(gen_filename(gen[5], component_type::Data));
     write_file(pending_delete_dir + "/sstables-4-5.log",
-               component_basename(4, component_type::TOC) + "\n" +
-               component_basename(5, component_type::TOC) + "\n");
+               component_basename(gen[4], component_type::TOC) + "\n" +
+               component_basename(gen[5], component_type::TOC) + "\n");
 
     // Regular log file with multiple entries and some deleted sstables
-    write_file(gen_filename(6, component_type::TemporaryTOC), toc_text);
-    touch_file(gen_filename(6, component_type::Data));
-    write_file(gen_filename(7, component_type::TemporaryTOC), toc_text);
+    write_file(gen_filename(gen[6], component_type::TemporaryTOC), toc_text);
+    touch_file(gen_filename(gen[6], component_type::Data));
+    write_file(gen_filename(gen[7], component_type::TemporaryTOC), toc_text);
     write_file(pending_delete_dir + "/sstables-6-8.log",
-               component_basename(6, component_type::TOC) + "\n" +
-               component_basename(7, component_type::TOC) + "\n" +
-               component_basename(8, component_type::TOC) + "\n");
+               component_basename(gen[6], component_type::TOC) + "\n" +
+               component_basename(gen[7], component_type::TOC) + "\n" +
+               component_basename(gen[8], component_type::TOC) + "\n");
 
     do_with_cql_env_and_compaction_groups([&] (cql_test_env& e) {
         // Empty log file
@@ -446,38 +540,38 @@ SEASTAR_THREAD_TEST_CASE(test_distributed_loader_with_pending_delete) {
         require_exist(pending_delete_dir + "/sstables-1-1.log.tmp", false);
 
         // Regular log file with single entry
-        require_exist(gen_filename(2, component_type::TOC), false);
-        require_exist(gen_filename(2, component_type::Data), false);
+        require_exist(gen_filename(gen[2], component_type::TOC), false);
+        require_exist(gen_filename(gen[2], component_type::Data), false);
         require_exist(pending_delete_dir + "/sstables-2-2.log", false);
 
         // Temporary log file with single entry
         require_exist(pending_delete_dir + "/sstables-3-3.log.tmp", false);
 
         // Regular log file with multiple entries
-        require_exist(gen_filename(4, component_type::TOC), false);
-        require_exist(gen_filename(4, component_type::Data), false);
-        require_exist(gen_filename(5, component_type::TOC), false);
-        require_exist(gen_filename(5, component_type::Data), false);
+        require_exist(gen_filename(gen[4], component_type::TOC), false);
+        require_exist(gen_filename(gen[4], component_type::Data), false);
+        require_exist(gen_filename(gen[5], component_type::TOC), false);
+        require_exist(gen_filename(gen[5], component_type::Data), false);
         require_exist(pending_delete_dir + "/sstables-4-5.log", false);
 
         // Regular log file with multiple entries and some deleted sstables
-        require_exist(gen_filename(6, component_type::TemporaryTOC), false);
-        require_exist(gen_filename(6, component_type::Data), false);
-        require_exist(gen_filename(7, component_type::TemporaryTOC), false);
+        require_exist(gen_filename(gen[6], component_type::TemporaryTOC), false);
+        require_exist(gen_filename(gen[6], component_type::Data), false);
+        require_exist(gen_filename(gen[7], component_type::TemporaryTOC), false);
         require_exist(pending_delete_dir + "/sstables-6-8.log", false);
     }, db_cfg_ptr).get();
 }
 
 // Snapshot tests and their helpers
-future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<> (cql_test_env& env)> func, shared_ptr<db::config> db_cfg_ptr = {}) {
-    return seastar::async([cf_names = std::move(cf_names), func = std::move(func), db_cfg_ptr = std::move(db_cfg_ptr)] () mutable {
+future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<> (cql_test_env& env)> func, bool create_mvs = false, shared_ptr<db::config> db_cfg_ptr = {}) {
+    return seastar::async([cf_names = std::move(cf_names), func = std::move(func), create_mvs,  db_cfg_ptr = std::move(db_cfg_ptr)] () mutable {
         lw_shared_ptr<tmpdir> tmpdir_for_data;
         if (!db_cfg_ptr) {
             tmpdir_for_data = make_lw_shared<tmpdir>();
             db_cfg_ptr = make_shared<db::config>();
             db_cfg_ptr->data_file_directories(std::vector<sstring>({ tmpdir_for_data->path().string() }));
         }
-        do_with_cql_env_and_compaction_groups([cf_names = std::move(cf_names), func = std::move(func)] (cql_test_env& e) {
+        do_with_cql_env_and_compaction_groups([cf_names = std::move(cf_names), func = std::move(func), create_mvs] (cql_test_env& e) {
             for (const auto& cf_name : cf_names) {
                 e.create_table([&cf_name] (std::string_view ks_name) {
                     return *schema_builder(ks_name, cf_name)
@@ -493,6 +587,18 @@ future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<>
                 e.execute_cql(fmt::format("insert into {} (p1, c1, c2, r1) values ('key2', 4, 5, 6);", cf_name)).get();
                 e.execute_cql(fmt::format("insert into {} (p1, c1, c2, r1) values ('key2', 5, 5, 6);", cf_name)).get();
                 e.execute_cql(fmt::format("insert into {} (p1, c1, c2, r1) values ('key2', 6, 5, 6);", cf_name)).get();
+
+                if (create_mvs) {
+                    auto f1 = e.local_view_builder().wait_until_built("ks", seastar::format("view_{}", cf_name));
+                    e.execute_cql(seastar::format("create materialized view view_{0} as select * from {0} where p1 is not null and c1 is not null and c2 is "
+                                                  "not null primary key (p1, c1, c2)",
+                                                  cf_name))
+                        .get();
+                    f1.get();
+                    e.get_system_keyspace().local().load_built_views().get();
+
+                    e.execute_cql(seastar::format("CREATE INDEX index_{0} ON {0} (r1);", cf_name)).get();
+                }
             }
 
             func(e).get();
@@ -502,7 +608,7 @@ future<> do_with_some_data(std::vector<sstring> cf_names, std::function<future<>
 
 future<> take_snapshot(sharded<replica::database>& db, bool skip_flush = false, sstring ks_name = "ks", sstring cf_name = "cf", sstring snapshot_name = "test") {
     try {
-        co_await replica::database::snapshot_table_on_all_shards(db, ks_name, cf_name, snapshot_name, db::snapshot_ctl::snap_views::no, skip_flush);
+        co_await replica::database::snapshot_table_on_all_shards(db, ks_name, cf_name, snapshot_name, skip_flush);
     } catch (...) {
         testlog.error("Could not take snapshot for {}.{} snapshot_name={} skip_flush={}: {}",
                 ks_name, cf_name, snapshot_name, skip_flush, std::current_exception());
@@ -518,31 +624,53 @@ future<> take_snapshot(cql_test_env& e, sstring ks_name, sstring cf_name, sstrin
     return take_snapshot(e.db(), false /* skip_flush */, std::move(ks_name), std::move(cf_name), std::move(snapshot_name));
 }
 
-SEASTAR_TEST_CASE(snapshot_works) {
-    return do_with_some_data({"cf"}, [] (cql_test_env& e) {
-        take_snapshot(e).get();
+// Helper to get directory a table keeps its data in.
+// Only suitable for tests, that work with local storage type.
+fs::path table_dir(const replica::column_family& cf) {
+    return std::get<data_dictionary::storage_options::local>(cf.get_storage_options().value).dir;
+}
+
+static future<> snapshot_works(const std::string& table_name) {
+    return do_with_some_data({"cf"}, [table_name] (cql_test_env& e) {
+        take_snapshot(e, "ks", table_name).get();
 
         std::set<sstring> expected = {
             "manifest.json",
+            "schema.cql"
         };
 
-        auto& cf = e.local_db().find_column_family("ks", "cf");
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        auto& cf = e.local_db().find_column_family("ks", table_name);
+        auto table_directory = table_dir(cf);
+        auto snapshot_dir = table_directory / sstables::snapshots_dir / "test";
+
+        lister::scan_dir(table_directory, lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected](fs::path, directory_entry de) {
             expected.insert(de.name);
             return make_ready_future<>();
         }).get();
         // snapshot triggered a flush and wrote the data down.
-        BOOST_REQUIRE_GT(expected.size(), 1);
+        BOOST_REQUIRE_GE(expected.size(), 11);
 
         // all files were copied and manifest was generated
-        lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(snapshot_dir, lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected](fs::path, directory_entry de) {
             expected.erase(de.name);
             return make_ready_future<>();
         }).get();
 
         BOOST_REQUIRE_EQUAL(expected.size(), 0);
         return make_ready_future<>();
-    });
+    }, true);
+}
+
+SEASTAR_TEST_CASE(table_snapshot_works) {
+    return snapshot_works("cf");
+}
+
+SEASTAR_TEST_CASE(view_snapshot_works) {
+    return snapshot_works("view_cf");
+}
+
+SEASTAR_TEST_CASE(index_snapshot_works) {
+    return snapshot_works(::secondary_index::index_table_name("index_cf"));
 }
 
 SEASTAR_TEST_CASE(snapshot_skip_flush_works) {
@@ -554,7 +682,7 @@ SEASTAR_TEST_CASE(snapshot_skip_flush_works) {
         };
 
         auto& cf = e.local_db().find_column_family("ks", "cf");
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
             expected.insert(de.name);
             return make_ready_future<>();
         }).get();
@@ -563,7 +691,7 @@ SEASTAR_TEST_CASE(snapshot_skip_flush_works) {
         BOOST_REQUIRE_EQUAL(expected.size(), 1);
 
         // all files were copied and manifest was generated
-        lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir((table_dir(cf) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
             expected.erase(de.name);
             return make_ready_future<>();
         }).get();
@@ -578,19 +706,19 @@ SEASTAR_TEST_CASE(snapshot_list_okay) {
         auto& cf = e.local_db().find_column_family("ks", "cf");
         take_snapshot(e).get();
 
-        auto details = cf.get_snapshot_details().get0();
+        auto details = cf.get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 1);
 
         auto sd = details["test"];
         BOOST_REQUIRE_EQUAL(sd.live, 0);
         BOOST_REQUIRE_GT(sd.total, 0);
 
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
             fs::remove(parent_dir / de.name);
             return make_ready_future<>();
         }).get();
 
-        auto sd_post_deletion = cf.get_snapshot_details().get0().at("test");
+        auto sd_post_deletion = cf.get_snapshot_details().get().at("test");
 
         BOOST_REQUIRE_EQUAL(sd_post_deletion.total, sd_post_deletion.live);
         BOOST_REQUIRE_EQUAL(sd.total, sd_post_deletion.live);
@@ -603,28 +731,31 @@ SEASTAR_TEST_CASE(snapshot_list_contains_dropped_tables) {
     return do_with_some_data({"cf1", "cf2", "cf3", "cf4"}, [] (cql_test_env& e) {
         e.execute_cql("DROP TABLE ks.cf1;").get();
 
-        auto details = e.local_db().get_snapshot_details().get0();
+        auto details = e.local_db().get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 1);
+        BOOST_REQUIRE_EQUAL(details.begin()->second.size(), 1);
 
-        const auto& sd = details.front().details;
+        const auto& sd = details.begin()->second.front().details;
         BOOST_REQUIRE_GT(sd.live, 0);
         BOOST_REQUIRE_EQUAL(sd.total, sd.live);
 
         take_snapshot(e, "ks", "cf2", "test2").get();
         take_snapshot(e, "ks", "cf3", "test3").get();
 
-        details = e.local_db().get_snapshot_details().get0();
+        details = e.local_db().get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 3);
 
         e.execute_cql("DROP TABLE ks.cf4;").get();
 
-        details = e.local_db().get_snapshot_details().get0();
+        details = e.local_db().get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 4);
 
-        for (const auto& result : details) {
+        for (const auto& [name, r] : details) {
+            BOOST_REQUIRE_EQUAL(r.size(), 1);
+            const auto& result = r.front();
             const auto& sd = result.details;
 
-            if (result.snapshot_name == "test2" || result.snapshot_name == "test3") {
+            if (name == "test2" || name == "test3") {
                 BOOST_REQUIRE_EQUAL(sd.live, 0);
                 BOOST_REQUIRE_GT(sd.total, 0);
             } else {
@@ -640,7 +771,7 @@ SEASTAR_TEST_CASE(snapshot_list_contains_dropped_tables) {
 SEASTAR_TEST_CASE(snapshot_list_inexistent) {
     return do_with_some_data({"cf"}, [] (cql_test_env& e) {
         auto& cf = e.local_db().find_column_family("ks", "cf");
-        auto details = cf.get_snapshot_details().get0();
+        auto details = cf.get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 0);
         return make_ready_future<>();
     });
@@ -653,7 +784,7 @@ SEASTAR_TEST_CASE(clear_snapshot) {
         auto& cf = e.local_db().find_column_family("ks", "cf");
 
         unsigned count = 0;
-        lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&count] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir((table_dir(cf) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&count] (fs::path parent_dir, directory_entry de) {
             count++;
             return make_ready_future<>();
         }).get();
@@ -662,7 +793,7 @@ SEASTAR_TEST_CASE(clear_snapshot) {
         e.local_db().clear_snapshot("test", {"ks"}, "").get();
         count = 0;
 
-        BOOST_REQUIRE_EQUAL(fs::exists(fs::path(cf.dir()) / sstables::snapshots_dir / "test"), false);
+        BOOST_REQUIRE_EQUAL(fs::exists(table_dir(cf) / sstables::snapshots_dir / "test"), false);
         return make_ready_future<>();
     });
 }
@@ -678,8 +809,8 @@ SEASTAR_TEST_CASE(clear_multiple_snapshots) {
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) {
         auto& t = e.local_db().find_column_family(ks_name, table_name);
-        auto table_dir = fs::path(t.dir());
-        auto snapshots_dir = table_dir / sstables::snapshots_dir;
+        auto tdir = table_dir(t);
+        auto snapshots_dir = tdir / sstables::snapshots_dir;
 
         for (auto i = 0; i < num_snapshots; i++) {
             testlog.debug("Taking snapshot {} on {}.{}", snapshot_name(i), ks_name, table_name);
@@ -723,18 +854,18 @@ SEASTAR_TEST_CASE(clear_multiple_snapshots) {
 
         // existing snapshots expected to remain after dropping the table
         testlog.debug("Dropping table {}.{}", ks_name, table_name);
-        replica::database::drop_table_on_all_shards(e.db(), ks_name, table_name).get();
+        replica::database::drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name).get();
         BOOST_REQUIRE_EQUAL(fs::exists(snapshots_dir / snapshot_name(num_snapshots)), true);
 
         // clear all tags
         testlog.debug("Clearing all snapshots in {}.{} after it had been dropped", ks_name, table_name);
         e.local_db().clear_snapshot("", {ks_name}, table_name).get();
 
-        assert(!fs::exists(table_dir));
+        SCYLLA_ASSERT(!fs::exists(tdir));
 
         // after all snapshots had been cleared,
         // the dropped table directory is expected to be removed.
-        BOOST_REQUIRE_EQUAL(fs::exists(table_dir), false);
+        BOOST_REQUIRE_EQUAL(fs::exists(tdir), false);
 
         return make_ready_future<>();
     });
@@ -751,20 +882,20 @@ SEASTAR_TEST_CASE(clear_nonexistent_snapshot) {
 SEASTAR_TEST_CASE(test_snapshot_ctl_details) {
     return do_with_some_data({"cf"}, [] (cql_test_env& e) {
         sharded<db::snapshot_ctl> sc;
-        sc.start(std::ref(e.db())).get();
+        sc.start(std::ref(e.db()), std::ref(e.get_task_manager()), std::ref(e.get_sstorage_manager()), db::snapshot_ctl::config{}).get();
         auto stop_sc = deferred_stop(sc);
 
         auto& cf = e.local_db().find_column_family("ks", "cf");
         take_snapshot(e).get();
 
-        auto details = cf.get_snapshot_details().get0();
+        auto details = cf.get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 1);
 
         auto sd = details["test"];
         BOOST_REQUIRE_EQUAL(sd.live, 0);
         BOOST_REQUIRE_GT(sd.total, 0);
 
-        auto sc_details = sc.local().get_snapshot_details().get0();
+        auto sc_details = sc.local().get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(sc_details.size(), 1);
 
         auto sc_sd_vec = sc_details["test"];
@@ -772,27 +903,27 @@ SEASTAR_TEST_CASE(test_snapshot_ctl_details) {
         const auto &sc_sd = sc_sd_vec[0];
         BOOST_REQUIRE_EQUAL(sc_sd.ks, "ks");
         BOOST_REQUIRE_EQUAL(sc_sd.cf, "cf");
-        BOOST_REQUIRE_EQUAL(sc_sd.live, sd.live);
-        BOOST_REQUIRE_EQUAL(sc_sd.total, sd.total);
+        BOOST_REQUIRE_EQUAL(sc_sd.details.live, sd.live);
+        BOOST_REQUIRE_EQUAL(sc_sd.details.total, sd.total);
 
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
             fs::remove(parent_dir / de.name);
             return make_ready_future<>();
         }).get();
 
-        auto sd_post_deletion = cf.get_snapshot_details().get0().at("test");
+        auto sd_post_deletion = cf.get_snapshot_details().get().at("test");
 
         BOOST_REQUIRE_EQUAL(sd_post_deletion.total, sd_post_deletion.live);
         BOOST_REQUIRE_EQUAL(sd.total, sd_post_deletion.live);
 
-        sc_details = sc.local().get_snapshot_details().get0();
+        sc_details = sc.local().get_snapshot_details().get();
         auto sc_sd_post_deletion_vec = sc_details["test"];
         BOOST_REQUIRE_EQUAL(sc_sd_post_deletion_vec.size(), 1);
         const auto &sc_sd_post_deletion = sc_sd_post_deletion_vec[0];
         BOOST_REQUIRE_EQUAL(sc_sd_post_deletion.ks, "ks");
         BOOST_REQUIRE_EQUAL(sc_sd_post_deletion.cf, "cf");
-        BOOST_REQUIRE_EQUAL(sc_sd_post_deletion.live, sd_post_deletion.live);
-        BOOST_REQUIRE_EQUAL(sc_sd_post_deletion.total, sd_post_deletion.total);
+        BOOST_REQUIRE_EQUAL(sc_sd_post_deletion.details.live, sd_post_deletion.live);
+        BOOST_REQUIRE_EQUAL(sc_sd_post_deletion.details.total, sd_post_deletion.total);
 
         return make_ready_future<>();
     });
@@ -801,33 +932,33 @@ SEASTAR_TEST_CASE(test_snapshot_ctl_details) {
 SEASTAR_TEST_CASE(test_snapshot_ctl_true_snapshots_size) {
     return do_with_some_data({"cf"}, [] (cql_test_env& e) {
         sharded<db::snapshot_ctl> sc;
-        sc.start(std::ref(e.db())).get();
+        sc.start(std::ref(e.db()), std::ref(e.get_task_manager()), std::ref(e.get_sstorage_manager()), db::snapshot_ctl::config{}).get();
         auto stop_sc = deferred_stop(sc);
 
         auto& cf = e.local_db().find_column_family("ks", "cf");
         take_snapshot(e).get();
 
-        auto details = cf.get_snapshot_details().get0();
+        auto details = cf.get_snapshot_details().get();
         BOOST_REQUIRE_EQUAL(details.size(), 1);
 
         auto sd = details["test"];
         BOOST_REQUIRE_EQUAL(sd.live, 0);
         BOOST_REQUIRE_GT(sd.total, 0);
 
-        auto sc_live_size = sc.local().true_snapshots_size().get0();
+        auto sc_live_size = sc.local().true_snapshots_size().get();
         BOOST_REQUIRE_EQUAL(sc_live_size, sd.live);
 
-        lister::scan_dir(fs::path(cf.dir()), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
+        lister::scan_dir(table_dir(cf), lister::dir_entry_types::of<directory_entry_type::regular>(), [] (fs::path parent_dir, directory_entry de) {
             fs::remove(parent_dir / de.name);
             return make_ready_future<>();
         }).get();
 
-        auto sd_post_deletion = cf.get_snapshot_details().get0().at("test");
+        auto sd_post_deletion = cf.get_snapshot_details().get().at("test");
 
         BOOST_REQUIRE_EQUAL(sd_post_deletion.total, sd_post_deletion.live);
         BOOST_REQUIRE_EQUAL(sd.total, sd_post_deletion.live);
 
-        sc_live_size = sc.local().true_snapshots_size().get0();
+        sc_live_size = sc.local().true_snapshots_size().get();
         BOOST_REQUIRE_EQUAL(sc_live_size, sd_post_deletion.live);
 
         return make_ready_future<>();
@@ -840,7 +971,7 @@ SEASTAR_TEST_CASE(toppartitions_cross_shard_schema_ptr) {
         e.execute_cql("CREATE TABLE ks.tab (id int PRIMARY KEY)").get();
         db::toppartitions_query tq(e.db(), {{"ks", "tab"}}, {}, 1s, 100, 100);
         tq.scatter().get();
-        auto q = e.prepare("INSERT INTO ks.tab(id) VALUES(?)").get0();
+        auto q = e.prepare("INSERT INTO ks.tab(id) VALUES(?)").get();
         // Generate many values to ensure crossing shards
         for (auto i = 0; i != 100; ++i) {
             e.execute_prepared(q, {cql3::raw_value::make_value(int32_type->decompose(i))}).get();
@@ -853,7 +984,7 @@ SEASTAR_TEST_CASE(toppartitions_cross_shard_schema_ptr) {
 SEASTAR_THREAD_TEST_CASE(read_max_size) {
     do_with_cql_env_and_compaction_groups([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE test (pk text, ck int, v text, PRIMARY KEY (pk, ck));").get();
-        auto id = e.prepare("INSERT INTO test (pk, ck, v) VALUES (?, ?, ?);").get0();
+        auto id = e.prepare("INSERT INTO test (pk, ck, v) VALUES (?, ?, ?);").get();
 
         auto& db = e.local_db();
         auto& tab = db.find_column_family("ks", "test");
@@ -909,7 +1040,7 @@ SEASTAR_THREAD_TEST_CASE(read_max_size) {
                     }
                     query::read_command cmd(s->id(), s->version(), slice, query::max_result_size(max_size), query::tombstone_limit::max);
                     try {
-                        auto size = query_method(s, cmd).get0();
+                        auto size = query_method(s, cmd).get();
                         // Just to ensure we are not interpreting empty results as success.
                         BOOST_REQUIRE(size != 0);
                         if (should_throw) {
@@ -919,9 +1050,9 @@ SEASTAR_THREAD_TEST_CASE(read_max_size) {
                         }
                     } catch (std::runtime_error& e) {
                         if (should_throw) {
-                            testlog.trace("Exception thrown, as expected: {}", e);
+                            testlog.trace("Exception thrown, as expected: {}", e.what());
                         } else {
-                            BOOST_FAIL(fmt::format("Expected no exception, but caught: {}", e));
+                            BOOST_FAIL(fmt::format("Expected no exception, but caught: {}", e.what()));
                         }
                     }
                 }
@@ -942,7 +1073,7 @@ SEASTAR_THREAD_TEST_CASE(unpaged_mutation_read_global_limit) {
     cfg.dbcfg->available_memory = 2 * 1024 * 1024;
     do_with_cql_env_and_compaction_groups([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE test (pk text, ck int, v text, PRIMARY KEY (pk, ck));").get();
-        auto id = e.prepare("INSERT INTO test (pk, ck, v) VALUES (?, ?, ?);").get0();
+        auto id = e.prepare("INSERT INTO test (pk, ck, v) VALUES (?, ?, ?);").get();
 
         auto& db = e.local_db();
         auto& tab = db.find_column_family("ks", "test");
@@ -986,12 +1117,12 @@ SEASTAR_THREAD_TEST_CASE(unpaged_mutation_read_global_limit) {
             slice.options.remove<query::partition_slice::option::allow_short_read>();
             query::read_command cmd(s->id(), s->version(), slice, query::max_result_size(max_size), query::tombstone_limit::max);
             try {
-                auto size = query_method(s, cmd).get0();
+                auto size = query_method(s, cmd).get();
                 // Just to ensure we are not interpreting empty results as success.
                 BOOST_REQUIRE(size != 0);
                 BOOST_FAIL("Expected exception, but none was thrown.");
             } catch (std::runtime_error& e) {
-                testlog.trace("Exception thrown, as expected: {}", e);
+                testlog.trace("Exception thrown, as expected: {}", e.what());
             }
         }
     }, std::move(cfg)).get();
@@ -1005,11 +1136,11 @@ SEASTAR_THREAD_TEST_CASE(reader_concurrency_semaphore_selection_test) {
         destroy_scheduling_group(unknown_scheduling_group).get();
     });
 
-    const auto user_semaphore = std::mem_fn(&database_test::get_user_read_concurrency_semaphore);
-    const auto system_semaphore = std::mem_fn(&database_test::get_system_read_concurrency_semaphore);
-    const auto streaming_semaphore = std::mem_fn(&database_test::get_streaming_read_concurrency_semaphore);
+    const auto user_semaphore = std::mem_fn(&database_test_wrapper::get_user_read_concurrency_semaphore);
+    const auto system_semaphore = std::mem_fn(&database_test_wrapper::get_system_read_concurrency_semaphore);
+    const auto streaming_semaphore = std::mem_fn(&database_test_wrapper::get_streaming_read_concurrency_semaphore);
 
-    std::vector<std::pair<scheduling_group, std::function<reader_concurrency_semaphore&(database_test&)>>> scheduling_group_and_expected_semaphore{
+    std::vector<std::pair<scheduling_group, std::function<reader_concurrency_semaphore&(database_test_wrapper&)>>> scheduling_group_and_expected_semaphore{
         {default_scheduling_group(), system_semaphore}
     };
 
@@ -1026,9 +1157,10 @@ SEASTAR_THREAD_TEST_CASE(reader_concurrency_semaphore_selection_test) {
 
     do_with_cql_env_and_compaction_groups([&scheduling_group_and_expected_semaphore] (cql_test_env& e) {
         auto& db = e.local_db();
-        database_test tdb(db);
+        database_test_wrapper tdb(db);
         for (const auto& [sched_group, expected_sem_getter] : scheduling_group_and_expected_semaphore) {
-            with_scheduling_group(sched_group, [&db, sched_group = sched_group, expected_sem_ptr = &expected_sem_getter(tdb)] {
+            with_scheduling_group(sched_group, [&db, sched_group = sched_group, &tdb, &expected_sem_getter = expected_sem_getter] {
+                auto expected_sem_ptr = &expected_sem_getter(tdb);
                 auto& sem = db.get_reader_concurrency_semaphore();
                 if (&sem != expected_sem_ptr) {
                     BOOST_FAIL(fmt::format("Unexpected semaphore for scheduling group {}, expected {}, got {}", sched_group.name(), expected_sem_ptr->name(), sem.name()));
@@ -1038,7 +1170,7 @@ SEASTAR_THREAD_TEST_CASE(reader_concurrency_semaphore_selection_test) {
     }, std::move(cfg)).get();
 }
 
-SEASTAR_THREAD_TEST_CASE(max_result_size_for_unlimited_query_selection_test) {
+SEASTAR_THREAD_TEST_CASE(max_result_size_for_query_selection_test) {
     cql_test_config cfg;
 
     cfg.db_config->max_memory_for_unlimited_query_soft_limit(1 * 1024 * 1024, utils::config_file::config_source::CommandLine);
@@ -1049,9 +1181,14 @@ SEASTAR_THREAD_TEST_CASE(max_result_size_for_unlimited_query_selection_test) {
         destroy_scheduling_group(unknown_scheduling_group).get();
     });
 
-    const auto user_max_result_size = query::max_result_size(cfg.db_config->max_memory_for_unlimited_query_soft_limit(),
-            cfg.db_config->max_memory_for_unlimited_query_hard_limit());
-    const auto system_max_result_size = query::max_result_size(query::result_memory_limiter::unlimited_result_size);
+    const auto user_max_result_size = query::max_result_size(
+            cfg.db_config->max_memory_for_unlimited_query_soft_limit(),
+            cfg.db_config->max_memory_for_unlimited_query_hard_limit(),
+            query::result_memory_limiter::maximum_result_size);
+    const auto system_max_result_size = query::max_result_size(
+            query::result_memory_limiter::unlimited_result_size,
+            query::result_memory_limiter::unlimited_result_size,
+            query::result_memory_limiter::maximum_result_size);
     const auto maintenance_max_result_size = system_max_result_size;
 
     std::vector<std::pair<scheduling_group, query::max_result_size>> scheduling_group_and_expected_max_result_size{
@@ -1071,10 +1208,10 @@ SEASTAR_THREAD_TEST_CASE(max_result_size_for_unlimited_query_selection_test) {
 
     do_with_cql_env_and_compaction_groups([&scheduling_group_and_expected_max_result_size] (cql_test_env& e) {
         auto& db = e.local_db();
-        database_test tdb(db);
+        database_test_wrapper tdb(db);
         for (const auto& [sched_group, expected_max_size] : scheduling_group_and_expected_max_result_size) {
             with_scheduling_group(sched_group, [&db, sched_group = sched_group, expected_max_size = expected_max_size] {
-                const auto max_size = db.get_unlimited_query_max_result_size();
+                const auto max_size = db.get_query_max_result_size();
                 if (max_size != expected_max_size) {
                     BOOST_FAIL(fmt::format("Unexpected max_size for scheduling group {}, expected {{{}, {}}}, got {{{}, {}}}",
                                 sched_group.name(),
@@ -1088,24 +1225,170 @@ SEASTAR_THREAD_TEST_CASE(max_result_size_for_unlimited_query_selection_test) {
     }, std::move(cfg)).get();
 }
 
+// Check that during a multi-page range scan:
+// * semaphore mismatch is detected
+// * code is exception safe w.r.t. to the mismatch exception, e.g. readers are closed properly
+SEASTAR_TEST_CASE(multipage_range_scan_semaphore_mismatch) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        const auto do_abort = set_abort_on_internal_error(false);
+        auto reset_abort = defer([do_abort] {
+            set_abort_on_internal_error(do_abort);
+        });
+        e.execute_cql("CREATE TABLE ks.tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck));").get();
+
+        auto insert_id = e.prepare("INSERT INTO ks.tbl(pk, ck, v) VALUES(?, ?, ?)").get();
+
+        auto& db = e.local_db();
+        auto& tbl = db.find_column_family("ks", "tbl");
+        auto s = tbl.schema();
+
+        auto dk = tests::generate_partition_key(tbl.schema());
+        const auto pk = cql3::raw_value::make_value(managed_bytes(*dk.key().begin(*s)));
+        const auto v = cql3::raw_value::make_value(int32_type->decompose(0));
+        for (int32_t ck = 0; ck < 100; ++ck) {
+            e.execute_prepared(insert_id, {pk, cql3::raw_value::make_value(int32_type->decompose(ck)), v}).get();
+        }
+
+        auto sched_groups = get_scheduling_groups().get();
+
+        query::read_command cmd1(
+                s->id(),
+                s->version(),
+                s->full_slice(),
+                query::max_result_size(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()),
+                query::tombstone_limit::max,
+                query::row_limit(4),
+                query::partition_limit::max,
+                gc_clock::now(),
+                std::nullopt,
+                query_id::create_random_id(),
+                query::is_first_page::yes);
+
+        auto cmd2 = cmd1;
+        auto cr = query::clustering_range::make_starting_with({clustering_key::from_single_value(*s, int32_type->decompose(3)), false});
+        cmd2.slice = partition_slice_builder(*s).set_specific_ranges(query::specific_ranges(dk.key(), {cr})).build();
+        cmd2.is_first_page = query::is_first_page::no;
+
+        auto pr = dht::partition_range::make_starting_with({dk, true});
+        auto prs = dht::partition_range_vector{pr};
+
+        auto read_page = [&] (scheduling_group sg, const query::read_command& cmd) {
+            with_scheduling_group(sg, [&] {
+                return query_data_on_all_shards(e.db(), s, cmd, prs, query::result_options::only_result(), {}, db::no_timeout);
+            }).get();
+        };
+
+        read_page(default_scheduling_group(), cmd1);
+        BOOST_REQUIRE_EXCEPTION(read_page(sched_groups.statement_scheduling_group, cmd2), std::runtime_error,
+                testing::exception_predicate::message_contains("semaphore mismatch detected, dropping reader"));
+    });
+}
+
 // Test `upgrade_sstables` on all keyspaces (including the system keyspace).
 // Refs: #9494 (https://github.com/scylladb/scylla/issues/9494)
 SEASTAR_TEST_CASE(upgrade_sstables) {
     return do_with_cql_env_and_compaction_groups([] (cql_test_env& e) {
-        e.db().invoke_on_all([&e] (replica::database& db) -> future<> {
+        e.db().invoke_on_all([] (replica::database& db) -> future<> {
             auto& cm = db.get_compaction_manager();
             for (auto& [ks_name, ks] : db.get_keyspaces()) {
-                auto owned_ranges_ptr = compaction::make_owned_ranges_ptr(db.get_keyspace_local_ranges(ks_name));
+                const auto& erm = ks.get_vnode_effective_replication_map();
+                auto owned_ranges_ptr = compaction::make_owned_ranges_ptr(co_await db.get_keyspace_local_ranges(erm));
                 for (auto& [cf_name, schema] : ks.metadata()->cf_meta_data()) {
                     auto& t = db.find_column_family(schema->id());
                     constexpr bool exclude_current_version = false;
                     co_await t.parallel_foreach_table_state([&] (compaction::table_state& ts) {
-                        return cm.perform_sstable_upgrade(owned_ranges_ptr, ts, exclude_current_version);
+                        return cm.perform_sstable_upgrade(owned_ranges_ptr, ts, exclude_current_version, tasks::task_info{});
                     });
                 }
             }
         }).get();
     });
+}
+
+SEASTAR_THREAD_TEST_CASE(per_service_level_reader_concurrency_semaphore_test) {
+    cql_test_config cfg;
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        const size_t num_service_levels = 3;
+        const size_t num_keys_to_insert = 10;
+        const size_t num_individual_reads_to_test = 50;
+        auto& db = e.local_db();
+        database_test_wrapper dbt(db);
+        size_t total_memory = dbt.get_total_user_reader_concurrency_semaphore_memory();
+        sharded<qos::service_level_controller>& sl_controller = e.service_level_controller_service();
+        std::array<sstring, num_service_levels> sl_names;
+        qos::service_level_options slo;
+        size_t expected_total_weight = 0;
+        auto index_to_weight = [] (size_t i) -> size_t {
+            return (i + 1)*100;
+        };
+
+        // make the default service level take as little memory as possible
+        slo.shares.emplace<int32_t>(1);
+        expected_total_weight += 1;
+        sl_controller.local().add_service_level(qos::service_level_controller::default_service_level_name, slo).get();
+
+        // Just to make the code more readable.
+        auto get_reader_concurrency_semaphore_for_sl = [&] (sstring sl_name) -> reader_concurrency_semaphore& {
+            return *sl_controller.local().with_service_level(sl_name, noncopyable_function<reader_concurrency_semaphore*()>([&] {
+                return &db.get_reader_concurrency_semaphore();
+            })).get();
+        };
+
+        for (unsigned i = 0; i < num_service_levels; i++) {
+            sstring sl_name = format("sl{}", i);
+            slo.shares.emplace<int32_t>(index_to_weight(i));
+            sl_controller.local().add_service_level(sl_name, slo).get();
+            expected_total_weight += index_to_weight(i);
+            // Make sure that the total weight is tracked correctly in the semaphore group
+            BOOST_REQUIRE_EQUAL(expected_total_weight, dbt.get_total_user_reader_concurrency_semaphore_weight());
+            sl_names[i] = sl_name;
+            size_t total_distributed_memory = 0;
+            for (unsigned j = 0 ; j <= i ; j++) {
+                reader_concurrency_semaphore& sem = get_reader_concurrency_semaphore_for_sl(sl_names[j]);
+                // Make sure that all semaphores that has been created until now - have the right amount of available memory
+                // after the operation has ended.
+                // We allow for a small delta of up to num_service_levels. This allows an off-by-one for each semaphore,
+                // the remainder being added to one of the semaphores.
+                // We make sure this didn't leak/create memory by checking the total below.
+                const auto delta = std::abs(ssize_t((index_to_weight(j) * total_memory) / expected_total_weight) - sem.available_resources().memory);
+                BOOST_REQUIRE_LE(delta, num_service_levels);
+                total_distributed_memory += sem.available_resources().memory;
+            }
+            total_distributed_memory += get_reader_concurrency_semaphore_for_sl(qos::service_level_controller::default_service_level_name).available_resources().memory;
+            BOOST_REQUIRE_EQUAL(total_distributed_memory, total_memory);
+        }
+
+        auto get_semaphores_stats_snapshot = [&] () {
+            std::unordered_map<sstring, reader_concurrency_semaphore::stats> snapshot;
+            for (auto&& sl_name : sl_names) {
+                snapshot[sl_name] = get_reader_concurrency_semaphore_for_sl(sl_name).get_stats();
+            }
+            return snapshot;
+        };
+        e.execute_cql("CREATE TABLE tbl (a int, b int, PRIMARY KEY (a));").get();
+
+        for (unsigned i = 0; i < num_keys_to_insert; i++) {
+            for (unsigned j = 0; j < num_keys_to_insert; j++) {
+                e.execute_cql(format("INSERT INTO tbl(a, b) VALUES ({}, {});", i, j)).get();
+            }
+        }
+
+        for (unsigned i = 0; i < num_individual_reads_to_test; i++) {
+            int random_service_level = tests::random::get_int(num_service_levels - 1);
+            auto snapshot_before = get_semaphores_stats_snapshot();
+
+            sl_controller.local().with_service_level(sl_names[random_service_level], noncopyable_function<future<>()> ([&] {
+                return e.execute_cql("SELECT * FROM tbl;").discard_result();
+            })).get();
+            auto snapshot_after = get_semaphores_stats_snapshot();
+            for (auto& [sl_name, stats] : snapshot_before) {
+                // Make sure that the only semaphore that experienced any activity (at least measured activity) is
+                // the semaphore that belongs to the current service level.
+                BOOST_REQUIRE((stats == snapshot_after[sl_name] && sl_name != sl_names[random_service_level]) ||
+                        (stats != snapshot_after[sl_name] && sl_name == sl_names[random_service_level]));
+            }
+        }
+    }, std::move(cfg)).get();
 }
 
 SEASTAR_TEST_CASE(populate_from_quarantine_works) {
@@ -1117,7 +1400,7 @@ SEASTAR_TEST_CASE(populate_from_quarantine_works) {
     // populate tmpdir_for_data and
     // move a random sstable to quarantine
     co_await do_with_some_data({"cf"}, [&host_id] (cql_test_env& e) -> future<> {
-        host_id = e.local_db().get_config().host_id;
+        host_id = e.local_db().get_token_metadata().get_my_id();
         auto& db = e.db();
         co_await db.invoke_on_all([] (replica::database& db) {
             auto& cf = db.find_column_family("ks", "cf");
@@ -1125,7 +1408,7 @@ SEASTAR_TEST_CASE(populate_from_quarantine_works) {
         });
         auto shard = tests::random::get_int<unsigned>(0, smp::count);
         auto found = false;
-        for (auto i = 0; i < smp::count && !found; i++) {
+        for (unsigned i = 0; i < smp::count && !found; i++) {
             found = co_await db.invoke_on((shard + i) % smp::count, [] (replica::database& db) -> future<bool> {
                 auto& cf = db.find_column_family("ks", "cf");
                 bool found = false;
@@ -1137,25 +1420,26 @@ SEASTAR_TEST_CASE(populate_from_quarantine_works) {
                     auto idx = tests::random::get_int<size_t>(0, sstables.size() - 1);
                     testlog.debug("Moving sstable #{} out of {} to quarantine", idx, sstables.size());
                     auto sst = sstables[idx];
-                    co_await sst->move_to_quarantine();
+                    co_await sst->change_state(sstables::sstable_state::quarantine);
                     found |= true;
                 });
                 co_return found;
             });
         }
         BOOST_REQUIRE(found);
-    }, db_cfg_ptr);
+    }, false, db_cfg_ptr);
 
     // reload the table from tmpdir_for_data and
     // verify that all rows are still there
-    db_cfg_ptr->host_id = host_id;
     size_t row_count = 0;
+    cql_test_config test_config(db_cfg_ptr);
+    test_config.host_id = host_id;
     co_await do_with_cql_env([&row_count] (cql_test_env& e) -> future<> {
         auto res = co_await e.execute_cql("select * from ks.cf;");
         auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
         BOOST_REQUIRE(rows);
         row_count = rows->rs().result_set().size();
-    }, std::move(db_cfg_ptr));
+    }, std::move(test_config));
     BOOST_REQUIRE_EQUAL(row_count, 6);
 }
 
@@ -1174,7 +1458,7 @@ SEASTAR_TEST_CASE(snapshot_with_quarantine_works) {
         // move a random sstable to quarantine
         auto shard = tests::random::get_int<unsigned>(0, smp::count);
         auto found = false;
-        for (auto i = 0; i < smp::count; i++) {
+        for (unsigned i = 0; i < smp::count; i++) {
             co_await db.invoke_on((shard + i) % smp::count, [&] (replica::database& db) -> future<> {
                 auto& cf = db.find_column_family("ks", "cf");
                 co_await cf.parallel_foreach_table_state([&] (compaction::table_state& ts) -> future<> {
@@ -1191,7 +1475,7 @@ SEASTAR_TEST_CASE(snapshot_with_quarantine_works) {
                     }
                     auto idx = tests::random::get_int<size_t>(0, sstables.size() - 1);
                     auto sst = sstables[idx];
-                    co_await sst->move_to_quarantine();
+                    co_await sst->change_state(sstables::sstable_state::quarantine);
                 });
             });
         }
@@ -1207,7 +1491,7 @@ SEASTAR_TEST_CASE(snapshot_with_quarantine_works) {
         auto& cf = db.local().find_column_family("ks", "cf");
 
         // all files were copied and manifest was generated
-        co_await lister::scan_dir((fs::path(cf.dir()) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
+        co_await lister::scan_dir((table_dir(cf) / sstables::snapshots_dir / "test"), lister::dir_entry_types::of<directory_entry_type::regular>(), [&expected] (fs::path parent_dir, directory_entry de) {
             testlog.debug("Found in snapshots: {}", de.name);
             expected.erase(de.name);
             return make_ready_future<>();
@@ -1225,7 +1509,6 @@ SEASTAR_TEST_CASE(database_drop_column_family_clears_querier_cache) {
     return do_with_cql_env_and_compaction_groups([] (cql_test_env& e) {
         e.execute_cql("create table ks.cf (k text, v int, primary key (k));").get();
         auto& db = e.local_db();
-        const auto ts = db_clock::now();
         auto& tbl = db.find_column_family("ks", "cf");
 
         auto op = std::optional(tbl.read_in_progress());
@@ -1233,13 +1516,12 @@ SEASTAR_TEST_CASE(database_drop_column_family_clears_querier_cache) {
         auto q = query::querier(
                 tbl.as_mutation_source(),
                 tbl.schema(),
-                database_test(db).get_user_read_concurrency_semaphore().make_tracking_only_permit(s.get(), "test", db::no_timeout),
+                database_test_wrapper(db).get_user_read_concurrency_semaphore().make_tracking_only_permit(s, "test", db::no_timeout, {}),
                 query::full_partition_range,
                 s->full_slice(),
-                default_priority_class(),
                 nullptr);
 
-        auto f = replica::database::drop_table_on_all_shards(e.db(), "ks", "cf");
+        auto f = replica::database::drop_table_on_all_shards(e.db(), e.get_system_keyspace(), "ks", "cf");
 
         // we add a querier to the querier cache while the drop is ongoing
         auto& qc = db.get_querier_cache();
@@ -1263,16 +1545,16 @@ static future<> test_drop_table_with_auto_snapshot(bool auto_snapshot) {
     db_cfg_ptr->auto_snapshot(auto_snapshot);
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
-        auto cf_dir = e.local_db().find_column_family(ks_name, table_name).dir();
+        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
 
         // Pass `with_snapshot=true` to drop_table_on_all
         // to allow auto_snapshot (based on the configuration above).
         // The table directory should therefore exist after the table is dropped if auto_snapshot is disabled in the configuration.
-        co_await replica::database::drop_table_on_all_shards(e.db(), ks_name, table_name, true);
+        co_await replica::database::drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, true);
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, auto_snapshot);
         co_return;
-    }, db_cfg_ptr);
+    }, false, db_cfg_ptr);
 }
 
 SEASTAR_TEST_CASE(drop_table_with_auto_snapshot_enabled) {
@@ -1288,12 +1570,12 @@ SEASTAR_TEST_CASE(drop_table_with_no_snapshot) {
     sstring table_name = "table_with_no_snapshot";
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
-        auto cf_dir = e.local_db().find_column_family(ks_name, table_name).dir();
+        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
 
         // Pass `with_snapshot=false` to drop_table_on_all
         // to disallow auto_snapshot.
         // The table directory should therefore not exist after the table is dropped.
-        co_await replica::database::drop_table_on_all_shards(e.db(), ks_name, table_name, false);
+        co_await replica::database::drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, false);
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, false);
         co_return;
@@ -1306,15 +1588,28 @@ SEASTAR_TEST_CASE(drop_table_with_explicit_snapshot) {
 
     co_await do_with_some_data({table_name}, [&] (cql_test_env& e) -> future<> {
         auto snapshot_tag = format("test-{}", db_clock::now().time_since_epoch().count());
-        co_await replica::database::snapshot_table_on_all_shards(e.db(), ks_name, table_name, snapshot_tag, db::snapshot_ctl::snap_views::no, false);
-        auto cf_dir = e.local_db().find_column_family(ks_name, table_name).dir();
+        co_await replica::database::snapshot_table_on_all_shards(e.db(), ks_name, table_name, snapshot_tag, false);
+        auto cf_dir = table_dir(e.local_db().find_column_family(ks_name, table_name)).native();
 
         // With explicit snapshot and with_snapshot=false
         // dir should still be kept, regardless of the
         // with_snapshot parameter and auto_snapshot config.
-        co_await replica::database::drop_table_on_all_shards(e.db(), ks_name, table_name, false);
+        co_await replica::database::drop_table_on_all_shards(e.db(), e.get_system_keyspace(), ks_name, table_name, false);
         auto cf_dir_exists = co_await file_exists(cf_dir);
         BOOST_REQUIRE_EQUAL(cf_dir_exists, true);
         co_return;
     });
 }
+
+SEASTAR_TEST_CASE(mutation_dump_generated_schema_deterministic_id_version) {
+    simple_schema s;
+    auto os1 = replica::mutation_dump::generate_output_schema_from_underlying_schema(s.schema());
+    auto os2 = replica::mutation_dump::generate_output_schema_from_underlying_schema(s.schema());
+
+    BOOST_REQUIRE_EQUAL(os1->id(), os2->id());
+    BOOST_REQUIRE_EQUAL(os1->version(), os2->version());
+
+    return make_ready_future<>();
+}
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -5,23 +5,23 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "function.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "cql3/cql3_type.hh"
-#include <vector>
-#include <iosfwd>
-#include <boost/functional/hash.hpp>
-
 #include "cql3/functions/function_name.hh"
+#include <vector>
+#include <boost/functional/hash.hpp>
+#include <fmt/core.h>
 
-namespace std {
-    std::ostream& operator<<(std::ostream& os, const std::vector<data_type>& arg_types);
-}
+
+template <> struct fmt::formatter<std::vector<data_type>> : fmt::formatter<string_view> {
+    auto format(const std::vector<data_type>& arg_types, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
 
 namespace cql3 {
 
@@ -63,7 +63,7 @@ public:
     }
 
     virtual sstring column_name(const std::vector<sstring>& column_names) const override {
-        return format("{}({})", _name, join(", ", column_names));
+        return seastar::format("{}({})", _name, fmt::join(column_names, ", "));
     }
 
     virtual void print(std::ostream& os) const override;
@@ -72,9 +72,8 @@ public:
 inline
 void
 abstract_function::print(std::ostream& os) const {
-    os << _name << " : (";
-    os << _arg_types;
-    os << ") -> " << _return_type->as_cql3_type().to_string();
+    fmt::print(os, "{} : ({}) -> {}",
+               _name, _arg_types, _return_type->as_cql3_type().to_string());
 }
 
 }

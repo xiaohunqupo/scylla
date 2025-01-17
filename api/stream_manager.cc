@@ -3,25 +3,30 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "stream_manager.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_result_future.hh"
+#include "api/api.hh"
 #include "api/api-doc/stream_manager.json.hh"
+#include "api/api-doc/storage_service.json.hh"
 #include <vector>
+#include <rapidjson/document.h>
 #include "gms/gossiper.hh"
 
 namespace api {
+using namespace seastar::httpd;
 
+namespace ss = httpd::storage_service_json;
 namespace hs = httpd::stream_manager_json;
 
 static void set_summaries(const std::vector<streaming::stream_summary>& from,
         json::json_list<hs::stream_summary>& to) {
     if (!from.empty()) {
         hs::stream_summary res;
-        res.cf_id = boost::lexical_cast<std::string>(from.front().cf_id);
+        res.cf_id = fmt::to_string(from.front().cf_id);
         // For each stream_session, we pretend we are sending/receiving one
         // file, to make it compatible with nodetool.
         res.files = 1;
@@ -38,7 +43,7 @@ static hs::progress_info get_progress_info(const streaming::progress_info& info)
     res.current_bytes = info.current_bytes;
     res.direction = info.dir;
     res.file_name = info.file_name;
-    res.peer = boost::lexical_cast<std::string>(info.peer);
+    res.peer = fmt::to_string(info.peer);
     res.session_index = 0;
     res.total_bytes = info.total_bytes;
     return res;
@@ -61,7 +66,7 @@ static hs::stream_state get_state(
     state.plan_id = result_future.plan_id.to_sstring();
     for (auto info : result_future.get_coordinator().get()->get_all_session_info()) {
         hs::stream_info si;
-        si.peer = boost::lexical_cast<std::string>(info.peer);
+        si.peer = fmt::to_string(info.peer);
         si.session_index = 0;
         si.state = info.state;
         si.connecting = si.peer;
@@ -105,7 +110,7 @@ void set_stream_manager(http_context& ctx, routes& r, sharded<streaming::stream_
     });
 
     hs::get_total_incoming_bytes.set(r, [&sm](std::unique_ptr<request> req) {
-        gms::inet_address peer(req->param["peer"]);
+        gms::inet_address peer(req->get_path_param("peer"));
         return sm.map_reduce0([peer](streaming::stream_manager& sm) {
             return sm.get_progress_on_all_shards(peer).then([] (auto sbytes) {
                 return sbytes.bytes_received;
@@ -126,7 +131,7 @@ void set_stream_manager(http_context& ctx, routes& r, sharded<streaming::stream_
     });
 
     hs::get_total_outgoing_bytes.set(r, [&sm](std::unique_ptr<request> req) {
-        gms::inet_address peer(req->param["peer"]);
+        gms::inet_address peer(req->get_path_param("peer"));
         return sm.map_reduce0([peer] (streaming::stream_manager& sm) {
             return sm.get_progress_on_all_shards(peer).then([] (auto sbytes) {
                 return sbytes.bytes_sent;
@@ -145,6 +150,11 @@ void set_stream_manager(http_context& ctx, routes& r, sharded<streaming::stream_
             return make_ready_future<json::json_return_type>(res);
         });
     });
+
+    ss::get_stream_throughput_mb_per_sec.set(r, [&sm](std::unique_ptr<http::request> req) {
+        auto value = sm.local().throughput_mbs();
+        return make_ready_future<json::json_return_type>(value);
+    });
 }
 
 void unset_stream_manager(http_context& ctx, routes& r) {
@@ -154,6 +164,7 @@ void unset_stream_manager(http_context& ctx, routes& r) {
     hs::get_all_total_incoming_bytes.unset(r);
     hs::get_total_outgoing_bytes.unset(r);
     hs::get_all_total_outgoing_bytes.unset(r);
+    ss::get_stream_throughput_mb_per_sec.unset(r);
 }
 
 }

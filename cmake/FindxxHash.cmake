@@ -3,7 +3,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 find_package(PkgConfig REQUIRED)
 
@@ -43,6 +43,7 @@ if(xxHash_FOUND)
       PROPERTIES
         IMPORTED_LOCATION ${xxhash_LIBRARY}
         INTERFACE_INCLUDE_DIRECTORIES ${xxhash_INCLUDE_DIRS}
+        # Hacks needed to expose internal APIs for xxhash dependencies
         INTERFACE_COMPILE_DEFINITIONS XXH_PRIVATE_API)
   endif()
 endif()

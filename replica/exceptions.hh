@@ -3,21 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include <cstdint>
 #include <exception>
-#include <optional>
 #include <variant>
 
-#include "seastar/core/sstring.hh"
-#include "seastar/core/timed_out_error.hh"
-
-#include "utils/exception_container.hh"
-#include "utils/result.hh"
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/format.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/timed_out_error.hh>
 
 namespace replica {
 
@@ -43,10 +41,37 @@ public:
     virtual const char* what() const noexcept override { return "rate limit exceeded"; }
 };
 
+class stale_topology_exception final : public replica_exception {
+    int64_t _caller_version;
+    int64_t _callee_fence_version;
+    seastar::sstring _message;
+public:
+    stale_topology_exception(int64_t caller_version, int64_t callee_fence_version)
+        : _caller_version(caller_version)
+        , _callee_fence_version(callee_fence_version)
+        , _message(seastar::format("stale topology exception, caller version {}, callee fence version {}", caller_version, callee_fence_version))
+    {
+    }
+
+    int64_t caller_version() const {
+        return _caller_version;
+    }
+
+    int64_t callee_fence_version() const {
+        return _callee_fence_version;
+    }
+
+    virtual const char* what() const noexcept override { return _message.c_str(); }
+};
+
+using abort_requested_exception = seastar::abort_requested_exception;
+
 struct exception_variant {
     std::variant<unknown_exception,
             no_exception,
-            rate_limit_exception
+            rate_limit_exception,
+            stale_topology_exception,
+            abort_requested_exception
     > reason;
 
     exception_variant()

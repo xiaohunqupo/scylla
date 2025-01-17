@@ -3,18 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <algorithm>
+
+#include "utils/assert.hh"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/split.hpp>
-#include <boost/algorithm/string/join.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/range/irange.hpp>
 #include <boost/range/algorithm_ext.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/algorithm/sort.hpp>
+#include <boost/range/numeric.hpp>
 #include <json/json.h>
+#include <fmt/ranges.h>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/perf/perf.hh"
@@ -27,6 +29,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/units.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_runner.hh>
 #include <seastar/util/closeable.hh>
 #include "compaction/compaction_manager.hh"
@@ -37,11 +40,19 @@
 using namespace std::chrono_literals;
 using namespace seastar;
 namespace fs = std::filesystem;
-using int_range = nonwrapping_range<int>;
+using int_range = interval<int>;
 
 namespace sstables {
     extern bool use_binary_search_in_promoted_index;
 } // namespace sstables
+
+namespace std {
+// required by boost::lexical_cast<std::string>(vector<string>), which is in turn used
+// by boost::program_option for printing out the default value of an option
+std::ostream& operator<<(std::ostream& os, const std::vector<string>& v) {
+    return os << fmt::format("{}", v);
+}
+}
 
 reactor::io_stats s;
 
@@ -70,7 +81,7 @@ struct metrics_snapshot {
     reactor::io_stats io;
     reactor::sched_stats sched;
     memory::statistics mem;
-    sstables::partition_index_cache::stats index;
+    partition_index_cache_stats index;
     cache_tracker::stats cache;
     uint64_t instructions;
 
@@ -82,7 +93,7 @@ struct metrics_snapshot {
         busy_time = r.total_busy_time();
         idle_time = r.total_idle_time();
         hr_clock = std::chrono::high_resolution_clock::now();
-        index = sstables::partition_index_cache::shard_stats();
+        index = cql_env->local_db().row_cache_tracker().get_partition_index_cache_stats();
         cache = cql_env->local_db().row_cache_tracker().get_stats();
         instructions = the_instructions_counter.read();
     }
@@ -119,7 +130,7 @@ class dataset_acceptor {
 public:
     virtual ~dataset_acceptor() = default;;
     virtual bool can_run(dataset&) = 0;
-    virtual void run(replica::column_family& cf, dataset& ds) = 0;
+    virtual void run(app_template &app, replica::column_family& cf, dataset& ds) = 0;
 };
 
 struct test_group {
@@ -151,7 +162,7 @@ public:
             : _name(name)
             , _message(message)
             , _table_name(boost::replace_all_copy(name, "-", "_"))
-           , _create_table_statement(format(create_table_statement_pattern, _table_name))
+           , _create_table_statement(fmt::format(fmt::runtime(create_table_statement_pattern), _table_name))
     { }
 
     const std::string& name() const { return _name; }
@@ -169,7 +180,7 @@ public:
 // type of its argument.
 template<typename DataSet>
 class dataset_acceptor_impl: public dataset_acceptor {
-    using test_fn = void (*)(replica::column_family&, DataSet&);
+    using test_fn = void (*)(app_template&, replica::column_family&, DataSet&);
     test_fn _fn;
 private:
     static DataSet* try_cast(dataset& ds) {
@@ -182,13 +193,13 @@ public:
         return try_cast(ds) != nullptr;
     }
 
-    void run(replica::column_family& cf, dataset& ds) override {
-        _fn(cf, *try_cast(ds));
+    void run(app_template &app, replica::column_family& cf, dataset& ds) override {
+        _fn(app, cf, *try_cast(ds));
     }
 };
 
 template<typename DataSet>
-std::unique_ptr<dataset_acceptor> make_test_fn(void (*fn)(replica::column_family&, DataSet&)) {
+std::unique_ptr<dataset_acceptor> make_test_fn(void (*fn)(app_template &app, replica::column_family&, DataSet&)) {
     return std::make_unique<dataset_acceptor_impl<DataSet>>(fn);
 }
 
@@ -267,7 +278,7 @@ private:
     template <std::size_t... Is>
     inline sstring_vec stats_values_to_strings_impl(const stats_values& values, std::index_sequence<Is...> seq) {
         static_assert(stats_formats.size() == seq.size());
-        sstring_vec result {format(stats_formats[Is].c_str(), std::get<Is>(values))...};
+        sstring_vec result {seastar::format(fmt::runtime(stats_formats[Is].c_str()), std::get<Is>(values))...};
         return result;
     }
 
@@ -290,10 +301,10 @@ public:
 
     void write_test_names(const output_items& param_names, const output_items& stats_names) override {
         for (const auto& name: param_names) {
-            std::cout << format(name.format.c_str(), name.value) << " ";
+            std::cout << fmt::format(fmt::runtime(name.format.c_str()), name.value) << " ";
         }
         for (const auto& name: stats_names) {
-            std::cout << format(name.format.c_str(), name.value) << " ";
+            std::cout << fmt::format(fmt::runtime(name.format.c_str()), name.value) << " ";
         }
        std::cout << std::endl;
     }
@@ -306,11 +317,11 @@ public:
             const output_items& param_names, const output_items& stats_names) override {
         for (auto& value : values) {
             for (size_t i = 0; i < param_names.size(); ++i) {
-                std::cout << format(param_names.at(i).format.c_str(), params.at(i)) << " ";
+                std::cout << fmt::format(fmt::runtime(param_names.at(i).format.c_str()), params.at(i)) << " ";
             }
             auto stats_strings = stats_values_to_strings(value);
             for (size_t i = 0; i < stats_names.size(); ++i) {
-                std::cout << format(stats_names.at(i).format.c_str(), stats_strings.at(i)) << " ";
+                std::cout << fmt::format(fmt::runtime(stats_names.at(i).format.c_str()), stats_strings.at(i)) << " ";
             }
             std::cout << "\n";
         }
@@ -319,11 +330,11 @@ public:
     void write_test_values(const sstring_vec& params, const stats_values& stats,
             const output_items& param_names, const output_items& stats_names) override {
         for (size_t i = 0; i < param_names.size(); ++i) {
-            std::cout << format(param_names.at(i).format.c_str(), params.at(i)) << " ";
+            std::cout << fmt::format(fmt::runtime(param_names.at(i).format.c_str()), params.at(i)) << " ";
         }
         sstring_vec stats_strings = stats_values_to_strings(stats);
         for (size_t i = 0; i < stats_names.size(); ++i) {
-            std::cout << format(stats_names.at(i).format.c_str(), stats_strings.at(i)) << " ";
+            std::cout << fmt::format(fmt::runtime(stats_names.at(i).format.c_str()), stats_strings.at(i)) << " ";
         }
         std::cout << std::endl;
     }
@@ -462,18 +473,18 @@ public:
         if (_static_param) {
             params_value[_static_param->first.c_str()] = _static_param->second.c_str();
         }
-        std::string all_params_names = boost::algorithm::join(
-                param_names
-                    | boost::adaptors::transformed([](const output_item& item) { return item.value; })
-                    | boost::adaptors::filtered([](const sstring& s) { return !s.empty(); }),
-                ",");
-        std::string all_params_values = boost::algorithm::join(
-                params
-                    | boost::adaptors::indexed()
-                    | boost::adaptors::filtered([&param_names](const boost::range::index_value<const sstring&>& idx) {
-                        return !param_names[idx.index()].value.empty(); })
-                    | boost::adaptors::transformed([](const boost::range::index_value<const sstring&>& idx) { return idx.value(); }),
-                ",");
+        std::string all_params_names = param_names
+                    | std::views::transform([](const output_item& item) { return item.value; })
+                    | std::views::filter([](const sstring& s) { return !s.empty(); })
+                    | std::views::join_with(',')
+                    | std::ranges::to<std::string>();
+        std::string all_params_values = params
+                    | std::views::enumerate
+                    | std::views::filter([&param_names](const std::tuple<ssize_t, sstring>& idx) {
+                        return !param_names[std::get<0>(idx)].value.empty(); })
+                    | std::views::transform([](const std::tuple<ssize_t, sstring>& idx) { return std::get<1>(idx); })
+                    | std::views::join_with(',')
+                    | std::ranges::to<std::string>();
         if (_static_param) {
             all_params_names += "," + _static_param->first;
             all_params_values += "," + _static_param->first;
@@ -493,7 +504,7 @@ public:
 
         Json::Value stats_value;
       if (summary_result) {
-        assert(values.size() == 1);
+        SCYLLA_ASSERT(values.size() == 1);
         for (size_t i = 0; i < stats_names.size(); ++i) {
             write_test_values_impl(stats_value, stats_names, values.front());
         }
@@ -755,12 +766,12 @@ public:
 };
 
 static
-uint64_t consume_all(flat_mutation_reader_v2& rd) {
-    return rd.consume(counting_consumer()).get0();
+uint64_t consume_all(mutation_reader& rd) {
+    return rd.consume(counting_consumer()).get();
 }
 
 static
-uint64_t consume_all_with_next_partition(flat_mutation_reader_v2& rd) {
+uint64_t consume_all_with_next_partition(mutation_reader& rd) {
     uint64_t fragments = 0;
     do {
         fragments += consume_all(rd);
@@ -770,15 +781,17 @@ uint64_t consume_all_with_next_partition(flat_mutation_reader_v2& rd) {
     return fragments;
 }
 
-static void assert_partition_start(flat_mutation_reader_v2& rd) {
-    auto mfopt = rd().get0();
-    assert(mfopt);
-    assert(mfopt->is_partition_start());
+static void assert_partition_start(mutation_reader& rd) {
+    auto mfopt = rd().get();
+    SCYLLA_ASSERT(mfopt);
+    SCYLLA_ASSERT(mfopt->is_partition_start());
 }
 
 // A dataset with one large partition with many clustered fragments.
 // Partition key: pk int [0]
-// Clusterint key: ck int [0 .. n_rows() - 1]
+// Clustering key: ck int [0 .. n_rows() * 2 - 1]
+// Present keys are odd: 1, 3, ...
+// Missing keys are even: 0, 2, ...
 class clustered_ds {
 public:
     virtual int n_rows(const table_config&) = 0;
@@ -788,7 +801,11 @@ public:
     }
 
     virtual clustering_key make_ck(const schema& s, int ck) {
-        return clustering_key::from_single_value(s, serialized(ck));
+        return clustering_key::from_single_value(s, serialized(ck * 2 + 1));
+    }
+
+    virtual clustering_key make_missing_ck(const schema& s, int ck) {
+        return clustering_key::from_single_value(s, serialized(ck * 2));
     }
 };
 
@@ -799,7 +816,6 @@ static test_result scan_rows_with_stride(replica::column_family& cf, clustered_d
         semaphore.make_permit(),
         query::full_partition_range,
         cf.schema()->full_slice(),
-        default_priority_class(),
         nullptr,
         n_skip ? streamed_mutation::forwarding::yes : streamed_mutation::forwarding::no);
     auto close_rd = deferred_close(rd);
@@ -870,7 +886,6 @@ static test_result slice_rows(replica::column_family& cf, clustered_ds& ds, int 
         semaphore.make_permit(),
         query::full_partition_range,
         cf.schema()->full_slice(),
-        default_priority_class(),
         nullptr,
         streamed_mutation::forwarding::yes);
     auto close_rd = deferred_close(rd);
@@ -886,7 +901,7 @@ static test_result slice_rows(replica::column_family& cf, clustered_ds& ds, int 
     return {before, fragments};
 }
 
-static test_result test_reading_all(flat_mutation_reader_v2& rd) {
+static test_result test_reading_all(mutation_reader& rd) {
     metrics_snapshot before;
     return {before, consume_all(rd)};
 }
@@ -905,17 +920,34 @@ static test_result slice_rows_by_ck(replica::column_family& cf, clustered_ds& ds
     return test_reading_all(rd);
 }
 
-static test_result select_spread_rows(replica::column_family& cf, clustered_ds& ds, int stride = 0, int n_read = 1) {
+static test_result select_spread_rows(replica::column_family& cf, clustered_ds& ds, int stride = 0, int n_read = 1, int offset = 0) {
     tests::reader_concurrency_semaphore_wrapper semaphore;
     auto sb = partition_slice_builder(*cf.schema());
     for (int i = 0; i < n_read; ++i) {
-        sb.with_range(query::clustering_range::make_singular(ds.make_ck(*cf.schema(), i * stride)));
+        sb.with_range(query::clustering_range::make_singular(ds.make_ck(*cf.schema(), i * stride + offset)));
     }
 
     auto slice = sb.build();
+    auto pr = dht::partition_range::make_singular(make_pkey(*cf.schema(), 0));
     auto rd = cf.make_reader_v2(cf.schema(),
         semaphore.make_permit(),
-        query::full_partition_range,
+        pr,
+        slice);
+    auto close_rd = deferred_close(rd);
+
+    return test_reading_all(rd);
+}
+
+static test_result select_missing_row(replica::column_family& cf, clustered_ds& ds, int key) {
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    auto sb = partition_slice_builder(*cf.schema());
+    sb.with_range(query::clustering_range::make_singular(ds.make_missing_ck(*cf.schema(), key)));
+
+    auto pr = dht::partition_range::make_singular(dht::decorate_key(*cf.schema(), ds.make_pk(*cf.schema())));
+    auto slice = sb.build();
+    auto rd = cf.make_reader_v2(cf.schema(),
+        semaphore.make_permit(),
+        pr,
         slice);
     auto close_rd = deferred_close(rd);
 
@@ -930,7 +962,7 @@ static test_result test_slicing_using_restrictions(replica::column_family& cf, c
         }))
         .build();
     auto pr = dht::partition_range::make_singular(make_pkey(*cf.schema(), 0));
-    auto rd = cf.make_reader_v2(cf.schema(), semaphore.make_permit(), pr, slice, default_priority_class(), nullptr,
+    auto rd = cf.make_reader_v2(cf.schema(), semaphore.make_permit(), pr, slice, nullptr,
                              streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
     auto close_rd = deferred_close(rd);
 
@@ -940,7 +972,7 @@ static test_result test_slicing_using_restrictions(replica::column_family& cf, c
 static test_result slice_rows_single_key(replica::column_family& cf, clustered_ds& ds, int offset = 0, int n_read = 1) {
     tests::reader_concurrency_semaphore_wrapper semaphore;
     auto pr = dht::partition_range::make_singular(make_pkey(*cf.schema(), 0));
-    auto rd = cf.make_reader_v2(cf.schema(), semaphore.make_permit(), pr, cf.schema()->full_slice(), default_priority_class(), nullptr, streamed_mutation::forwarding::yes, mutation_reader::forwarding::no);
+    auto rd = cf.make_reader_v2(cf.schema(), semaphore.make_permit(), pr, cf.schema()->full_slice(), nullptr, streamed_mutation::forwarding::yes, mutation_reader::forwarding::no);
     auto close_rd = deferred_close(rd);
 
     metrics_snapshot before;
@@ -1129,7 +1161,6 @@ static test_result test_forwarding_with_restriction(replica::column_family& cf, 
         semaphore.make_permit(),
         pr,
         slice,
-        default_priority_class(),
         nullptr,
         streamed_mutation::forwarding::yes, mutation_reader::forwarding::no);
     auto close_rd = deferred_close(rd);
@@ -1168,7 +1199,7 @@ static
 table_config read_config(cql_test_env& env, const sstring& name) {
     auto msg = std::invoke([&] {
         try {
-            return env.execute_cql(format("select n_rows, value_size from ks.config where name = '{}'", name)).get0();
+            return env.execute_cql(format("select n_rows, value_size from ks.config where name = '{}'", name)).get();
         } catch (const exceptions::invalid_request_exception& e) {
             throw std::runtime_error(fmt::format("Could not read config (exception: `{}`). Did you run --populate ?", e.what()));
         }
@@ -1178,7 +1209,7 @@ table_config read_config(cql_test_env& env, const sstring& name) {
     if (rs.size() < 1) {
         throw std::runtime_error("config not found. Did you run --populate ?");
     }
-    const std::vector<bytes_opt>& config_row = rs.rows()[0];
+    const std::vector<managed_bytes_opt>& config_row = rs.rows()[0];
     if (config_row.size() != 2) {
         throw std::runtime_error("config row has invalid size");
     }
@@ -1188,8 +1219,8 @@ table_config read_config(cql_test_env& env, const sstring& name) {
 }
 
 static unsigned cardinality(int_range r) {
-    assert(r.start());
-    assert(r.end());
+    SCYLLA_ASSERT(r.start());
+    SCYLLA_ASSERT(r.end());
     return r.end()->value() - r.start()->value() + r.start()->is_inclusive() + r.end()->is_inclusive() - 1;
 }
 
@@ -1210,7 +1241,6 @@ static int count_for_skip_pattern(int n, int n_read, int n_skip) {
     return n / (n_read + n_skip) * n_read + std::min(n % (n_read + n_skip), n_read);
 }
 
-app_template app;
 bool cancel = false;
 bool cache_enabled;
 bool new_test_case = false;
@@ -1224,14 +1254,14 @@ void clear_cache() {
     cql_env->local_db().row_cache_tracker().clear();
 }
 
-void on_test_group() {
+void on_test_group(app_template &app) {
     if (!app.configuration().contains("keep-cache-across-test-groups")
         && !app.configuration().contains("keep-cache-across-test-cases")) {
         clear_cache();
     }
 };
 
-void on_test_case() {
+void on_test_case(app_template &app) {
     new_test_case = true;
     if (!app.configuration().contains("keep-cache-across-test-cases")) {
         clear_cache();
@@ -1254,12 +1284,12 @@ void print_all(const test_result_vector& results) {
     if (!dump_all_results || results.empty()) {
         return;
     }
-    output_mgr->add_all_test_values(results.back().get_params(), boost::copy_range<std::vector<stats_values>>(
-        results
-        | boost::adaptors::transformed([] (const test_result& tr) {
+    output_mgr->add_all_test_values(results.back().get_params(), results
+        | std::views::transform([] (const test_result& tr) {
             return tr.get_stats_values();
         })
-    ));
+        | std::ranges::to<std::vector<stats_values>>()
+    );
 }
 
 class result_collector {
@@ -1276,7 +1306,7 @@ public:
             results.resize(rs.size());
         }
         {
-            assert(rs.size() == results.size());
+            SCYLLA_ASSERT(rs.size() == results.size());
             for (auto j = 0u; j < rs.size(); j++) {
                 results[j].emplace_back(rs[j]);
             }
@@ -1290,9 +1320,7 @@ public:
                 return a + b.aio_reads() + b.aio_writes();
             }) / (result.empty() ? 1 : result.size());
 
-            boost::sort(result, [] (const test_result& a, const test_result& b) {
-                return a.fragment_rate() < b.fragment_rate();
-            });
+            std::ranges::sort(result, std::ranges::less(), std::mem_fn(&test_result::fragment_rate));
             auto median = result[result.size() / 2];
             auto fragment_rate_min = result[0].fragment_rate();
             auto fragment_rate_max = result[result.size() - 1].fragment_rate();
@@ -1311,11 +1339,11 @@ public:
     }
 };
 
-void run_test_case(std::function<std::vector<test_result>()> fn) {
+void run_test_case(app_template &app, std::function<std::vector<test_result>()> fn) {
     result_collector rc;
 
     auto do_run = [&] {
-        on_test_case();
+        on_test_case(app);
         return fn();
     };
 
@@ -1341,13 +1369,13 @@ void run_test_case(std::function<std::vector<test_result>()> fn) {
     rc.done();
 }
 
-void run_test_case(std::function<test_result()> fn) {
-    run_test_case([&] {
+void run_test_case(app_template &app, std::function<test_result()> fn) {
+    run_test_case(app, [&] {
         return test_result_vector { fn() };
     });
 }
 
-void test_large_partition_single_key_slice(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_single_key_slice(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     auto n_rows = ds.n_rows(cfg);
     int_range live_range = int_range({0}, {n_rows - 1});
 
@@ -1361,58 +1389,58 @@ void test_large_partition_single_key_slice(replica::column_family& cf, clustered
         return r;
     };
 
-    run_test_case([&] {
+    run_test_case(app, [&] {
         return test_result_vector {
             test(int_range::make({0}, {1})),
             check_no_disk_reads(test(int_range::make({0}, {1}))),
         };
     });
 
-    run_test_case([&] {
+    run_test_case(app, [&] {
         return test_result_vector {
             test(int_range::make({0}, {n_rows / 2})),
             check_no_disk_reads(test(int_range::make({0}, {n_rows / 2}))),
         };
     });
 
-    run_test_case([&] {
+    run_test_case(app, [&] {
       return test_result_vector {
         test(int_range::make({0}, {n_rows})),
         check_no_disk_reads(test(int_range::make({0}, {n_rows}))),
       };
     });
 
-    assert(n_rows > 200); // assumed below
+    SCYLLA_ASSERT(n_rows > 200); // assumed below
 
-    run_test_case([&] { // adjacent, no overlap
+    run_test_case(app, [&] { // adjacent, no overlap
         return test_result_vector {
             test(int_range::make({1}, {100, false})),
             test(int_range::make({100}, {109})),
         };
     });
 
-    run_test_case([&] { // adjacent, contained
+    run_test_case(app, [&] { // adjacent, contained
         return test_result_vector {
             test(int_range::make({1}, {100})),
-            check_no_disk_reads(test(int_range::make_singular({100}))),
+            check_no_disk_reads(test(int_range::make_singular(100))),
         };
     });
 
-    run_test_case([&] { // overlap
+    run_test_case(app, [&] { // overlap
         return test_result_vector {
             test(int_range::make({1}, {100})),
             test(int_range::make({51}, {150})),
         };
     });
 
-    run_test_case([&] { // enclosed
+    run_test_case(app, [&] { // enclosed
         return test_result_vector {
             test(int_range::make({1}, {100})),
             check_no_disk_reads(test(int_range::make({51}, {70}))),
         };
     });
 
-    run_test_case([&] { // enclosing
+    run_test_case(app, [&] { // enclosing
         return test_result_vector {
             test(int_range::make({51}, {70})),
             test(int_range::make({41}, {80})),
@@ -1420,38 +1448,38 @@ void test_large_partition_single_key_slice(replica::column_family& cf, clustered
         };
     });
 
-    run_test_case([&] { // adjacent, singular excluded
+    run_test_case(app, [&] { // adjacent, singular excluded
         return test_result_vector {
             test(int_range::make({0}, {100, false})),
-            test(int_range::make_singular({100})),
+            test(int_range::make_singular(100)),
         };
     });
 
-    run_test_case([&] { // adjacent, singular excluded
+    run_test_case(app, [&] { // adjacent, singular excluded
         return test_result_vector {
             test(int_range::make({100, false}, {200})),
-            test(int_range::make_singular({100})),
+            test(int_range::make_singular(100)),
         };
     });
 
-    run_test_case([&] {
+    run_test_case(app, [&] {
         return test_result_vector {
             test(int_range::make_ending_with({100})),
             check_no_disk_reads(test(int_range::make({10}, {20}))),
-            check_no_disk_reads(test(int_range::make_singular({-1}))),
+            check_no_disk_reads(test(int_range::make_singular(-1))),
         };
     });
 
-    run_test_case([&] {
+    run_test_case(app, [&] {
         return test_result_vector {
             test(int_range::make_starting_with({100})),
             check_no_disk_reads(test(int_range::make({150}, {159}))),
-            check_no_disk_reads(test(int_range::make_singular({n_rows - 1}))),
-            check_no_disk_reads(test(int_range::make_singular({n_rows + 1}))),
+            check_no_disk_reads(test(int_range::make_singular(n_rows - 1))),
+            check_no_disk_reads(test(int_range::make_singular(n_rows + 1))),
         };
     });
 
-    run_test_case([&] { // many gaps
+    run_test_case(app, [&] { // many gaps
         return test_result_vector {
             test(int_range::make({10}, {20, false})),
             test(int_range::make({30}, {40, false})),
@@ -1461,7 +1489,7 @@ void test_large_partition_single_key_slice(replica::column_family& cf, clustered
         };
     });
 
-    run_test_case([&] { // many gaps
+    run_test_case(app, [&] { // many gaps
         return test_result_vector {
             test(int_range::make({10}, {20, false})),
             test(int_range::make({30}, {40, false})),
@@ -1472,7 +1500,7 @@ void test_large_partition_single_key_slice(replica::column_family& cf, clustered
     });
 }
 
-void test_large_partition_skips(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_skips(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     auto n_rows = ds.n_rows(cfg);
 
     output_mgr->set_test_param_names({{"read", "{:<7}"}, {"skip", "{:<7}"}}, test_result::stats_names());
@@ -1483,7 +1511,7 @@ void test_large_partition_skips(replica::column_family& cf, clustered_ds& ds) {
         return r;
     };
     auto test = [&] (int n_read, int n_skip) {
-        run_test_case([&] {
+        run_test_case(app, [&] {
             return do_test(n_read, n_skip);
         });
     };
@@ -1512,7 +1540,7 @@ void test_large_partition_skips(replica::column_family& cf, clustered_ds& ds) {
         output_mgr->add_test_static_param("cache_enabled", "Testing cache scan of large partition with varying row continuity.");
         for (auto n_read : {1, 64}) {
             for (auto n_skip : {1, 64}) {
-                run_test_case([&] {
+                run_test_case(app, [&] {
                     return test_result_vector {
                         do_test(n_read, n_skip), // populate with gaps
                         do_test(1, 0),
@@ -1523,12 +1551,12 @@ void test_large_partition_skips(replica::column_family& cf, clustered_ds& ds) {
     }
 }
 
-void test_large_partition_slicing(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_slicing(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     auto n_rows = ds.n_rows(cfg);
 
     output_mgr->set_test_param_names({{"offset", "{:<7}"}, {"read", "{:<7}"}}, test_result::stats_names());
     auto test = [&] (int offset, int read) {
-      run_test_case([&] {
+      run_test_case(app, [&] {
         auto r = slice_rows(cf, ds, offset, read);
         r.set_params(to_sstrings(offset, read));
         check_fragment_count(r, std::min(n_rows - offset, read));
@@ -1547,12 +1575,12 @@ void test_large_partition_slicing(replica::column_family& cf, clustered_ds& ds) 
     test(n_rows / 2, 4096);
 }
 
-void test_large_partition_slicing_clustering_keys(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_slicing_clustering_keys(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     auto n_rows = ds.n_rows(cfg);
 
     output_mgr->set_test_param_names({{"offset", "{:<7}"}, {"read", "{:<7}"}}, test_result::stats_names());
     auto test = [&] (int offset, int read) {
-      run_test_case([&] {
+      run_test_case(app, [&] {
         auto r = slice_rows_by_ck(cf, ds, offset, read);
         r.set_params(to_sstrings(offset, read));
         check_fragment_count(r, std::min(n_rows - offset, read));
@@ -1571,12 +1599,12 @@ void test_large_partition_slicing_clustering_keys(replica::column_family& cf, cl
     test(n_rows / 2, 4096);
 }
 
-void test_large_partition_slicing_single_partition_reader(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_slicing_single_partition_reader(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     auto n_rows = ds.n_rows(cfg);
 
     output_mgr->set_test_param_names({{"offset", "{:<7}"}, {"read", "{:<7}"}}, test_result::stats_names());
     auto test = [&](int offset, int read) {
-      run_test_case([&] {
+      run_test_case(app, [&] {
         auto r = slice_rows_single_key(cf, ds, offset, read);
         r.set_params(to_sstrings(offset, read));
         check_fragment_count(r, std::min(n_rows - offset, read));
@@ -1595,38 +1623,70 @@ void test_large_partition_slicing_single_partition_reader(replica::column_family
     test(n_rows / 2, 4096);
 }
 
-void test_large_partition_select_few_rows(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_select_few_rows(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     auto n_rows = ds.n_rows(cfg);
 
-    output_mgr->set_test_param_names({{"stride", "{:<7}"}, {"rows", "{:<7}"}}, test_result::stats_names());
-    auto test = [&](int stride, int read) {
-      run_test_case([&] {
-        auto r = select_spread_rows(cf, ds, stride, read);
-        r.set_params(to_sstrings(stride, read));
+    output_mgr->set_test_param_names({{"offset", "{:<7}"}, {"stride", "{:<7}"}, {"rows", "{:<7}"}}, test_result::stats_names());
+    auto test = [&](int offset, int stride, int read) {
+      run_test_case(app, [&] {
+        auto r = select_spread_rows(cf, ds, stride, read, offset);
+        r.set_params(to_sstrings(offset, stride, read));
         check_fragment_count(r, read);
         return r;
       });
     };
 
-    test(n_rows / 1, 1);
-    test(n_rows / 2, 2);
-    test(n_rows / 4, 4);
-    test(n_rows / 8, 8);
-    test(n_rows / 16, 16);
-    test(2, n_rows / 2);
+    test(n_rows / 2, 1, 1);
+    test(n_rows / 2 + 1, 1, 1);
+
+    test(0, n_rows / 1, 1);
+    test(0, n_rows / 2, 2);
+    test(0, n_rows / 4, 4);
+    test(0, n_rows / 8, 8);
+    test(0, n_rows / 16, 16);
+    test(0, 2, n_rows / 2);
 }
 
-void test_large_partition_forwarding(replica::column_family& cf, clustered_ds& ds) {
+void test_large_partition_select_missing_rows(app_template &app, replica::column_family& cf, clustered_ds& ds) {
+    auto n_rows = ds.n_rows(cfg);
+
+    output_mgr->set_test_param_names({{"offset", "{:<7}"}}, test_result::stats_names());
+    auto test = [&](int offset) {
+      run_test_case(app, [&] {
+        auto r = select_missing_row(cf, ds, offset);
+        r.set_params(to_sstrings(offset));
+        check_fragment_count(r, 0);
+        return r;
+      });
+    };
+
+    test(0);
+    test(1);
+
+    test(n_rows / 3);
+
+    test(n_rows / 2 - 1);
+    test(n_rows / 2);
+    test(n_rows / 2 + 1);
+
+    test(n_rows * 2 / 3);
+
+    test(n_rows - 1);
+    test(n_rows);
+    test(n_rows * 2);
+}
+
+void test_large_partition_forwarding(app_template &app, replica::column_family& cf, clustered_ds& ds) {
     output_mgr->set_test_param_names({{"pk-scan", "{:<7}"}}, test_result::stats_names());
 
-  run_test_case([&] {
+  run_test_case(app, [&] {
     auto r = test_forwarding_with_restriction(cf, ds, cfg, false);
     check_fragment_count(r, 2);
     r.set_params(to_sstrings("yes"));
     return r;
   });
 
-  run_test_case([&] {
+  run_test_case(app, [&] {
     auto r = test_forwarding_with_restriction(cf, ds, cfg, true);
     check_fragment_count(r, 2);
     r.set_params(to_sstrings("no"));
@@ -1634,7 +1694,7 @@ void test_large_partition_forwarding(replica::column_family& cf, clustered_ds& d
   });
 }
 
-void test_small_partition_skips(replica::column_family& cf2, multipart_ds& ds) {
+void test_small_partition_skips(app_template &app, replica::column_family& cf2, multipart_ds& ds) {
     auto n_parts = ds.n_partitions(cfg);
 
     output_mgr->set_test_param_names({{"", "{:<2}"}, {"read", "{:<7}"}, {"skip", "{:<7}"}}, test_result::stats_names());
@@ -1647,7 +1707,7 @@ void test_small_partition_skips(replica::column_family& cf2, multipart_ds& ds) {
     };
     auto test = [&] (int n_read, int n_skip) {
       test_result r;
-      run_test_case([&] {
+      run_test_case(app, [&] {
         r = do_test(n_read, n_skip);
         return r;
       });
@@ -1679,7 +1739,7 @@ void test_small_partition_skips(replica::column_family& cf2, multipart_ds& ds) {
         output_mgr->add_test_static_param("cache_enabled", "Testing cache scan with small partitions with varying continuity.");
         for (auto n_read : {1, 64}) {
             for (auto n_skip : {1, 64}) {
-                run_test_case([&] {
+                run_test_case(app, [&] {
                     return test_result_vector {
                         do_test(n_read, n_skip), // populate with gaps
                         do_test(1, 0),
@@ -1690,13 +1750,13 @@ void test_small_partition_skips(replica::column_family& cf2, multipart_ds& ds) {
     }
 }
 
-void test_small_partition_slicing(replica::column_family& cf2, multipart_ds& ds) {
+void test_small_partition_slicing(app_template &app, replica::column_family& cf2, multipart_ds& ds) {
     auto n_parts = ds.n_partitions(cfg);
 
     output_mgr->set_test_param_names({{"offset", "{:<7}"}, {"read", "{:<7}"}}, test_result::stats_names());
     auto keys = make_pkeys(cf2.schema(), n_parts);
     auto test = [&] (int offset, int read) {
-      run_test_case([&] {
+      run_test_case(app, [&] {
         auto r = slice_partitions(cf2, keys, offset, read);
         r.set_params(to_sstrings(offset, read));
         check_fragment_count(r, std::min(n_parts - offset, read));
@@ -1720,7 +1780,7 @@ auto make_datasets() {
     std::map<std::string, std::unique_ptr<dataset>> dsets;
     auto add = [&] (std::unique_ptr<dataset> ds) {
         if (dsets.contains(ds->name())) {
-            throw std::runtime_error(format("Dataset with name '{}' already exists", ds->name()));
+            throw std::runtime_error(seastar::format("Dataset with name '{}' already exists", ds->name()));
         }
         auto name = ds->name();
         dsets.emplace(std::move(name), std::move(ds));
@@ -1739,11 +1799,19 @@ replica::table& find_table(replica::database& db, dataset& ds) {
     return db.find_column_family("ks", ds.table_name());
 }
 
+static std::vector<replica::memtable*> active_memtables(replica::table& t) {
+    std::vector<replica::memtable*> active_memtables;
+    t.for_each_active_memtable([&] (replica::memtable& mt) {
+        active_memtables.push_back(&mt);
+    });
+    return active_memtables;
+}
+
 static
 void populate(const std::vector<dataset*>& datasets, cql_test_env& env, const table_config& cfg, size_t flush_threshold) {
     drop_keyspace_if_exists(env, "ks");
 
-    env.execute_cql("CREATE KEYSPACE ks WITH REPLICATION = {'class' : 'SimpleStrategy', 'replication_factor' : 1};").get();
+    env.execute_cql("CREATE KEYSPACE ks WITH REPLICATION = {'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1};").get();
 
     std::cout << "Saving test config...\n";
     env.execute_cql("create table config (name text primary key, n_rows int, value_size int)").get();
@@ -1755,7 +1823,7 @@ void populate(const std::vector<dataset*>& datasets, cql_test_env& env, const ta
         dataset& ds = *ds_ptr;
         output_mgr->add_dataset_population(ds);
 
-        env.execute_cql(format("{} WITH compression = {{ 'sstable_compression': '{}' }};",
+        env.execute_cql(seastar::format("{} WITH compression = {{ 'sstable_compression': '{}' }};",
             ds.create_table_statement(), cfg.compressor)).get();
 
         replica::column_family& cf = find_table(db, ds);
@@ -1765,12 +1833,12 @@ void populate(const std::vector<dataset*>& datasets, cql_test_env& env, const ta
 
         output_mgr->set_test_param_names({{"flush@ (MiB)", "{:<12}"}}, test_result::stats_names());
 
-        db.get_compaction_manager().run_with_compaction_disabled(cf.as_table_state(), [&] {
+        db.get_compaction_manager().run_with_compaction_disabled(cf.try_get_table_state_with_static_sharding(), [&] {
             return seastar::async([&] {
                 auto gen = ds.make_generator(s, cfg);
                 while (auto mopt = gen()) {
                     ++fragments;
-                    replica::memtable& active_memtable = *cf.active_memtables().front();
+                    replica::memtable& active_memtable = *active_memtables(cf).front();
                     active_memtable.apply(*mopt);
                     if (active_memtable.region().occupancy().used_space() > flush_threshold) {
                         metrics_snapshot before;
@@ -1794,7 +1862,7 @@ void populate(const std::vector<dataset*>& datasets, cql_test_env& env, const ta
         }).get();
 
         std::cout << "compacting...\n";
-        cf.compact_all_sstables().get();
+        cf.compact_all_sstables(tasks::task_info{}).get();
     }
 }
 
@@ -1843,6 +1911,13 @@ static std::initializer_list<test_group> test_groups = {
         make_test_fn(test_large_partition_select_few_rows),
     },
     {
+        "large-partition-select-missing-rows",
+        "Testing single-row reads of a missing key from a large partition",
+        test_group::requires_cache::no,
+        test_group::type::large_partition,
+        make_test_fn(test_large_partition_select_missing_rows),
+    },
+    {
         "large-partition-forwarding",
         "Testing forwarding with clustering restriction in a large partition",
         test_group::requires_cache::no,
@@ -1872,7 +1947,7 @@ auto make_compaction_disabling_guard(replica::database& db, std::vector<replica:
     shared_promise<> pr;
     for (auto&& t : tables) {
         // FIXME: discarded future.
-        (void)db.get_compaction_manager().run_with_compaction_disabled(t->as_table_state(), [f = shared_future<>(pr.get_shared_future())] {
+        (void)db.get_compaction_manager().run_with_compaction_disabled(t->try_get_table_state_with_static_sharding(), [f = shared_future<>(pr.get_shared_future())] {
             return f.get_future();
         });
     }
@@ -1885,19 +1960,22 @@ namespace perf {
 
 int scylla_fast_forward_main(int argc, char** argv) {
     namespace bpo = boost::program_options;
+    app_template app;
+
     app.add_options()
         ("random-seed", boost::program_options::value<unsigned>(), "Random number generator seed")
         ("run-tests", bpo::value<std::vector<std::string>>()->default_value(
-                boost::copy_range<std::vector<std::string>>(
-                    test_groups | boost::adaptors::transformed([] (auto&& tc) { return tc.name; }))
-                ),
+                test_groups
+                    | std::views::transform([] (auto&& tc) { return tc.name; })
+                    | std::ranges::to<std::vector<std::string>>()),
             "Test groups to run")
         ("datasets", bpo::value<std::vector<std::string>>()->default_value(
-                boost::copy_range<std::vector<std::string>>(datasets
-                    | boost::adaptors::filtered([] (auto&& e) {
+                datasets
+                    | std::views::filter([] (auto&& e) {
                         return e.second->enabled_by_default();
                     })
-                    | boost::adaptors::map_keys)),
+                    | std::views::keys
+                    | std::ranges::to<std::vector<std::string>>()),
             "Use only the following datasets")
         ("list-tests", "Show available test groups")
         ("list-datasets", "Show available datasets")
@@ -1911,6 +1989,7 @@ int scylla_fast_forward_main(int argc, char** argv) {
         ("with-compression", "Generates compressed sstables")
         ("rows", bpo::value<int>()->default_value(1000000), "Number of CQL rows in a partition. Relevant only for population.")
         ("value-size", bpo::value<int>()->default_value(100), "Size of value stored in a cell. Relevant only for population.")
+        ("column-index-size-in-kb", bpo::value<int>(), "Overrides default column_index_size_in_kb config.")
         ("name", bpo::value<std::string>()->default_value("default"), "Name of the configuration")
         ("output-format", bpo::value<sstring>()->default_value("text"), "Output file for results. 'text' (default) or 'json'")
         ("test-case-duration", bpo::value<double>()->default_value(1), "Duration in seconds of a single test case (0 for a single run).")
@@ -1920,7 +1999,7 @@ int scylla_fast_forward_main(int argc, char** argv) {
         ("dump-all-results", "Write results of all iterations of all tests to text files in the output directory")
         ;
 
-    return app.run(argc, argv, [] {
+    return app.run(argc, argv, [&app] {
         auto db_cfg_ptr = make_shared<db::config>();
         auto& db_cfg = *db_cfg_ptr;
 
@@ -1954,7 +2033,9 @@ int scylla_fast_forward_main(int argc, char** argv) {
         db_cfg.enable_commitlog(false);
         db_cfg.data_file_directories({datadir}, db::config::config_source::CommandLine);
         db_cfg.unspooled_dirty_soft_limit(1.0); // prevent background memtable flushes.
-
+        if (app.configuration().contains("column-index-size-in-kb")) {
+            db_cfg.column_index_size_in_kb(app.configuration()["column-index-size-in-kb"].as<int>());
+        }
         db_cfg.sstable_format(app.configuration()["sstable-format"].as<std::string>());
 
         test_case_duration = app.configuration()["test-case-duration"].as<double>();
@@ -1966,10 +2047,10 @@ int scylla_fast_forward_main(int argc, char** argv) {
             logging::logger_registry().set_logger_level("sstable", seastar::log_level::trace);
         }
 
-        std::cout << "Data directory: " << db_cfg.data_file_directories() << "\n";
-        std::cout << "Output directory: " << output_dir << "\n";
+        fmt::print("Data directory: {}\n", db_cfg.data_file_directories());
+        fmt::print("Output directory: {}\n", output_dir);
 
-        auto init = [] {
+        auto init = [&app] {
             auto conf_seed = app.configuration()["random-seed"];
             auto seed = conf_seed.empty() ? std::random_device()() : conf_seed.as<unsigned>();
             std::cout << "random-seed=" << seed << '\n';
@@ -1978,9 +2059,9 @@ int scylla_fast_forward_main(int argc, char** argv) {
             });
         };
 
-        return init().then([db_cfg_ptr] {
-          return do_with_cql_env([] (cql_test_env& env) {
-            return seastar::async([&env] {
+        return init().then([&app, db_cfg_ptr] {
+          return do_with_cql_env([&app] (cql_test_env& env) {
+            return seastar::async([&app, &env] {
                 cql_env = &env;
                 sstring name = app.configuration()["name"].as<std::string>();
 
@@ -1988,13 +2069,13 @@ int scylla_fast_forward_main(int argc, char** argv) {
                 output_mgr = std::make_unique<output_manager>(app.configuration()["output-format"].as<sstring>());
 
                 auto enabled_dataset_names = app.configuration()["datasets"].as<std::vector<std::string>>();
-                auto enabled_datasets = boost::copy_range<std::vector<dataset*>>(enabled_dataset_names
-                                        | boost::adaptors::transformed([&](auto&& name) {
+                auto enabled_datasets = enabled_dataset_names
+                                        | std::views::transform([&](auto&& name) {
                     if (!datasets.contains(name)) {
-                        throw std::runtime_error(format("No such dataset: {}", name));
+                        throw std::runtime_error(seastar::format("No such dataset: {}", name));
                     }
                     return datasets[name].get();
-                }));
+                }) | std::ranges::to<std::vector<dataset*>>();
 
                 if (app.configuration().contains("populate")) {
                     int n_rows = app.configuration()["rows"].as<int>();
@@ -2024,22 +2105,21 @@ int scylla_fast_forward_main(int argc, char** argv) {
                         return make_ready_future();
                     });
 
-                    auto requested_test_groups = boost::copy_range<std::unordered_set<std::string>>(
-                            app.configuration()["run-tests"].as<std::vector<std::string>>()
-                    );
-                    auto enabled_test_groups = test_groups | boost::adaptors::filtered([&] (auto&& tc) {
+                    auto requested_test_groups = app.configuration()["run-tests"].as<std::vector<std::string>>() | std::ranges::to<std::unordered_set>();
+                    auto enabled_test_groups = test_groups | std::views::filter([&] (auto&& tc) {
                         return requested_test_groups.contains(tc.name);
                     });
 
-                    auto compaction_guard = make_compaction_disabling_guard(db, boost::copy_range<std::vector<replica::table*>>(
-                        enabled_datasets | boost::adaptors::transformed([&] (auto&& ds) {
+                    auto compaction_guard = make_compaction_disabling_guard(db, enabled_datasets
+                        | std::views::transform([&] (auto&& ds) {
                             return &find_table(db, *ds);
-                        })));
+                          })
+                        | std::ranges::to<std::vector<replica::table*>>());
 
                     auto run_tests = [&] (test_group::type type) {
-                                boost::for_each(
+                                std::ranges::for_each(
                                     enabled_test_groups
-                                    | boost::adaptors::filtered([type] (auto&& tc) { return tc.partition_type == type; }),
+                                    | std::views::filter([type] (auto&& tc) { return tc.partition_type == type; }),
                                     [&] (auto&& tc) {
                                      for (auto&& ds : enabled_datasets) {
                                       if (tc.test_fn->can_run(*ds)) {
@@ -2047,8 +2127,8 @@ int scylla_fast_forward_main(int argc, char** argv) {
                                             output_mgr->add_test_group(tc, *ds, false);
                                         } else {
                                             output_mgr->add_test_group(tc, *ds, true);
-                                            on_test_group();
-                                            tc.test_fn->run(find_table(db, *ds), *ds);
+                                            on_test_group(app);
+                                            tc.test_fn->run(app, find_table(db, *ds), *ds);
                                         }
                                       }
                                      }

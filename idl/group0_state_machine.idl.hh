@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "raft/raft.hh"
@@ -23,8 +23,20 @@ struct broadcast_table_query {
     service::broadcast_tables::query query;
 };
 
+struct topology_change {
+    std::vector<canonical_mutation> mutations;
+};
+
+struct mixed_change {
+    std::vector<canonical_mutation> mutations;
+};
+
+struct write_mutations {
+    std::vector<canonical_mutation> mutations;
+};
+
 struct group0_command {
-    std::variant<service::schema_change, service::broadcast_table_query> change;
+    std::variant<service::schema_change, service::broadcast_table_query, service::topology_change, service::write_mutations, service::mixed_change> change;
     canonical_mutation history_append;
 
     std::optional<utils::UUID> prev_state_id;

@@ -8,17 +8,7 @@ Backup and Restore Procedures
    Restore from Backup <restore>
    Delete your Backup <delete-snapshot>
 
-.. raw:: html
-
-
-   <div class="panel callout radius animated">
-            <div class="row">
-              <div class="medium-3 columns">
-                <h5 id="getting-started">Backup and Restore Procedures</h5>
-              </div>
-              <div class="medium-9 columns">
-
-Procedures to backup and restore your Scylla data safely
+Procedures to backup and restore your ScyllaDB data safely
 
 * :doc:`Backup your Data <backup>`
 
@@ -26,14 +16,6 @@ Procedures to backup and restore your Scylla data safely
 
 * :doc:`Delete your Backup </operating-scylla/procedures/backup-restore/delete-snapshot/>`
 
-* Also covered in the `Backup and Restore lesson <https://university.scylladb.com/courses/the-mutant-monitoring-system-training-course/lessons/backup-and-restore/>`_ on Scylla University.
-
-.. raw:: html
-
-   </div>
-   </div>
-   </div>
+* Also covered in the `Cluster Backup Using ScyllaDB Manager lesson <https://university.scylladb.com/courses/scylla-operations/lessons/scylla-manager-repair-and-tombstones/topic/cluster-backup-using-scylla-manager/>`_ on ScyllaDB University.
 
 .. include:: _common/manager.rst
-
-

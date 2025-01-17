@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "bytes.hh"
+#include <memory>
 
 class schema;
 class partition_key;
@@ -64,7 +65,7 @@ public:
  * of bytes is different than ordering of tokens (signed vs unsigned comparison).
  *
  * The type name stored for computations of this class is "token" - this was
- * the original implementation. (now depracated for new tables)
+ * the original implementation. (now deprecated for new tables)
  */
 class legacy_token_column_computation : public column_computation {
 public:
@@ -85,7 +86,7 @@ public:
  * Please use this class instead of legacy_token_column_computation.
  * 
  * The type name stored for computations of this class is "token_v2".
- * (the name "token" refers to the depracated legacy_token_column_computation)
+ * (the name "token" refers to the deprecated legacy_token_column_computation)
  */
 class token_column_computation : public column_computation {
 public:

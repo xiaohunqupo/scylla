@@ -79,27 +79,23 @@ and to the TRUNCATE data definition query.
 
 In addition, the timeout parameter can be applied to SELECT queries as well.
 
-## Keyspace storage options
 
-Storage options allows specifying the storage format assigned to a keyspace.
-The default storage format is `LOCAL`, which simply means storing all the sstables
-in a local directory.
-Experimental support for `S3` storage format is also added. This option is not fully
-implemented yet, but it will allow storing sstables in a shared, S3-compatible object store.
+After [enabling object storage support](../operating-scylla/admin.rst#admin-keyspace-storage-options), configure your endpoints by
+following these [instructions](../operating-scylla/admin.rst#object-storage-configuration).
 
-Storage options can be specified via `CREATE KEYSPACE` or `ALTER KEYSPACE` statement
-and it's formatted as a map of options - similarly to how replication strategy is handled.
 
-Examples:
+Now you can configure your object storage when creating a keyspace:
+
 ```cql
-CREATE KEYSPACE ks
-    WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 3 }
-    AND STORAGE = { 'type' : 'S3', 'bucket' : '/tmp/b1', 'endpoint' : 'localhost' } ;
+CREATE KEYSPACE with STORAGE = { 'type': 'S3', 'endpoint': '$endpoint_name', 'bucket': '$bucket' } 
 ```
 
+**Example**
+
 ```cql
-ALTER KEYSPACE ks WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 3 }
-    AND STORAGE = { 'type' : 'S3', 'bucket': '/tmp/b2', 'endpoint' : 'localhost' } ;
+CREATE KEYSPACE ks
+    WITH REPLICATION = { 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3 }
+    AND STORAGE = { 'type' : 'S3', 'bucket' : '/tmp/b1', 'endpoint' : 'localhost' } ;
 ```
 
 Storage options can be inspected by checking the new system schema table: `system_schema.scylla_keyspaces`:
@@ -146,14 +142,7 @@ views happens _asynchronously_, i.e., in the background. This means that
 the user cannot know when the view updates have all finished - or even be
 sure that they succeeded.
 
-However, there are circumstances where ScyllaDB does view updates
-_synchronously_ - i.e., the user's write returns only after the views
-were updated. This happens when the materialized-view replica is on the
-same node as the base-table replica. For example, if the base table and
-the view have the same partition key. Note that only ScyllaDB guarantees
-synchronous view updates in this case - they are asynchronous in Cassandra.
-
-ScyllaDB also allows explicitly marking a view as synchronous. When a view
+ScyllaDB allows marking a view as synchronous. When a view
 is marked synchronous, base-table updates will wait for that view to be
 updated before returning. A base table may have multiple views marked
 synchronous, and will wait for all of them. The consistency level of a
@@ -191,6 +180,15 @@ above, _usually_ means asynchronous updates), use:
 ```cql
 ALTER MATERIALIZED VIEW main.mv WITH synchronous_updates = false;
 ```
+
+Even in an asynchronous view, _some_ view updates may be done synchronously.
+This happens when the materialized-view replica is on the same node as the
+base-table replica. This happens, for example, in tables using vnodes where
+the base table and the view have the same partition key; But is not the case
+if the table uses tablets: With tablets, the base and view tablets may migrate
+to different nodes. In general, users should not, and cannot, rely on these
+serendipitous synchronous view updates; If synchronous view updates are
+important, mark the view explicitly with `synchronous_updates = true`.
 
 ### Synchronous global secondary indexes
 
@@ -336,6 +334,20 @@ FINALFUNC final_fct
 INITCOND (0, 0);
 ```
 
+### Behavior of bind variables references with the same name
+
+If a bind variable is referred to twice (example: `WHERE aa = :var AND bb = :var`; `:var`
+is referenced twice), ScyllaDB and Cassandra treat it differently:
+
+ - Cassandra ignores the double reference and treats the two as two separate variables. They
+   can have different types, and occupy two slots in the bind variable metadata (used by
+   drivers when the user provides a bind variable tuple rather than a map)
+ - ScyllaDB treats the two references as referring to the same variable. The two references
+   must have the same type, and occupy one slot in the bind variable metadata.
+
+ScyllaDB can revert to the Cassandra treatment by setting the configuration item
+`cql_duplicate_bind_variable_names_refer_to_same_variable` to `false`.
+
 ### Lists elements for filtering
 
 Subscripting a list in a WHERE clause is supported as are maps.
@@ -357,7 +369,7 @@ is not perfect and the actual rate of accepted requests may be higher up to
 a factor of keyspace's `RF`. This feature should not be used to enforce precise
 limits but rather serve as an overload protection feature.
 
-_NOTE): This feature works best when shard-aware drivers are used (rejected
+_NOTE_: This feature works best when shard-aware drivers are used (rejected
 requests have the least cost).
 
 Limits are configured separately for reads and writes. Some examples:
@@ -383,3 +395,27 @@ For more details, see:
 
 - Detailed [design notes](https://github.com/scylladb/scylla/blob/master/docs/dev/per-partition-rate-limit.md)
 - Description of the [rate limit exceeded](https://github.com/scylladb/scylla/blob/master/docs/dev/protocol-extensions.md#rate-limit-error) error
+
+## Effective service level
+
+Actual values of service level's options may come from different service levels, not only from the one user is assigned with.
+
+To facilitate insight into which values come from which service level, there is ``LIST EFFECTIVE SERVICE LEVEL OF <role_name>`` command.
+```cql
+    > LIST EFFECTIVE SERVICE LEVEL OF role2;
+
+     service_level_option | effective_service_level | value
+    ----------------------+-------------------------+-------------
+            workload_type |                     sl2 |       batch
+                  timeout |                     sl1 |          2s
+```
+
+For more details, check [Service Levels docs](https://github.com/scylladb/scylla/blob/master/docs/cql/service-levels.rst)
+
+## DESCRIBE SCHEMA WITH INTERNALS [AND PASSWORDS]
+
+We extended the semantics of `DESCRIBE SCHEMA WITH INTERNALS`: aside from describing the elements of the schema,
+it also describes authentication/authorization and service levels. Additionally, we introduced a new tier of the
+statement: `DESCRIBE SCHEMA WITH INTERNALS AND PASSWORDS`, which also includes the information about hashed passwords of the roles.
+
+For more details, see [the article on DESCRIBE SCHEMA](./describe-schema.rst).

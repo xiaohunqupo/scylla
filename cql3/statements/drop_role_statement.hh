@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -22,7 +22,7 @@ class query_processor;
 
 namespace statements {
 
-class drop_role_statement final : public authentication_statement {
+class drop_role_statement final : public authentication_altering_statement {
     sstring _role;
 
     bool _if_exists;
@@ -38,7 +38,7 @@ public:
     virtual future<> check_access(query_processor& qp, const service::client_state&) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(query_processor&, service::query_state&, const query_options&) const override;
+    execute(query_processor&, service::query_state&, const query_options&, std::optional<service::group0_guard> guard) const override;
 };
 
 }

@@ -15,7 +15,7 @@ For more information, please see the [ScyllaDB web site].
 ## Build Prerequisites
 
 Scylla is fairly fussy about its build environment, requiring very recent
-versions of the C++20 compiler and of many libraries to build. The document
+versions of the C++23 compiler and of many libraries to build. The document
 [HACKING.md](HACKING.md) includes detailed information on building and
 developing Scylla, but to get Scylla building quickly on (almost) any build
 machine, Scylla offers a [frozen toolchain](tools/toolchain/README.md),
@@ -30,9 +30,9 @@ requirements - you just need to meet the frozen toolchain's prerequisites
 Building Scylla with the frozen toolchain `dbuild` is as easy as:
 
 ```bash
-$ git submodule update --init --force --recursive
-$ ./tools/toolchain/dbuild ./configure.py
-$ ./tools/toolchain/dbuild ninja build/release/scylla
+$ git submodule update --init --force --recursive
+$ ./tools/toolchain/dbuild ./configure.py
+$ ./tools/toolchain/dbuild ninja build/release/scylla
 ```
 
 For further information, please see:
@@ -60,16 +60,18 @@ Please note that you need to run Scylla with `dbuild` if you built it with the f
 For more run options, run:
 
 ```bash
-$ ./tools/toolchain/dbuild ./build/release/scylla --help
+$ ./tools/toolchain/dbuild ./build/release/scylla --help
 ```
 
 ## Testing
 
+[![Build with the latest Seastar](https://github.com/scylladb/scylladb/actions/workflows/seastar.yaml/badge.svg)](https://github.com/scylladb/scylladb/actions/workflows/seastar.yaml) [![Check Reproducible Build](https://github.com/scylladb/scylladb/actions/workflows/reproducible-build.yaml/badge.svg)](https://github.com/scylladb/scylladb/actions/workflows/reproducible-build.yaml) [![clang-nightly](https://github.com/scylladb/scylladb/actions/workflows/clang-nightly.yaml/badge.svg)](https://github.com/scylladb/scylladb/actions/workflows/clang-nightly.yaml)
+
 See [test.py manual](docs/dev/testing.md).
 
 ## Scylla APIs and compatibility
-By default, Scylla is compatible with Apache Cassandra and its APIs - CQL and
-Thrift. There is also support for the API of Amazon DynamoDB™,
+By default, Scylla is compatible with Apache Cassandra and its API - CQL.
+There is also support for the API of Amazon DynamoDB™,
 which needs to be enabled and configured in order to be used. For more
 information on how to enable the DynamoDB™ API in Scylla,
 and the current compatibility of this feature as well as Scylla-specific extensions, see
@@ -82,11 +84,11 @@ Documentation can be found [here](docs/dev/README.md).
 Seastar documentation can be found [here](http://docs.seastar.io/master/index.html).
 User documentation can be found [here](https://docs.scylladb.com/).
 
-## Training 
+## Training
 
-Training material and online courses can be found at [Scylla University](https://university.scylladb.com/). 
-The courses are free, self-paced and include hands-on examples. They cover a variety of topics including Scylla data modeling, 
-administration, architecture, basic NoSQL concepts, using drivers for application development, Scylla setup, failover, compactions, 
+Training material and online courses can be found at [Scylla University](https://university.scylladb.com/).
+The courses are free, self-paced and include hands-on examples. They cover a variety of topics including Scylla data modeling,
+administration, architecture, basic NoSQL concepts, using drivers for application development, Scylla setup, failover, compactions,
 multi-datacenters and how Scylla integrates with third-party applications.
 
 ## Contributing to Scylla
@@ -100,10 +102,10 @@ If you are a developer working on Scylla, please read the [developer guidelines]
 
 ## Contact
 
-* The [users mailing list] and [Slack channel] are for users to discuss configuration, management, and operations of the ScyllaDB open source.
+* The [community forum] and [Slack channel] are for users to discuss configuration, management, and operations of the ScyllaDB open source.
 * The [developers mailing list] is for developers and people interested in following the development of ScyllaDB to discuss technical topics.
 
-[Users mailing list]: https://groups.google.com/forum/#!forum/scylladb-users
+[Community forum]: https://forum.scylladb.com/
 
 [Slack channel]: http://slack.scylladb.com/
 

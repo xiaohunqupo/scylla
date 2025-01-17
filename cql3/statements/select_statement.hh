@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -17,11 +17,14 @@
 #include <seastar/core/shared_ptr.hh>
 #include "transport/messages/result_message.hh"
 #include "index/secondary_index_manager.hh"
-#include "exceptions/exceptions.hh"
 #include "exceptions/coordinator_result.hh"
+#include "locator/host_id.hh"
 
 namespace service {
     class client_state;
+    class storage_proxy;
+    class storage_proxy_coordinator_query_options;
+    class storage_proxy_coordinator_query_result;
 } // namespace service
 
 namespace cql3 {
@@ -51,9 +54,11 @@ public:
     using parameters = raw::select_statement::parameters;
     using ordering_comparator_type = raw::select_statement::ordering_comparator_type;
     static constexpr int DEFAULT_COUNT_PAGE_SIZE = 10000;
+    bool _may_use_token_aware_routing;
 protected:
     static thread_local const lw_shared_ptr<const parameters> _default_parameters;
     schema_ptr _schema;
+    schema_ptr _query_schema;
     uint32_t _bound_terms;
     lw_shared_ptr<const parameters> _parameters;
     ::shared_ptr<selection::selection> _selection;
@@ -106,22 +111,26 @@ public:
     virtual ::shared_ptr<const cql3::metadata> get_result_metadata() const override;
     virtual uint32_t get_bound_terms() const override;
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
-    virtual void validate(query_processor&, const service::client_state& state) const override;
     virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor& qp,
-        service::query_state& state, const query_options& options) const override;
+        service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-        execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options) const override;
+        execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
-    future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor& qp,
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_non_aggregate_unpaged(query_processor& qp,
         lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
          const query_options& options, gc_clock::time_point now) const;
 
-    future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message(query_processor& qp,
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message_non_aggregate_unpaged(query_processor& qp,
         lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
          const query_options& options, gc_clock::time_point now) const;
+
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message_aggregate_or_paged(query_processor& qp,
+        lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
+         const query_options& options, gc_clock::time_point now, int32_t page_size, bool aggregate, bool nonpaged_filtering, uint64_t limit) const;
+
 
     struct primary_key {
         dht::decorated_key partition;
@@ -144,13 +153,10 @@ public:
     db::timeout_clock::duration get_timeout(const service::client_state& state, const query_options& options) const;
 
 protected:
-    uint64_t do_get_limit(const query_options& options, const std::optional<expr::expression>& limit, const expr::unset_bind_variable_guard& unset_guard, uint64_t default_limit) const;
-    uint64_t get_limit(const query_options& options) const {
-        return do_get_limit(options, _limit, _limit_unset_guard, query::max_rows);
-    }
-    uint64_t get_per_partition_limit(const query_options& options) const {
-        return do_get_limit(options, _per_partition_limit, _per_partition_limit_unset_guard, query::partition_max_rows);
-    }
+    using get_limit_result = bo::result<uint64_t, exceptions::invalid_request_exception>;
+    get_limit_result get_limit(const query_options& options, const std::optional<expr::expression>& limit, bool is_per_partition_limit = false) const;
+    static uint64_t get_inner_loop_limit(const select_statement::get_limit_result& limit, bool is_aggregate);
+
     bool needs_post_query_ordering() const;
     virtual void update_stats_rows_read(int64_t rows_read) const {
         _stats.rows_read += rows_read;
@@ -304,6 +310,43 @@ private:
     query::partition_slice get_partition_slice_for_global_index_posting_list(const query_options& options) const;
 
     bytes compute_idx_token(const partition_key& key) const;
+};
+
+class mutation_fragments_select_statement : public select_statement {
+    schema_ptr _underlying_schema;
+public:
+    mutation_fragments_select_statement(
+            schema_ptr output_schema,
+            schema_ptr underlying_schema,
+            uint32_t bound_terms,
+            lw_shared_ptr<const parameters> parameters,
+            ::shared_ptr<selection::selection> selection,
+            ::shared_ptr<const restrictions::statement_restrictions> restrictions,
+            ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
+            bool is_reversed,
+            ordering_comparator_type ordering_comparator,
+            std::optional<expr::expression> limit,
+            std::optional<expr::expression> per_partition_limit,
+            cql_stats &stats,
+            std::unique_ptr<cql3::attributes> attrs);
+
+    // This statement has a schema that is different from that of the underlying table.
+    static schema_ptr generate_output_schema(schema_ptr underlying_schema);
+
+private:
+    future<exceptions::coordinator_result<service::storage_proxy_coordinator_query_result>>
+    do_query(
+            locator::effective_replication_map_ptr erm_keepalive,
+            locator::host_id this_node,
+            service::storage_proxy& sp,
+            schema_ptr schema,
+            lw_shared_ptr<query::read_command> cmd,
+            dht::partition_range_vector partition_ranges,
+            db::consistency_level cl,
+            service::storage_proxy_coordinator_query_options optional_params) const;
+
+    virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(query_processor& qp,
+            service::query_state& state, const query_options& options) const override;
 };
 
 }

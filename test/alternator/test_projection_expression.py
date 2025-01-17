@@ -1,11 +1,11 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for the various operations (GetItem, Query, Scan) with a
 # ProjectionExpression parameter.
 #
-# ProjectionExpression is an expension of the legacy AttributesToGet
+# ProjectionExpression is an expansion of the legacy AttributesToGet
 # parameter. Both parameters request that only a subset of the attributes
 # be fetched for each item, instead of all of them. But while AttributesToGet
 # was limited to top-level attributes, ProjectionExpression can request also
@@ -13,7 +13,9 @@
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_query, multiset
+
+from test.alternator.util import random_string, full_scan, full_query, multiset
+
 
 # Basic test for ProjectionExpression, requesting only top-level attributes.
 # Result should include the selected attributes only - if one wants the key
@@ -45,9 +47,9 @@ def test_projection_expression_toplevel_syntax(test_table_s):
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression=' a  ,   b  ')['Item'] == {'a': 'hello', 'b': 'hi'}
     # Missing or unused names in ExpressionAttributeNames are errors:
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#wrong': 'a'})['Item'] == {'a': 'hello'}
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#wrong': 'a'})['Item']
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#name': 'a', '#unused': 'b'})['Item'] == {'a': 'hello'}
+        test_table_s.get_item(Key={'p': p}, ConsistentRead=True, ProjectionExpression='#name', ExpressionAttributeNames={'#name': 'a', '#unused': 'b'})['Item']
     # It is not allowed to fetch the same top-level attribute twice (or in
     # general, list two overlapping attributes). We get an error like
     # "Invalid ProjectionExpression: Two document paths overlap with each
@@ -284,7 +286,7 @@ def test_scan_projection_expression_path(test_table):
     assert multiset(expected_items) == multiset(got_items)
 
 # BatchGetItem also supports ProjectionExpression, let's test that it
-# applies to all items, and that it correctly suports document paths as well.
+# applies to all items, and that it correctly supports document paths as well.
 def test_batch_get_item_projection_expression_path(test_table_s):
     items = [{'p': random_string(), 'a': {'b': random_string(), 'x': 'hi'}, 'c': random_string()} for i in range(3)]
     with test_table_s.batch_writer() as batch:

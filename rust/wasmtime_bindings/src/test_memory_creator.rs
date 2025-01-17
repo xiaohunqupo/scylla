@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 use crate::memory_creator::ScyllaMemoryCreator;
 use anyhow::{anyhow, Result};
+use std::ops::Range;
 use std::ptr;
 use wasmtime::LinearMemory;
 
@@ -51,6 +52,9 @@ unsafe impl LinearMemory for TestScyllaLinearMemory {
     }
     fn as_ptr(&self) -> *mut u8 {
         self.memory.as_ptr()
+    }
+    fn wasm_accessible(&self) -> Range<usize> {
+        self.memory.wasm_accessible()
     }
 }
 

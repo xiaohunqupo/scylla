@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,15 +11,20 @@
 #include "seastarx.hh"
 #include "service/paxos/cas_request.hh"
 #include "utils/rjson.hh"
+#include "consumed_capacity.hh"
 #include "executor.hh"
+#include "tracing/trace_state.hh"
+#include "keys.hh"
 
 namespace alternator {
+
+class consumed_capacity;
 
 // An rmw_operation encapsulates the common logic of all the item update
 // operations which may involve a read of the item before the write
 // (so-called Read-Modify-Write operations). These operations include PutItem,
 // UpdateItem and DeleteItem: All of these may be conditional operations (the
-// "Expected" parameter) which requir a read before the write, and UpdateItem
+// "Expected" parameter) which require a read before the write, and UpdateItem
 // may also have an update expression which refers to the item's old value.
 //
 // The code below supports running the read and the write together as one
@@ -63,13 +68,17 @@ protected:
     partition_key _pk = partition_key::make_empty();
     clustering_key _ck = clustering_key::make_empty();
     write_isolation _write_isolation;
-
+    mutable wcu_consumed_capacity_counter _consumed_capacity;
     // All RMW operations can have a ReturnValues parameter from the following
     // choices. But note that only UpdateItem actually supports all of them:
     enum class returnvalues {
         NONE, ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATED_NEW
     } _returnvalues;
+    enum class returnvalues_on_condition_check_failure {
+        NONE, ALL_OLD
+    } _returnvalues_on_condition_check_failure;
     static returnvalues parse_returnvalues(const rjson::value& request);
+    static returnvalues_on_condition_check_failure parse_returnvalues_on_condition_check_failure(const rjson::value& request);
     // When _returnvalues != NONE, apply() should store here, in JSON form,
     // the values which are to be returned in the "Attributes" field.
     // The default null JSON means do not return an Attributes field at all.
@@ -77,6 +86,8 @@ protected:
     // it (see explanation below), but note that because apply() may be
     // called more than once, if apply() will sometimes set this field it
     // must set it (even if just to the default empty value) every time.
+    // Additionally when _returnvalues_on_condition_check_failure is ALL_OLD
+    // then condition check failure will also result in storing values here.
     mutable rjson::value _return_attributes;
 public:
     // The constructor of a rmw_operation subclass should parse the request
@@ -107,7 +118,8 @@ public:
             tracing::trace_state_ptr trace_state,
             service_permit permit,
             bool needs_read_before_write,
-            stats& stats);
+            stats& stats,
+            uint64_t& wcu_total);
     std::optional<shard_id> shard_for_execute(bool needs_read_before_write);
 };
 

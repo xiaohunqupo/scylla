@@ -1,5 +1,8 @@
 -- Error messages contain a keyspace name. Make the output stable.
-CREATE KEYSPACE ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+CREATE KEYSPACE ks
+    WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND
+    tablets = {'enabled': false};
+
 -- do range delete in batch
 create table ks.t (pk int, ck int, v int, primary key(pk, ck)) with cdc = {'enabled': true, 'preimage': true, 'postimage': true};
 
@@ -14,7 +17,7 @@ begin batch insert into ks.t2 (pk, ck, v) values (1, 1, 100); delete from ks.t2 
 
 select "cdc$batch_seq_no", "cdc$operation", pk, ck, v from ks.t2_scylla_cdc_log;
 
--- do range delete in batch, but not matcing ck
+-- do range delete in batch, but not matching ck
 create table ks.t3 (pk int, ck int, v int, primary key(pk, ck)) with cdc = {'enabled': true, 'preimage': true, 'postimage': true};
 
 -- do range delete in batch

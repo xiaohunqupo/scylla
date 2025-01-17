@@ -5,11 +5,11 @@ Compaction
 ----------
 
 
-This document describes the compaction strategy options available when creating a table. For more information about creating a table in Scylla, refer to the :ref:`CQL Reference <create-table-statement>`.
+This document describes the compaction strategy options available when creating a table. For more information about creating a table in ScyllaDB, refer to the :ref:`CQL Reference <create-table-statement>`.
 
-By default, Scylla starts a compaction task whenever a new SSTable is written. Compaction merges several SSTables into a new SSTable, which contains only the live data from the input SSTables. Merging several sorted files to get a sorted result is an efficient process, and this is the main reason why SSTables are kept sorted. 
+By default, ScyllaDB starts a compaction task whenever a new SSTable is written. Compaction merges several SSTables into a new SSTable, which contains only the live data from the input SSTables. Merging several sorted files to get a sorted result is an efficient process, and this is the main reason why SSTables are kept sorted. 
 
-The following compaction strategies are supported by Scylla: 
+The following compaction strategies are supported by ScyllaDB: 
 
 * Size-tiered Compaction Strategy (`STCS`_)
 
@@ -19,9 +19,7 @@ The following compaction strategies are supported by Scylla:
 
 * Time-window Compaction Strategy (`TWCS`_)
 
-* Date-tiered Compaction Strategy (DTCS) - use `TWCS`_ instead
-
-This page concentrates on the parameters to use when creating a table with a compaction strategy. If you are unsure which strategy to use or want general information on the compaction strategies which are available to Scylla, refer to :doc:`Compaction Strategies </architecture/compaction/compaction-strategies>`.
+This page concentrates on the parameters to use when creating a table with a compaction strategy. If you are unsure which strategy to use or want general information on the compaction strategies which are available to ScyllaDB, refer to :doc:`Compaction Strategies </architecture/compaction/compaction-strategies>`.
 
 Common options
 ^^^^^^^^^^^^^^
@@ -33,7 +31,8 @@ The following options are available for all compaction strategies.
      'class' : 'compaction_strategy_name', 
      'enabled' : (true | false),
      'tombstone_threshold' : ratio,
-     'tombstone_compaction_interval' : sec}
+     'tombstone_compaction_interval' : sec,
+     'unchecked_tombstone_compaction' : (true | false)}
 
 
 
@@ -63,7 +62,12 @@ The following options are available for all compaction strategies.
 =====
 
 ``tombstone_compaction_interval`` (default: 86400s (1 day))
-   An SSTable that is suitable for single SSTable compaction, according to tombstone_threshold will not be compacted if it is newer than tombstone_compaction_interval. 
+  *tombstone_compaction_interval* is lower-bound for when a new tombstone compaction can start. If an SSTable was compacted at a time *X*, the earliest time it will be considered for tombstone compaction again is *X + tombstone_compaction_interval*. This does not guarantee that sstables will be considered for compaction immediately after tombstone_compaction_interval time has elapsed after the last compaction.
+
+=====
+
+``unchecked_tombstone_compaction`` (default: false)
+   If unchecked_tombstone_compaction is set to true, tombstone_threshold will be ignored, and an SSTable will be compacted according to tombstone_compaction_interval.
 
 =====
 
@@ -116,7 +120,7 @@ The following options only apply to SizeTieredCompactionStrategy:
 
 =====
 
-``min_sstable_size`` (default: 50)
+``min_sstable_size`` (default: 52,428,800)
    All SSTables smaller than this number of bytes are put into the same bucket.
 
 =====
@@ -168,20 +172,18 @@ Incremental Compaction Strategy (ICS)
 
 .. versionadded:: 2019.1.4 Scylla Enterprise
 
-.. note:: ICS is only available for Scylla Enterprise customers
-
-When using ICS, SSTable runs are put in different buckets depending on their size. 
+When using ICS, SSTable runs are put in different buckets depending on their size.
 When an SSTable run is bucketed, the average size of the runs in the bucket is compared to the new run, as well as the ``bucket_high`` and ``bucket_low`` levels.
 
 
 The database compares each SSTable-run size to the average of all SSTable-run sizes on all buckets in the node.
-It calculates ``bucket_low * avg_bucket_size`` and ``bucket_high * avg_bucket_size`` and then compares the result with the ``average SSTable-run size``. 
-The conditions set for ``bucket_high`` and ``bucket_low`` dictate if successive runs will be added to the same bucket. 
+It calculates ``bucket_low * avg_bucket_size`` and ``bucket_high * avg_bucket_size`` and then compares the result with the ``average SSTable-run size``.
+The conditions set for ``bucket_high`` and ``bucket_low`` dictate if successive runs will be added to the same bucket.
 When compaction begins it merges SSTable runs whose size in KB are within ``[average-size * bucket_low]`` and ``[average-size * bucket_high]``.
 
 
 Once there are multiple runs in a bucket, minor compaction begins.
-The minimum number of SSTable runs that triggers minor compaction is either 2 or ``min_threshold``, if the ``compaction_enforce_min_threshold`` 
+The minimum number of SSTable runs that triggers minor compaction is either 2 or ``min_threshold``, if the ``compaction_enforce_min_threshold``
 configuration option is set in the scylla.yaml configuration file.
 
 .. _ics-options:
@@ -206,18 +208,18 @@ The following options only apply to IncrementalCompactionStrategy:
 =====
 
 ``bucket_high`` (default: 1.5)
-   A new SSTable is added to the bucket if the SSTable size is **less than**   
-   bucket_high * the average size of that bucket (and if the bucket_low condition also holds).    
-   For example, if **'bucket_high = 1.5'** and the **SSTable size = 14MB**, does the SSTable belong to a bucket with an average size of 10MB? 
-   Yes, because the **SSTable size = 14**, which is **less** than **'bucket_high' * average bucket size = 15**. 
-   So, the SSTable will be added to the bucket, and the bucket’s average size will be recalculated. 
+   A new SSTable is added to the bucket if the SSTable size is **less than**
+   bucket_high * the average size of that bucket (and if the bucket_low condition also holds).
+   For example, if **'bucket_high = 1.5'** and the **SSTable size = 14MB**, does the SSTable belong to a bucket with an average size of 10MB?
+   Yes, because the **SSTable size = 14**, which is **less** than **'bucket_high' * average bucket size = 15**.
+   So, the SSTable will be added to the bucket, and the bucket’s average size will be recalculated.
 
 =====
 
 ``bucket_low`` (default: 0.5)
    A new SSTable is added to the bucket if the SSTable size is **more than**
-   bucket_low * the average size of that bucket (and if the bucket_high condition also holds). 
-   For example, if **'bucket_high = 0.5'** and the **SSTable size is 10MB**, does the SSTable belong to a bucket with an average size of 15MB? 
+   bucket_low * the average size of that bucket (and if the bucket_high condition also holds).
+   For example, if **'bucket_high = 0.5'** and the **SSTable size is 10MB**, does the SSTable belong to a bucket with an average size of 15MB?
    Yes, because the **SSTable size = 10**, which is **more** than **'bucket_low' * average bucket size = 7.5**.
    So, the SSTable will be added to the bucket, and the bucket’s average size will be recalculated.
 
@@ -247,7 +249,7 @@ The following options only apply to IncrementalCompactionStrategy:
 =====
 
 ``sstable_size_in_mb`` (default: 1000)
-   This is the target size in megabytes, that will be used as the goal for an SSTable size (fragment size) following a compression. 
+   This is the target size in megabytes, that will be used as the goal for an SSTable size (fragment size) following a compression.
 
 .. _SAG:
 
@@ -255,9 +257,7 @@ The following options only apply to IncrementalCompactionStrategy:
 
 ``space_amplification_goal`` (default: null)
 
-:label-tip:`ScyllaDB Enterprise`
-
-   .. versionadded:: 2020.1.6 
+   .. versionadded:: 2020.1.6
 
    This is a threshold of the ratio of the sum of the sizes of the two largest tiers to the size of the largest tier,
    above which ICS will automatically compact the second largest and largest tiers together to eliminate stale data that may have been overwritten, expired, or deleted.
@@ -309,7 +309,7 @@ TWCS options
 =====
 
 ``expired_sstable_check_frequency_seconds`` (default: 600)
-  Specifies (in seconds) how often Scylla will check for fully expired SSTables, which can be immediately dropped.
+  Specifies (in seconds) how often ScyllaDB will check for fully expired SSTables, which can be immediately dropped.
 
 =====
 

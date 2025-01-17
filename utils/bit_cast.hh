@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include <bit>
 #include <cstring>
-#include <cstddef>
 #include <type_traits>
 
 template <class T> concept Trivial = std::is_trivial_v<T>;

@@ -1,17 +1,38 @@
 include(generate_cql_grammar)
 
+find_package(ANTLR3 REQUIRED)
+
 generate_cql_grammar(
   GRAMMAR Cql.g
   SOURCES cql_grammar_srcs)
+set_source_files_properties(${cql_grammar_srcs}
+  PROPERTIES
+    COMPILE_OPTIONS "-Wno-uninitialized;-Wno-parentheses-equality")
+
+set(cql_parser_srcs ${cql_grammar_srcs})
+list(FILTER cql_parser_srcs INCLUDE REGEX "Parser.cpp$")
+
+set(unoptimized_modes "Coverage,Debug,Sanitize")
+set(sanitized_modes "Debug,Sanitize")
+set_property(
+    SOURCE ${cql_parser_srcs}
+    APPEND
+    PROPERTY COMPILE_OPTIONS
+      # Unoptimized parsers end up using huge amounts of stack space and
+      # overflowing their stack
+      $<$<CONFIG:${unoptimized_modes}>:-O1>
+      # use-after-scope sanitizer also uses large amount of stack space
+      # and overflows the stack of CqlParser
+      $<$<CONFIG:${sanitized_modes}>:-fsanitize-address-use-after-scope>)
 
 add_library(cql3 STATIC)
 target_sources(cql3
   PRIVATE
     type_json.cc
-    abstract_marker.cc
     attributes.cc
     cf_name.cc
     cql3_type.cc
+    description.cc
     operation.cc
     index_name.cc
     keyspace_element_name.cc
@@ -82,6 +103,7 @@ target_sources(cql3
     statements/detach_service_level_statement.cc
     statements/list_service_level_statement.cc
     statements/list_service_level_attachments_statement.cc
+    statements/list_effective_service_level_statement.cc
     statements/describe_statement.cc
     update_parameters.cc
     util.cc
@@ -94,10 +116,7 @@ target_sources(cql3
     query_options.cc
     user_types.cc
     untyped_result_set.cc
-    selection/abstract_function_selector.cc
-    selection/simple_selector.cc
     selection/selectable.cc
-    selection/selector_factories.cc
     selection/selection.cc
     selection/selector.cc
     restrictions/statement_restrictions.cc
@@ -109,5 +128,16 @@ target_include_directories(cql3
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_BINARY_DIR})
 target_link_libraries(cql3
-  Seastar::seastar
-  xxHash::xxhash)
+  PUBLIC
+    idl
+    wasmtime_bindings
+    Seastar::seastar
+    absl::headers
+    xxHash::xxhash
+    ANTLR3::antlr3
+  PRIVATE
+    lang
+    transport)
+
+check_headers(check-headers cql3
+  GLOB_RECURSE ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)

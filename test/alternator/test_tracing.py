@@ -1,6 +1,6 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 ##############################################################################
 # Tests for Scylla's "tracing" feature (see docs/dev/tracing.md) for Alternator
@@ -14,12 +14,14 @@
 # through out-of-band HTTP requests.
 ##############################################################################
 
+import json
+import time
+
 import pytest
 import requests
-import time
-import json
-from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_query, create_test_table
+
+from test.alternator.util import random_string, full_scan, full_query, create_test_table
+
 
 # The "with_tracing" fixture ensures that tracing is enabled throughout
 # the run of a test function, and disabled when it ends. If tracing cannot be
@@ -37,7 +39,7 @@ def with_tracing(rest_api):
     response = requests.post(rest_api+'/storage_service/trace_probability?probability=1')
     if response.status_code != 200:
         pytest.skip('Failed to enable tracing')
-    # verify tha tracing is really enabled
+    # verify that tracing is really enabled
     response = requests.get(rest_api+'/storage_service/trace_probability')
     if response.status_code != 200 or response.content.decode('utf-8') != '1':
         pytest.skip('Failed to verify tracing')
@@ -240,9 +242,9 @@ def test_slow_query_log(with_slow_query_logging, test_table_s, dynamodb):
     while time.time() < start_time + 60:
         results = full_scan(slow_query_table, ConsistentRead=False)
         put_item_found = any("PutItem" in result['parameters'] and p in result['parameters']
-                and result['username'] == "alternator" for result in results)
+                and result['username'] == "cassandra" for result in results)
         delete_item_found = any("DeleteItem" in result['parameters'] and p in result['parameters']
-                and result['username'] == "alternator" for result in results)
+                and result['username'] == "cassandra" for result in results)
         if put_item_found and delete_item_found:
             return
         else:

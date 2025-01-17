@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -38,6 +38,10 @@ public:
         return *static_cast<const replica::table*>(extract(t));
     }
 public:
+    virtual const table_schema_version& get_version(data_dictionary::database db) const override {
+        return unwrap(db).get_version();
+    }
+
     virtual std::optional<data_dictionary::keyspace> try_find_keyspace(data_dictionary::database db, std::string_view name) const override {
         try {
             return wrap(unwrap(db).find_keyspace(name));
@@ -62,11 +66,11 @@ public:
     }
     virtual std::vector<data_dictionary::table> get_tables(data_dictionary::database db) const override {
         std::vector<data_dictionary::table> ret;
-        auto&& tables = unwrap(db).get_column_families();
-        ret.reserve(tables.size());
-        for (auto&& [uuid, cf] : tables) {
-            ret.push_back(wrap(*cf));
-        }
+        auto& tmd = unwrap(db).get_tables_metadata();
+        ret.reserve(tmd.size());
+        tmd.for_each_table([&] (table_id, const lw_shared_ptr<table> table) {
+            ret.push_back(wrap(*table));
+        });
         return ret;
     }
     virtual std::optional<data_dictionary::table> try_find_table(data_dictionary::database db, std::string_view ks, std::string_view table) const override {
@@ -122,6 +126,9 @@ public:
     }
     virtual replica::database& real_database(data_dictionary::database db) const override {
         return const_cast<replica::database&>(unwrap(db));
+    }
+    virtual replica::database* real_database_ptr(data_dictionary::database db) const override {
+        return &real_database(db);
     }
     virtual schema_ptr get_cdc_base_table(data_dictionary::database db, const schema& s) const override {
         return cdc::get_base_table(unwrap(db), s);

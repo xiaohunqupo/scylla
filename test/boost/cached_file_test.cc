@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/range/irange.hpp>
@@ -28,7 +28,7 @@ static lru cf_lru;
 
 static sstring read_to_string(cached_file::stream& s, size_t limit = std::numeric_limits<size_t>::max()) {
     sstring b;
-    while (auto buf = s.next().get0()) {
+    while (auto buf = s.next().get()) {
         b += sstring(buf.get(), buf.size());
         if (b.size() >= limit) {
             break;
@@ -38,7 +38,7 @@ static sstring read_to_string(cached_file::stream& s, size_t limit = std::numeri
 }
 
 static void read_to_void(cached_file::stream& s, size_t limit = std::numeric_limits<size_t>::max()) {
-    while (auto buf = s.next().get0()) {
+    while (auto buf = s.next().get()) {
         if (buf.size() >= limit) {
             break;
         }
@@ -49,18 +49,18 @@ static void read_to_void(cached_file::stream& s, size_t limit = std::numeric_lim
 static sstring read_to_string(file& f, size_t start, size_t len) {
     file_input_stream_options opt;
     auto in = make_file_input_stream(f, start, len, opt);
-    auto buf = in.read_exactly(len).get0();
+    auto buf = in.read_exactly(len).get();
     return sstring(buf.get(), buf.size());
 }
 
 static sstring read_to_string(cached_file& cf, size_t off, size_t limit = std::numeric_limits<size_t>::max()) {
-    auto s = cf.read(off, default_priority_class(), std::nullopt);
+    auto s = cf.read(off, std::nullopt);
     return read_to_string(s, limit);
 }
 
 [[gnu::unused]]
 static void read_to_void(cached_file& cf, size_t off, size_t limit = std::numeric_limits<size_t>::max()) {
-    auto s = cf.read(off, default_priority_class(), std::nullopt);
+    auto s = cf.read(off, std::nullopt);
     read_to_void(s, limit);
 }
 
@@ -79,16 +79,16 @@ test_file make_test_file(size_t size) {
     auto contents = tests::random::get_sstring(size);
 
     auto path = dir.path() / "file";
-    file f = open_file_dma(path.c_str(), open_flags::create | open_flags::rw).get0();
+    file f = open_file_dma(path.c_str(), open_flags::create | open_flags::rw).get();
 
     testlog.debug("file contents: {}", contents);
 
-    output_stream<char> out = make_file_output_stream(f).get0();
+    output_stream<char> out = make_file_output_stream(f).get();
     auto close_out = defer([&] { out.close().get(); });
     out.write(contents.begin(), contents.size()).get();
     out.flush().get();
 
-    f = open_file_dma(path.c_str(), open_flags::ro).get0();
+    f = open_file_dma(path.c_str(), open_flags::ro).get();
 
     return test_file{
         .dir = std::move(dir),
@@ -99,7 +99,7 @@ test_file make_test_file(size_t size) {
 
 SEASTAR_THREAD_TEST_CASE(test_file_wrapper) {
     auto page_size = cached_file::page_size;
-    cached_file::metrics metrics;
+    cached_file_stats metrics;
     test_file tf = make_test_file(page_size * 3);
     logalloc::region region;
     cached_file cf(tf.f, metrics, cf_lru, region, page_size * 3);
@@ -120,9 +120,28 @@ SEASTAR_THREAD_TEST_CASE(test_file_wrapper) {
     BOOST_CHECK_THROW(read_to_string(f, 0, cf.size() + 1), seastar::file::eof_error);
 }
 
+/* Reproducer for issue https://github.com/scylladb/scylladb/issues/14814 */
+SEASTAR_THREAD_TEST_CASE(test_no_crash_on_dtor_after_oom) {
+    auto page_size = cached_file::page_size;
+    cached_file_stats metrics;
+    test_file tf = make_test_file(page_size * 32); // 128k.
+    logalloc::region region;
+    cached_file cf(tf.f, metrics, cf_lru, region, page_size * 32);
+    seastar::file f = make_cached_seastar_file(cf);
+
+    utils::get_local_injector().enable("cached_file_get_first_page", true /* oneshot */);
+
+    try {
+        BOOST_REQUIRE_EQUAL(tf.contents.substr(0, page_size * 32),
+                            read_to_string(f, 0, page_size * 32));
+    } catch (...) {
+        testlog.info("exception caught: {}", std::current_exception());
+    }
+}
+
 SEASTAR_THREAD_TEST_CASE(test_concurrent_population) {
     auto page_size = cached_file::page_size;
-    cached_file::metrics metrics;
+    cached_file_stats metrics;
     test_file tf = make_test_file(page_size * 3);
     logalloc::region region;
     cached_file cf(tf.f, metrics, cf_lru, region, page_size * 3);
@@ -148,7 +167,7 @@ SEASTAR_THREAD_TEST_CASE(test_reading_from_small_file) {
     test_file tf = make_test_file(1024);
 
     {
-        cached_file::metrics metrics;
+        cached_file_stats metrics;
         logalloc::region region;
         cached_file cf(tf.f, metrics, cf_lru, region, tf.contents.size());
 
@@ -191,7 +210,7 @@ SEASTAR_THREAD_TEST_CASE(test_eviction_via_lru) {
     test_file tf = make_test_file(file_size);
 
     {
-        cached_file::metrics metrics;
+        cached_file_stats metrics;
         logalloc::region region;
         cached_file cf(tf.f, metrics, cf_lru, region, tf.contents.size());
 
@@ -270,8 +289,8 @@ private:
     }
 public:
     // unsupported
-    virtual future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, const io_priority_class& pc) override { unsupported(); }
-    virtual future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc) override { unsupported(); }
+    virtual future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, io_intent*) override { unsupported(); }
+    virtual future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, io_intent*) override { unsupported(); }
     virtual future<> flush(void) override { unsupported(); }
     virtual future<> truncate(uint64_t length) override { unsupported(); }
     virtual future<> discard(uint64_t offset, uint64_t length) override { unsupported(); }
@@ -283,15 +302,15 @@ public:
 
     virtual future<> close() override { return make_ready_future<>(); }
 
-    virtual future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t size, const io_priority_class& pc) override {
+    virtual future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t size, io_intent*) override {
         return make_ready_future<temporary_buffer<uint8_t>>(temporary_buffer<uint8_t>(size));
     }
 
-    virtual future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, const io_priority_class& pc) override {
+    virtual future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent*) override {
         unsupported(); // FIXME
     }
 
-    virtual future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc) override {
+    virtual future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent*) override {
         unsupported(); // FIXME
     }
 };
@@ -303,7 +322,7 @@ SEASTAR_THREAD_TEST_CASE(test_stress_eviction) {
     auto file_size = page_size * n_pages;
     auto cached_size = 4'000'000;
 
-    cached_file::metrics metrics;
+    cached_file_stats metrics;
     logalloc::region region;
 
     auto f = file(make_shared<garbage_file_impl>());
@@ -315,7 +334,7 @@ SEASTAR_THREAD_TEST_CASE(test_stress_eviction) {
         return cf_lru.evict();
     });
 
-    for (int i = 0; i < (cached_size / page_size); ++i) {
+    for (size_t i = 0; i < (cached_size / page_size); ++i) {
         read_to_string(cf, page_size * i, page_size);
     }
 
@@ -335,7 +354,7 @@ SEASTAR_THREAD_TEST_CASE(test_stress_eviction) {
     testlog.debug("Memory: allocated={}, free={}", seastar::memory::stats().allocated_memory(), seastar::memory::stats().free_memory());
     testlog.debug("Starting test...");
 
-    for (int j = 0; j < n_pages * 16; ++j) {
+    for (size_t j = 0; j < n_pages * 16; ++j) {
         testlog.trace("Allocating");
         auto stride = tests::random::get_int(1, 20);
         auto page_idx = tests::random::get_int(n_pages - stride);
@@ -348,7 +367,7 @@ SEASTAR_THREAD_TEST_CASE(test_invalidation) {
     auto page_size = cached_file::page_size;
     test_file tf = make_test_file(page_size * 2);
 
-    cached_file::metrics metrics;
+    cached_file_stats metrics;
     logalloc::region region;
     cached_file cf(tf.f, metrics, cf_lru, region, page_size * 2);
 
@@ -433,4 +452,53 @@ SEASTAR_THREAD_TEST_CASE(test_invalidation) {
     BOOST_REQUIRE_EQUAL(2, metrics.page_misses);
     BOOST_REQUIRE_EQUAL(2, metrics.page_populations);
     BOOST_REQUIRE_EQUAL(0, metrics.page_hits);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_page_view_as_contiguous_shared_buffer) {
+    auto page_size = cached_file::page_size;
+    test_file tf = make_test_file(page_size);
+
+    cached_file_stats metrics;
+    logalloc::region region;
+    cached_file cf(tf.f, metrics, cf_lru, region, page_size);
+
+    auto s = cf.read(1, std::nullopt);
+    cached_file::page_view p = s.next_page_view().get();
+    BOOST_REQUIRE_EQUAL(tf.contents.substr(1, page_size - 1), sstring(p.begin(), p.end()));
+    BOOST_REQUIRE_EQUAL(p.size(), page_size - 1);
+    BOOST_REQUIRE(!p.empty());
+
+    p.trim(10);
+    BOOST_REQUIRE_EQUAL(tf.contents.substr(1, 10), sstring(p.begin(), p.end()));
+    BOOST_REQUIRE_EQUAL(tf.contents.substr(1, 10), sstring(p.get_write(), p.end()));
+
+    p.trim_front(1);
+    BOOST_REQUIRE_EQUAL(tf.contents.substr(2, 9), sstring(p.begin(), p.end()));
+
+    // Check movability
+    {
+        auto p_cpy = p.share();
+        auto p1 = std::move(p_cpy);
+        BOOST_REQUIRE_EQUAL(tf.contents.substr(2, 9), sstring(p1.begin(), p1.end()));
+        BOOST_REQUIRE(p_cpy.empty());
+        BOOST_REQUIRE(p_cpy.size() == 0);
+        BOOST_REQUIRE(!p_cpy);
+    }
+
+    auto p2 = p.share(2, 3);
+    BOOST_REQUIRE_EQUAL(tf.contents.substr(4, 3), sstring(p2.begin(), p2.end()));
+    p2.trim_front(1); // should not affect p
+
+    p.trim_front(9);
+    BOOST_REQUIRE_EQUAL(p.size(), 0);
+    BOOST_REQUIRE(p.begin() == p.end());
+
+    p = {};
+    BOOST_REQUIRE_EQUAL(p.size(), 0);
+    BOOST_REQUIRE(p.begin() == p.end());
+    BOOST_REQUIRE(!p);
+    BOOST_REQUIRE_EQUAL(sstring(p.begin(), p.end()), sstring());
+
+    // p should not affect p2
+    BOOST_REQUIRE_EQUAL(tf.contents.substr(5, 2), sstring(p2.begin(), p2.end()));
 }

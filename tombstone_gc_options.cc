@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
@@ -56,22 +56,14 @@ seastar::sstring tombstone_gc_options::to_sstring() const {
     return rjson::print(rjson::from_string_map(to_map()));
 }
 
-bool
-tombstone_gc_options::operator==(const tombstone_gc_options& other) const {
-    return _mode == other._mode && _propagation_delay_in_seconds == other._propagation_delay_in_seconds;
-}
-
-bool
-tombstone_gc_options::operator!=(const tombstone_gc_options& other) const {
-    return !(*this == other);
-}
-
-std::ostream& operator<<(std::ostream& os, const tombstone_gc_mode& mode) {
+auto fmt::formatter<tombstone_gc_mode>::format(tombstone_gc_mode mode, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    std::string_view name = "unknown";
     switch (mode) {
-    case tombstone_gc_mode::timeout:     return os << "timeout";
-    case tombstone_gc_mode::disabled:    return os << "disabled";
-    case tombstone_gc_mode::immediate:   return os << "immediate";
-    case tombstone_gc_mode::repair:      return os << "repair";
+    case tombstone_gc_mode::timeout:     name = "timeout"; break;
+    case tombstone_gc_mode::disabled:    name = "disabled"; break;
+    case tombstone_gc_mode::immediate:   name = "immediate"; break;
+    case tombstone_gc_mode::repair:      name = "repair"; break;
     }
-    return os << "unknown";
+    return formatter<string_view>::format(name, ctx);
 }

@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "bytes.hh"
 #include "schema/schema_fwd.hh"
 #include "service/qos/qos_common.hh"
 #include "utils/UUID.hh"
@@ -77,16 +76,13 @@ private:
     bool _forced_cdc_timestamps_schema_sync = false;
 
 public:
-    /* Should writes to the given table always be synchronized by commitlog (flushed to disk)
-     * before being acknowledged? */
-    static bool is_extra_durable(const sstring& cf_name);
-
     static std::vector<schema_ptr> all_distributed_tables();
     static std::vector<schema_ptr> all_everywhere_tables();
 
     system_distributed_keyspace(cql3::query_processor&, service::migration_manager&, service::storage_proxy&);
 
     future<> start();
+    future<> start_workload_prioritization();
     future<> stop();
 
     bool started() const { return _started; }
@@ -117,10 +113,14 @@ public:
 
     future<db_clock::time_point> cdc_current_generation_timestamp(context);
 
-    future<qos::service_levels_info> get_service_levels() const;
+    future<qos::service_levels_info> get_service_levels(qos::query_context ctx) const;
     future<qos::service_levels_info> get_service_level(sstring service_level_name) const;
     future<> set_service_level(sstring service_level_name, qos::service_level_options slo) const;
     future<> drop_service_level(sstring service_level_name) const;
+    bool workload_prioritization_tables_exists();
+
+private:
+    future<> create_tables(std::vector<schema_ptr> tables);
 };
 
 }

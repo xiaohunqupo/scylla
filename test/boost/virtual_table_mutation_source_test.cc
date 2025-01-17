@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include <seastar/core/with_timeout.hh>
 #include <seastar/util/closeable.hh>
 #include "db/virtual_table.hh"
-#include "db/system_keyspace.hh"
 #include "schema/schema.hh"
 
 #include "test/lib/mutation_source_test.hh"
-
+#include "test/lib/sstable_utils.hh"
 #include "test/lib/scylla_test_case.hh"
 
 class memtable_filling_test_vt : public db::memtable_filling_virtual_table {
@@ -38,10 +38,7 @@ public:
 
     virtual future<> execute(reader_permit permit, db::result_collector& rc) override {
         return async([this, permit, &rc] {
-            auto mt = make_lw_shared<replica::memtable>(_s);
-            do_for_each(_mutations, [mt] (const mutation& m) {
-                mt->apply(m);
-            }).get();
+            auto mt = make_memtable(_s, _mutations);
             auto rdr = mt->make_flat_reader(_s, permit);
             auto close_rdr = deferred_close(rdr);
             rdr.consume_pausable([&rc] (mutation_fragment_v2 mf) {
@@ -69,11 +66,10 @@ SEASTAR_THREAD_TEST_CASE(test_streaming_vt_as_mutation_source) {
                 reader_permit permit,
                 const dht::partition_range& pr,
                 const query::partition_slice& slice,
-                const io_priority_class& pc,
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding stream_fwd,
                 mutation_reader::forwarding) {
-            return ms.make_reader_v2(s, permit, pr, slice, pc, trace_state, stream_fwd, mutation_reader::forwarding::no);
+            return ms.make_reader_v2(s, permit, pr, slice, trace_state, stream_fwd, mutation_reader::forwarding::no);
         });
     }, false /* with_partition_range_forwarding */);
 }

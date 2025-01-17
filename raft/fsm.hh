@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #pragma once
 
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/on_internal_error.hh>
+#include "utils/assert.hh"
 #include "utils/small_vector.hh"
 #include "raft.hh"
 #include "tracker.hh"
@@ -21,6 +22,9 @@ struct fsm_output {
     struct applied_snapshot {
         snapshot_descriptor snp;
         bool is_local;
+
+        // Always 0 for non-local snapshots.
+        size_t preserved_log_entries;
     };
     std::optional<std::pair<term_t, server_id>> term_and_vote;
     std::vector<log_entry_ptr> log_entries;
@@ -34,16 +38,13 @@ struct fsm_output {
     // since last fsm output poll.
     std::optional<config_member_set> configuration;
     std::optional<read_id> max_read_id_with_quorum;
+    // True if there was a state change.
+    // Events can be coalesced, so this cannot be used to get
+    // all state changes, only to know that the state changed
+    // at least once
+    bool state_changed = false;
     // Set to true if a leadership transfer was aborted since the last output
     bool abort_leadership_transfer;
-
-    // True if there is no new output
-    bool empty() const {
-        return !term_and_vote &&
-            log_entries.size() == 0 && messages.size() == 0 &&
-            committed.size() == 0 && !snp && snps_to_drop.empty() &&
-            !configuration;
-    }
 };
 
 struct fsm_config {
@@ -136,9 +137,13 @@ struct leader {
 // in-memory state machine with a catch-all API step(message)
 // method. The method handles any kind of input and performs the
 // needed state machine state transitions. To get state machine output
-// poll_output() function has to be called. This call produces an output
+// get_output() function has to be called. To check first if
+// any new output is present, call has_output(). To wait for new
+// new output events, use the sm_events condition variable passed
+// to fsm constructor; fs` signals it each time new output may appear.
+// The get_output() call produces an output
 // object, which encapsulates a list of actions that must be
-// performed until the next poll_output() call can be made. The time is
+// performed until the next get_output() call can be made. The time is
 // represented with a logical timer. The client is responsible for
 // periodically invoking tick() method, which advances the state
 // machine time and allows it to track such events as election or
@@ -226,7 +231,7 @@ private:
     std::vector<std::pair<server_id, rpc_message>> _messages;
 
     // Signaled when there is a IO event to process.
-    seastar::condition_variable _sm_events;
+    seastar::condition_variable& _sm_events;
 
     // Called when one of the replicas advances its match index
     // so it may be the case that some entries are committed now.
@@ -308,7 +313,7 @@ private:
 
     // Issue the next read identifier
     read_id next_read_id() {
-        assert(is_leader());
+        SCYLLA_ASSERT(is_leader());
         ++leader_state().last_read_id;
         leader_state().last_read_id_changed = true;
         _sm_events.signal();
@@ -338,10 +343,8 @@ protected: // For testing
 
 public:
     explicit fsm(server_id id, term_t current_term, server_id voted_for, log log,
-            index_t commit_idx, failure_detector& failure_detector, fsm_config conf);
-
-    explicit fsm(server_id id, term_t current_term, server_id voted_for, log log,
-            failure_detector& failure_detector, fsm_config conf);
+            index_t commit_idx, failure_detector& failure_detector, fsm_config conf,
+            seastar::condition_variable& sm_events);
 
     bool is_leader() const {
         return std::holds_alternative<leader>(_state);
@@ -352,8 +355,20 @@ public:
     bool is_candidate() const {
         return std::holds_alternative<candidate>(_state);
     }
+    std::string_view current_state() const {
+        static constexpr std::string_view leader_state = "Leader";
+        static constexpr std::string_view follower_state = "Follower";
+        static constexpr std::string_view candidate_state = "Candidate";
+        if (is_leader()) {
+            return leader_state;
+        }
+        return is_follower() ? follower_state : candidate_state;
+    }
     bool is_prevote_candidate() const {
         return is_candidate() && std::get<candidate>(_state).is_prevote;
+    }
+    size_t state_to_metric() const {
+        return _state.index();
     }
     index_t log_last_idx() const {
         return _log.last_idx();
@@ -392,7 +407,7 @@ public:
 
     // Ask to search for a leader if one is not known.
     void ping_leader() {
-        assert(!current_leader());
+        SCYLLA_ASSERT(!current_leader());
         _ping_leader = true;
     }
 
@@ -409,12 +424,9 @@ public:
     // committed to the persistent Raft log afterwards.
     template<typename T> const log_entry& add_entry(T command);
 
-    // Wait until there is, and return state machine output that
-    // needs to be handled.
-    // This includes a list of the entries that need
-    // to be logged. The logged entries are eventually
-    // discarded from the state machine after applying a snapshot.
-    future<fsm_output> poll_output();
+    // Check if there is any state machine output
+    // that `get_output()` will return.
+    bool has_output() const;
 
     // Get state machine output, if there is any. Doesn't
     // wait. It is public for use in testing.
@@ -427,7 +439,7 @@ public:
 
     // Feed one Raft RPC message into the state machine.
     // Advances the state machine state and generates output,
-    // accessible via poll_output().
+    // accessible via get_output().
     template <typename Message>
     void step(server_id from, Message&& msg);
 
@@ -478,7 +490,7 @@ public:
 
     server_id id() const { return _my_id; }
 
-    friend std::ostream& operator<<(std::ostream& os, const fsm& f);
+    friend fmt::formatter<fsm>;
     friend leader;
 };
 
@@ -636,13 +648,15 @@ void fsm::step(server_id from, Message&& msg) {
             _last_election_time = _clock.now();
 
             if (current_leader() != from) {
-                on_internal_error_noexcept(logger, "Got append request/install snapshot/read_quorum from an unexpected leader");
+                on_internal_error_noexcept(logger, format(
+                    "Got append request/install snapshot/read_quorum from an unexpected leader,"
+                    " expected leader: {}, message from: {}", current_leader(), from));
             }
         }
     }
 
     auto visitor = [this, from, msg = std::move(msg)](const auto& state) mutable {
-        step(from, state, std::move(msg));
+        this->step(from, state, std::move(msg));
     };
 
     std::visit(visitor, _state);
@@ -650,3 +664,6 @@ void fsm::step(server_id from, Message&& msg) {
 
 } // namespace raft
 
+template <> struct fmt::formatter<raft::fsm> : fmt::formatter<string_view> {
+    auto format(const raft::fsm&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

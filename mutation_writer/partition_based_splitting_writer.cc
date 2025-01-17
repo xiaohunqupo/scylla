@@ -3,14 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "mutation_writer/partition_based_splitting_writer.hh"
+#include "mutation_writer/feed_writers.hh"
 #include "mutation/mutation_rebuilder.hh"
 #include "replica/memtable.hh"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/when_all.hh>
 
 namespace mutation_writer {
 
@@ -18,7 +20,6 @@ class partition_sorting_mutation_writer {
     schema_ptr _schema;
     reader_permit _permit;
     reader_consumer_v2 _consumer;
-    const io_priority_class& _pc;
     size_t _max_memory;
     bucket_writer_v2 _bucket_writer;
     std::optional<dht::decorated_key> _last_bucket_key;
@@ -41,7 +42,7 @@ private:
     }
 
     future<> flush_memtable() {
-        co_await _consumer(_memtable->make_flush_reader(_schema, _permit, _pc));
+        co_await _consumer(_memtable->make_flush_reader(_schema, _permit));
         _memtable = make_lw_shared<replica::memtable>(_schema);
     }
 
@@ -75,7 +76,6 @@ public:
         : _schema(std::move(schema))
         , _permit(std::move(permit))
         , _consumer(std::move(consumer))
-        , _pc(cfg.pc)
         , _max_memory(cfg.max_memory)
         , _bucket_writer(_schema, _permit, _consumer)
         , _memtable(make_lw_shared<replica::memtable>(_schema))
@@ -130,7 +130,7 @@ public:
     }
 };
 
-future<> segregate_by_partition(flat_mutation_reader_v2 producer, segregate_config cfg, reader_consumer_v2 consumer) {
+future<> segregate_by_partition(mutation_reader producer, segregate_config cfg, reader_consumer_v2 consumer) {
     auto schema = producer.schema();
     auto permit = producer.permit();
   try {

@@ -5,12 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "timeout_config.hh"
+#include "service/raft/raft_group0_client.hh"
+#include "audit/audit.hh"
 
 namespace service {
 
@@ -39,14 +41,24 @@ seastar::shared_ptr<const metadata> make_empty_metadata();
 
 class query_options;
 
+// A vector of CQL warnings generated during execution of a statement.
+using cql_warnings_vec = std::vector<sstring>;
+
 class cql_statement {
     timeout_config_selector _timeout_config_selector;
+    audit::audit_info_ptr _audit_info;
 public:
     // CQL statement text
     seastar::sstring raw_cql_statement;
 
-    explicit cql_statement(timeout_config_selector timeout_selector) : _timeout_config_selector(timeout_selector) {}
+    // Returns true for statements that needs guard to be taken before the execution
+    virtual bool needs_guard(query_processor& qp, service::query_state& state) const {
+        return false;
+    }
 
+    explicit cql_statement(timeout_config_selector timeout_selector) : _timeout_config_selector(timeout_selector) {}
+    cql_statement(cql_statement&& o) = default;
+    cql_statement(const cql_statement& o) : _timeout_config_selector(o._timeout_config_selector), _audit_info(o._audit_info ? std::make_unique<audit::audit_info>(*o._audit_info) : nullptr) { }
     virtual ~cql_statement()
     { }
 
@@ -62,12 +74,12 @@ public:
     virtual seastar::future<> check_access(query_processor& qp, const service::client_state& state) const = 0;
 
     /**
-     * Perform additional validation required by the statment.
-     * To be overriden by subclasses if needed.
+     * Perform additional validation required by the statement.
+     * To be overridden by subclasses if needed.
      *
      * @param state the current client state
      */
-    virtual void validate(query_processor& qp, const service::client_state& state) const = 0;
+    virtual void validate(query_processor& qp, const service::client_state& state) const {}
 
     /**
      * Execute the statement and return the resulting result or null if there is no result.
@@ -79,7 +91,7 @@ public:
      * @param options options for this query (consistency, variables, pageSize, ...)
      */
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-        execute(query_processor& qp, service::query_state& state, const query_options& options) const = 0;
+        execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const = 0;
 
     /**
      * Execute the statement and return the resulting result or null if there is no result.
@@ -91,8 +103,8 @@ public:
      * @param options options for this query (consistency, variables, pageSize, ...)
      */
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-            execute_without_checking_exception_message(query_processor& qp, service::query_state& state, const query_options& options) const {
-        return execute(qp, state, options);
+            execute_without_checking_exception_message(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
+        return execute(qp, state, options, std::move(guard));
     }
 
     virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const = 0;
@@ -102,6 +114,11 @@ public:
     virtual bool is_conditional() const {
         return false;
     }
+
+    audit::audit_info* get_audit_info() { return _audit_info.get(); }
+    void set_audit_info(audit::audit_info_ptr&& info) { _audit_info = std::move(info); }
+
+    virtual void sanitize_audit_info() {}
 };
 
 class cql_statement_no_metadata : public cql_statement {

@@ -4,13 +4,15 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include <memory>
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
+#include <ranges>
 #include <boost/range/adaptor/map.hpp>
 
 #include <seastar/core/future.hh>
@@ -19,15 +21,10 @@
 #include "commitlog.hh"
 #include "commitlog_replayer.hh"
 #include "replica/database.hh"
-#include "sstables/sstables.hh"
 #include "db/system_keyspace.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "converting_mutation_partition_applier.hh"
-#include "schema/schema_registry.hh"
 #include "commitlog_entry.hh"
-#include "service/priority_manager.hh"
-#include "db/extensions.hh"
-#include "utils/fragmented_temporary_buffer.hh"
 #include "validation.hh"
 #include "mutation/mutation_partition_view.hh"
 
@@ -48,7 +45,7 @@ class db::commitlog_replayer::impl {
 
     friend class db::commitlog_replayer;
 public:
-    impl(seastar::sharded<replica::database>& db);
+    impl(seastar::sharded<replica::database>& db, seastar::sharded<db::system_keyspace>& sys_ks);
 
     future<> init();
 
@@ -57,6 +54,7 @@ public:
         uint64_t skipped_mutations = 0;
         uint64_t applied_mutations = 0;
         uint64_t corrupt_bytes = 0;
+        uint64_t truncated_at = 0;
 
         stats& operator+=(const stats& s) {
             invalid_mutations += s.invalid_mutations;
@@ -73,7 +71,7 @@ public:
     };
 
     // move start/stop of the thread local bookkeep to "top level"
-    // and also make sure to assert on it actually being started.
+    // and also make sure to SCYLLA_ASSERT on it actually being started.
     future<> start() {
         return _column_mappings.start();
     }
@@ -82,7 +80,7 @@ public:
     }
 
     future<> process(stats*, commitlog::buffer_and_replay_position buf_rp) const;
-    future<stats> recover(sstring file, const sstring& fname_prefix) const;
+    future<stats> recover(const commitlog::descriptor&, const commitlog::replay_state&) const;
 
     typedef std::unordered_map<table_id, replay_position> rp_map;
     typedef std::unordered_map<unsigned, rp_map> shard_rpm_map;
@@ -100,91 +98,82 @@ public:
         auto j = i->second.find(uuid);
         return j != i->second.end() ? j->second : replay_position();
     }
+    replay_position token_min_pos(const table_id& uuid, unsigned shard, dht::token token) const {
+        replay_position rp;
+        if (auto i = _cleanup_map.find({uuid, shard}); i != _cleanup_map.end()) {
+            if (auto candidate_rp = i->second.get(dht::token::to_int64(token))) {
+                rp = *candidate_rp;
+            }
+        }
+        return rp;
+    }
 
-    seastar::sharded<replica::database>&
-        _db;
-    shard_rpm_map
-        _rpm;
-    shard_rp_map
-        _min_pos;
+    seastar::sharded<replica::database>& _db;
+    seastar::sharded<db::system_keyspace>& _sys_ks;
+    shard_rpm_map _rpm;
+    db::system_keyspace::commitlog_cleanup_map _cleanup_map;
+    shard_rp_map _min_pos;
 };
 
-db::commitlog_replayer::impl::impl(seastar::sharded<replica::database>& db)
+db::commitlog_replayer::impl::impl(seastar::sharded<replica::database>& db, seastar::sharded<db::system_keyspace>& sys_ks)
     : _db(db)
+    , _sys_ks(sys_ks)
 {}
 
 future<> db::commitlog_replayer::impl::init() {
-    return _db.map_reduce([this](shard_rpm_map map) {
-        for (auto& p1 : map) {
-            for (auto& p2 : p1.second) {
-                auto& pp = _rpm[p1.first][p2.first];
-                pp = std::max(pp, p2.second);
-
-                auto i = _min_pos.find(p1.first);
-                if (i == _min_pos.end() || p2.second < i->second) {
-                    _min_pos[p1.first] = p2.second;
-                }
-            }
-        }
-    }, [](replica::database& db) {
-        return do_with(shard_rpm_map{}, [&db](shard_rpm_map& map) {
-            return parallel_for_each(db.get_column_families(), [&map](auto& cfp) {
-                auto uuid = cfp.first;
-                // We do this on each cpu, for each CF, which technically is a little wasteful, but the values are
-                // cached, this is only startup, and it makes the code easier.
-                // Get all truncation records for the CF and initialize max rps if
-                // present. Cannot do this on demand, as there may be no sstables to
-                // mark the CF as "needed".
-                return db::system_keyspace::get_truncated_position(uuid).then([&map, uuid](std::vector<db::replay_position> tpps) {
-                    for (auto& p : tpps) {
-                        rlogger.trace("CF {} truncated at {}", uuid, p);
-                        auto& pp = map[p.shard_id()][uuid];
-                        pp = std::max(pp, p);
-                    }
-                });
-            }).then([&map] {
-                return make_ready_future<shard_rpm_map>(map);
-            });
-        });
-    }).finally([this] {
-        // bugfix: the above map-reduce will not_ detect if sstables
-        // are _missing_ from a CF. And because of re-sharding, we can't
-        // just insert initial zeros into the maps, because we don't know
-        // how many shards there was last time.
-        // However, this only affects global min pos, since
-        // for each CF, the worst that happens is that we have a missing
-        // entry -> empty replay_pos == min value. But calculating
-        // global min pos will be off, since we will only base it on
-        // existing sstables-per-shard.
-        // So, go through all CF:s and check, if a shard mapping does not
-        // have data for it, assume we must set global pos to zero.
-        for (auto&p : _db.local().get_column_families()) {
-            for (auto&p1 : _rpm) { // for each shard
-                if (!p1.second.contains(p.first)) {
-                    _min_pos[p1.first] = replay_position();
-                }
-            }
-        }
-        for (auto&p : _min_pos) {
-            rlogger.debug("minimum position for shard {}: {}", p.first, p.second);
-        }
-        for (auto&p1 : _rpm) {
-            for (auto& p2 : p1.second) {
-                rlogger.debug("replay position for shard/uuid {}/{}: {}", p1.first, p2.first, p2.second);
+    co_await _db.local().get_tables_metadata().parallel_for_each_table([this] (table_id uuid, lw_shared_ptr<replica::table>) -> future<> {
+        const auto rps = co_await _sys_ks.local().get_truncated_positions(uuid);
+        for (const auto& p: rps) {
+            rlogger.trace("CF {} truncated at {}", uuid, p);
+            auto &pp = _rpm[p.shard_id()][uuid];
+            pp = std::max(pp, p);
+            const auto i = _min_pos.find(p.shard_id());
+            if (i == _min_pos.end() || p < i->second) {
+                _min_pos[p.shard_id()] = p;
             }
         }
     });
+    _cleanup_map = co_await _sys_ks.local().get_commitlog_cleanup_records();
+
+    // bugfix: the above code will not_ detect if sstables
+    // are _missing_ from a CF. And because of re-sharding, we can't
+    // just insert initial zeros into the maps, because we don't know
+    // how many shards there was last time.
+    // However, this only affects global min pos, since
+    // for each CF, the worst that happens is that we have a missing
+    // entry -> empty replay_pos == min value. But calculating
+    // global min pos will be off, since we will only base it on
+    // existing sstables-per-shard.
+    // So, go through all CF:s and check, if a shard mapping does not
+    // have data for it, assume we must set global pos to zero.
+    _db.local().get_tables_metadata().for_each_table([&] (table_id id, lw_shared_ptr<replica::table>) {
+        for (auto&p1 : _rpm) { // for each shard
+            if (!p1.second.contains(id)) {
+                _min_pos[p1.first] = replay_position();
+            }
+        }
+    });
+
+    for (auto&p : _min_pos) {
+        rlogger.debug("minimum position for shard {}: {}", p.first, p.second);
+    }
+    for (auto&p1 : _rpm) {
+        for (auto& p2 : p1.second) {
+            rlogger.debug("replay position for shard/uuid {}/{}: {}", p1.first, p2.first, p2.second);
+        }
+    }
 }
 
 future<db::commitlog_replayer::impl::stats>
-db::commitlog_replayer::impl::recover(sstring file, const sstring& fname_prefix) const {
-    assert(_column_mappings.local_is_initialized());
+db::commitlog_replayer::impl::recover(const commitlog::descriptor& d, const commitlog::replay_state& rpstate) const {
+    SCYLLA_ASSERT(_column_mappings.local_is_initialized());
 
-    replay_position rp{commitlog::descriptor(file, fname_prefix)};
+    replay_position rp{d};
     auto gp = min_pos(rp.shard_id());
+    auto f = d.filename();
 
     if (rp.id < gp.id) {
-        rlogger.debug("skipping replay of fully-flushed {}", file);
+        rlogger.debug("skipping replay of fully-flushed {}", f);
         return make_ready_future<stats>();
     }
     position_type p = 0;
@@ -195,13 +184,15 @@ db::commitlog_replayer::impl::recover(sstring file, const sstring& fname_prefix)
     auto s = make_lw_shared<stats>();
     auto& exts = _db.local().extensions();
 
-    return db::commitlog::read_log_file(file, fname_prefix, service::get_local_commitlog_priority(),
+    return db::commitlog::read_log_file(rpstate, f, d.filename_prefix,
             std::bind(&impl::process, this, s.get(), std::placeholders::_1),
             p, &exts).then_wrapped([s](future<> f) {
         try {
             f.get();
         } catch (commitlog::segment_data_corruption_error& e) {
             s->corrupt_bytes += e.bytes();
+        } catch (commitlog::segment_truncation& e) {
+            s->truncated_at = e.position();
         } catch (...) {
             throw;
         }
@@ -233,21 +224,31 @@ future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_r
         if (rp < min_pos(shard_id)) {
             rlogger.trace("entry {} is less than global min position. skipping", rp);
             s->skipped_mutations++;
-            return make_ready_future<>();
+            co_return;
         }
 
         auto uuid = fm.column_family_id();
+        auto& table = _db.local().find_column_family(uuid);
+        const auto& schema = *table.schema();
+        auto token = fm.token(schema);
+
         auto cf_rp = cf_min_pos(uuid, shard_id);
         if (rp <= cf_rp) {
             rlogger.trace("entry {} at {} is younger than recorded replay position {}. skipping", fm.column_family_id(), rp, cf_rp);
             s->skipped_mutations++;
-            return make_ready_future<>();
+            co_return;
         }
 
-        const auto& schema = *_db.local().find_column_family(uuid).schema();
-        auto shard = fm.shard_of(schema);
-        return _db.invoke_on(shard, [this, cer = std::move(cer), &src_cm, rp] (replica::database& db) mutable -> future<> {
-            auto& fm = cer.mutation();
+        auto token_range_rp = token_min_pos(uuid, shard_id, token);
+        if (rp <= token_range_rp) {
+            rlogger.trace("entry {}, token {} in table {}, is younger than recorded replay position {} for its token range. skipping",
+                          rp, token, fm.column_family_id(), token_range_rp);
+            s->skipped_mutations++;
+            co_return;
+        }
+
+      auto apply = [&] (seastar::shard_id shard) {
+        return _db.invoke_on(shard, [this, &fm, &src_cm, rp] (replica::database& db) mutable -> future<> {
             // TODO: might need better verification that the deserialized mutation
             // is schema compatible. My guess is that just applying the mutation
             // will not do this.
@@ -277,9 +278,7 @@ future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_r
                     return db.apply_in_memory(m, cf, db::rp_handle(), db::no_timeout);
                 });
             } else {
-                return do_with(std::move(cer).mutation(), [&](const frozen_mutation& m) {
-                    return db.apply_in_memory(m, cf.schema(), db::rp_handle(), db::no_timeout);
-                });
+                return db.apply_in_memory(fm, cf.schema(), db::rp_handle(), db::no_timeout);
             }
         }).then_wrapped([s] (future<> f) {
             try {
@@ -291,6 +290,14 @@ future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_r
                 rlogger.warn("error replaying: {}", std::current_exception());
             }
         });
+      };
+        auto shards = table.get_effective_replication_map()->shard_for_writes(schema, token);
+        if (shards.empty()) {
+            rlogger.debug("no shard for token {} in table {}", token, uuid);
+            s->skipped_mutations++;
+        } else {
+            co_await seastar::parallel_for_each(shards, apply);
+        }
     } catch (replica::no_such_column_family&) {
         // No such CF now? Origin just ignores this.
     } catch (...) {
@@ -298,12 +305,10 @@ future<> db::commitlog_replayer::impl::process(stats* s, commitlog::buffer_and_r
         // TODO: write mutation to file like origin.
         rlogger.warn("error replaying: {}", std::current_exception());
     }
-
-    return make_ready_future<>();
 }
 
-db::commitlog_replayer::commitlog_replayer(seastar::sharded<replica::database>& db)
-    : _impl(std::make_unique<impl>(db))
+db::commitlog_replayer::commitlog_replayer(seastar::sharded<replica::database>& db, seastar::sharded<db::system_keyspace>& sys_ks)
+    : _impl(std::make_unique<impl>(db, sys_ks))
 {}
 
 db::commitlog_replayer::commitlog_replayer(commitlog_replayer&& r) noexcept
@@ -313,8 +318,8 @@ db::commitlog_replayer::commitlog_replayer(commitlog_replayer&& r) noexcept
 db::commitlog_replayer::~commitlog_replayer()
 {}
 
-future<db::commitlog_replayer> db::commitlog_replayer::create_replayer(seastar::sharded<replica::database>& db) {
-    return do_with(commitlog_replayer(db), [](auto&& rp) {
+future<db::commitlog_replayer> db::commitlog_replayer::create_replayer(seastar::sharded<replica::database>& db, seastar::sharded<db::system_keyspace>& sys_ks) {
+    return do_with(commitlog_replayer(db, sys_ks), [](auto&& rp) {
         auto f = rp._impl->init();
         return f.then([rp = std::move(rp)]() mutable {
             return make_ready_future<commitlog_replayer>(std::move(rp));
@@ -323,57 +328,76 @@ future<db::commitlog_replayer> db::commitlog_replayer::create_replayer(seastar::
 }
 
 future<> db::commitlog_replayer::recover(std::vector<sstring> files, sstring fname_prefix) {
-    typedef std::unordered_multimap<unsigned, sstring> shard_file_map;
+    using shard_file_map = std::unordered_multimap<unsigned, commitlog::descriptor>;
 
-    rlogger.info("Replaying {}", join(", ", files));
+    rlogger.info("Replaying {}", fmt::join(files, ", "));
 
     // pre-compute work per shard already.
-    auto map = ::make_lw_shared<shard_file_map>();
-    for (auto& f : files) {
-        commitlog::descriptor d(f, fname_prefix);
-        replay_position p = d;
-        map->emplace(p.shard_id() % smp::count, std::move(f));
+    shard_file_map map;
+    {
+        // sort files in descriptor ID order to make 
+        // replaying fragmented entries faster/cheaper
+        // (reduces risk of hogging large buffers a long time)
+        auto tmp = files | std::views::transform([&](auto& f) {
+            return commitlog::descriptor(f, fname_prefix);
+        });
+        auto cmp = [](auto& d1, auto& d2) { return d1.id < d2.id; };
+        std::set<commitlog::descriptor, decltype(cmp)> descs(tmp.begin(), tmp.end());
+ 
+        for (auto& d : descs) {
+            replay_position p = d;
+            map.emplace(p.shard_id() % smp::count, std::move(d));
+        }
     }
 
-    return do_with(std::move(fname_prefix), [this, map] (sstring& fname_prefix) {
-        return _impl->start().then([this, map, &fname_prefix] {
-            return map_reduce(smp::all_cpus(), [this, map, &fname_prefix] (unsigned id) {
-                return smp::submit_to(id, [this, id, map, &fname_prefix] () {
-                    auto total = ::make_lw_shared<impl::stats>();
-                    // TODO: or something. For now, we do this serialized per shard,
-                    // to reduce mutation congestion. We could probably (says avi)
-                    // do 2 segments in parallel or something, but lets use this first.
-                    auto range = map->equal_range(id);
-                    return do_for_each(range.first, range.second, [this, total, &fname_prefix] (const std::pair<unsigned, sstring>& p) {
-                        auto&f = p.second;
-                        rlogger.debug("Replaying {}", f);
-                        return _impl->recover(f, fname_prefix).then([f, total](impl::stats stats) {
-                            if (stats.corrupt_bytes != 0) {
-                                rlogger.warn("Corrupted file: {}. {} bytes skipped.", f, stats.corrupt_bytes);
-                            }
-                            rlogger.debug("Log replay of {} complete, {} replayed mutations ({} invalid, {} skipped)"
-                                            , f
-                                            , stats.applied_mutations
-                                            , stats.invalid_mutations
-                                            , stats.skipped_mutations
-                            );
-                            *total += stats;
-                        });
-                    }).then([total] {
-                        return make_ready_future<impl::stats>(*total);
-                    });
-                });
-            }, impl::stats(), std::plus<impl::stats>()).then([](impl::stats totals) {
-                rlogger.info("Log replay complete, {} replayed mutations ({} invalid, {} skipped)"
-                                , totals.applied_mutations
-                                , totals.invalid_mutations
-                                , totals.skipped_mutations
-                );
+    co_await _impl->start();
+    std::exception_ptr e;
+    try {
+        auto totals = co_await map_reduce(smp::all_cpus(), [&](unsigned id) -> future<impl::stats> {
+            co_return co_await smp::submit_to(id, [&] () -> future<impl::stats> {
+                impl::stats total;
+                std::unordered_map<unsigned, commitlog::replay_state> states;
+                // TODO: or something. For now, we do this serialized per shard,
+                // to reduce mutation congestion. We could probably (says avi)
+                // do 2 segments in parallel or something, but lets use this first.
+                auto range = map.equal_range(id);
+                for (auto& [id, d] : std::ranges::subrange(range.first, range.second)) {
+                    auto f = d.filename();
+                    rlogger.debug("Replaying {}", f);
+                    auto stats = co_await _impl->recover(d, states[replay_position(d).shard_id()]);
+                    if (stats.corrupt_bytes != 0) {
+                        rlogger.warn("Corrupted file: {}. {} bytes skipped.", f, stats.corrupt_bytes);
+                    }
+                    if (stats.truncated_at != 0) {
+                        rlogger.warn("Truncated file: {} at position {}.", f, stats.truncated_at);
+                    }
+                    rlogger.debug("Log replay of {} complete, {} replayed mutations ({} invalid, {} skipped)"
+                                    , f
+                                    , stats.applied_mutations
+                                    , stats.invalid_mutations
+                                    , stats.skipped_mutations
+                    );
+                    total += stats;
+                }
+                co_return total;
             });
-        }).finally([this] {
-            return _impl->stop();
-        });
-    });
+        }, impl::stats(), std::plus<impl::stats>());
+            
+        rlogger.info("Log replay complete, {} replayed mutations ({} invalid, {} skipped)"
+                        , totals.applied_mutations
+                        , totals.invalid_mutations
+                        , totals.skipped_mutations
+        );
+
+    } catch (...) {
+        e = std::current_exception();
+    }
+
+    co_await _impl->stop();
+
+    if (e) {
+        std::rethrow_exception(e);
+    }
 }
 
 future<> db::commitlog_replayer::recover(sstring f, sstring fname_prefix) {

@@ -4,7 +4,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 set -e
@@ -23,7 +23,7 @@ Options:
   --prefix /prefix         directory prefix (default /usr)
   --python3 /opt/python3   path of the python3 interpreter relative to install root (default /opt/scylladb/python3/bin/python3)
   --housekeeping           enable housekeeping service
-  --nonroot                install Scylla without required root priviledge
+  --nonroot                install Scylla without required root privilege
   --sysconfdir /etc/sysconfig   specify sysconfig directory name
   --supervisor             enable supervisor to manage scylla processes
   --supervisor-log-to-stdout logging to stdout on supervisor
@@ -107,18 +107,6 @@ if ! $skip_systemd_check && [ ! -d /run/systemd/system/ ]; then
     exit 1
 fi
 
-has_java=false
-if [ -x /usr/bin/java ]; then
-    javaver=$(/usr/bin/java -version 2>&1|head -n1|cut -f 3 -d " ")
-    if [[ "$javaver" =~ ^\"1.8.0 || "$javaver" =~ ^\"11.0. ]]; then
-        has_java=true
-    fi
-fi
-if ! $has_java; then
-    echo "Please install openjdk-8 or openjdk-11 before running install.sh."
-    exit 1
-fi
-
 if [ -z "$prefix" ]; then
     if $nonroot; then
         prefix=~/scylladb
@@ -146,7 +134,6 @@ if [ -z "$python3" ]; then
 fi
 
 scylla_args=()
-jmx_args=()
 args=()
 
 if $housekeeping; then
@@ -154,19 +141,16 @@ if $housekeeping; then
 fi
 if $nonroot; then
     scylla_args+=(--nonroot)
-    jmx_args+=(--nonroot)
     args+=(--nonroot)
 fi
 if $supervisor; then
     scylla_args+=(--supervisor)
-    jmx_args+=(--packaging)
 fi
 if $supervisor_log_to_stdout; then
     scylla_args+=(--supervisor-log-to-stdout)
 fi
 if $without_systemd; then
     scylla_args+=(--without-systemd)
-    jmx_args+=(--without-systemd)
 fi
 if $debuginfo; then
     scylla_args+=(--debuginfo)
@@ -176,9 +160,7 @@ fi
 
 (cd $(readlink -f scylla-python3); ./install.sh --root "$root" --prefix "$prefix" ${args[@]})
 
-(cd $(readlink -f scylla-jmx); ./install.sh --root "$root" --prefix "$prefix"  --sysconfdir "$sysconfdir" ${jmx_args[@]})
-
-(cd $(readlink -f scylla-tools); ./install.sh --root "$root" --prefix "$prefix" ${args[@]})
+(cd $(readlink -f scylla-cqlsh); ./install.sh --root "$root" --prefix "$prefix" ${args[@]})
 
 install -m755 uninstall.sh -Dt "$rprefix"
 

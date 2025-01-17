@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,6 +14,8 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/execution_stage.hh>
+#include <seastar/core/when_all.hh>
+#include "utils/assert.hh"
 #include "utils/hash.hh"
 #include "db_clock.hh"
 #include "gc_clock.hh"
@@ -21,39 +23,39 @@
 #include <seastar/core/distributed.hh>
 #include <functional>
 #include <unordered_map>
-#include <map>
 #include <set>
 #include <boost/functional/hash.hpp>
 #include <boost/range/algorithm/find.hpp>
 #include <optional>
 #include <string.h>
-#include "types.hh"
+#include "types/types.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include "db/commitlog/replay_position.hh"
 #include "db/commitlog/commitlog_types.hh"
-#include <limits>
 #include "schema/schema_fwd.hh"
 #include "db/view/view.hh"
 #include "db/snapshot-ctl.hh"
 #include "memtable.hh"
 #include "row_cache.hh"
+#include "query-result.hh"
 #include "compaction/compaction_strategy.hh"
 #include "utils/estimated_histogram.hh"
 #include <seastar/core/metrics_registration.hh>
-#include "tracing/trace_state.hh"
 #include "db/view/view_stats.hh"
 #include "db/view/view_update_backlog.hh"
 #include "db/view/row_locking.hh"
 #include "utils/phased_barrier.hh"
 #include "backlog_controller.hh"
 #include "dirty_memory_manager.hh"
-#include "reader_concurrency_semaphore.hh"
+#include "reader_concurrency_semaphore_group.hh"
 #include "db/timeout_clock.hh"
 #include "querier.hh"
 #include "cache_temperature.hh"
 #include <unordered_set>
+#include "utils/error_injection.hh"
 #include "utils/updateable_value.hh"
+#include "readers/multishard.hh"
 #include "data_dictionary/user_types_metadata.hh"
 #include "data_dictionary/keyspace_metadata.hh"
 #include "data_dictionary/data_dictionary.hh"
@@ -62,18 +64,25 @@
 #include "sstables/generation_type.hh"
 #include "db/rate_limiter.hh"
 #include "db/operation_type.hh"
+#include "locator/tablets.hh"
 #include "utils/serialized_action.hh"
-#include "compaction/compaction_manager.hh"
-#include "utils/disk-error-handler.hh"
-#include "rust/wasmtime_bindings.hh"
+#include "compaction/compaction_fwd.hh"
+#include "compaction_group.hh"
+#include "service/qos/qos_configuration_change_subscriber.hh"
 
 class cell_locker;
 class cell_locker_stats;
 class locked_cell;
 class mutation;
 
+class compaction_manager;
 class frozen_mutation;
 class reconcilable_result;
+
+namespace tracing { class trace_state_ptr; }
+namespace s3 { struct endpoint_config; }
+
+namespace lang { class manager; }
 
 namespace service {
 class storage_proxy;
@@ -88,18 +97,18 @@ class feature_service;
 
 namespace sstables {
 
+enum class sstable_state;
 class sstable;
 class compaction_descriptor;
 class compaction_completion_desc;
+class storage_manager;
 class sstables_manager;
 class compaction_data;
 class sstable_set;
 class directory_semaphore;
+struct sstable_files_snapshot;
+struct entry_descriptor;
 
-}
-
-namespace compaction {
-class table_state;
 }
 
 namespace ser {
@@ -111,6 +120,10 @@ namespace gms {
 class gossiper;
 }
 
+namespace api {
+class autocompaction_toggle_guard;
+}
+
 namespace db {
 class commitlog;
 class config;
@@ -119,20 +132,32 @@ class rp_handle;
 class data_listeners;
 class large_data_handler;
 class system_keyspace;
-class table_selector;
 
-future<> system_keyspace_make(db::system_keyspace& sys_ks, distributed<replica::database>& db, distributed<service::storage_service>& ss, sharded<gms::gossiper>& g, sharded<service::raft_group_registry>& raft_gr, db::config& cfg, db::table_selector&);
+namespace view {
+class view_update_generator;
+}
 
+}
+
+namespace qos {
+    class service_level_controller;
 }
 
 class mutation_reordered_with_truncate_exception : public std::exception {};
 
 class column_family_test;
-class database_test;
+class table_for_tests;
+class database_test_wrapper;
+using sstable_list = sstables::sstable_list;
+
+class sigquit_handler;
+
+extern logging::logger dblog;
 
 namespace replica {
 
 using shared_memtable = lw_shared_ptr<memtable>;
+class global_table_ptr;
 
 // We could just add all memtables, regardless of types, to a single list, and
 // then filter them out when we read them. Here's why I have chosen not to do
@@ -160,6 +185,7 @@ private:
     seal_immediate_fn_type _seal_immediate_fn;
     std::function<schema_ptr()> _current_schema;
     replica::dirty_memory_manager* _dirty_memory_manager;
+    memtable_table_shared_data _table_shared_data;
     std::optional<shared_future<>> _flush_coalescing;
     seastar::scheduling_group _compaction_scheduling_group;
     replica::table_stats& _table_stats;
@@ -171,21 +197,24 @@ public:
             seal_immediate_fn_type seal_immediate_fn,
             std::function<schema_ptr()> cs,
             dirty_memory_manager* dirty_memory_manager,
+            memtable_table_shared_data& table_shared_data,
             replica::table_stats& table_stats,
             seastar::scheduling_group compaction_scheduling_group = seastar::current_scheduling_group())
         : _memtables({})
         , _seal_immediate_fn(seal_immediate_fn)
         , _current_schema(cs)
         , _dirty_memory_manager(dirty_memory_manager)
+        , _table_shared_data(table_shared_data)
         , _compaction_scheduling_group(compaction_scheduling_group)
         , _table_stats(table_stats) {
         add_memtable();
     }
 
     memtable_list(std::function<schema_ptr()> cs, dirty_memory_manager* dirty_memory_manager,
+            memtable_table_shared_data& table_shared_data,
             replica::table_stats& table_stats,
             seastar::scheduling_group compaction_scheduling_group = seastar::current_scheduling_group())
-        : memtable_list({}, std::move(cs), dirty_memory_manager, table_stats, compaction_scheduling_group) {
+        : memtable_list({}, std::move(cs), dirty_memory_manager, table_shared_data, table_stats, compaction_scheduling_group) {
     }
 
     bool may_flush() const noexcept {
@@ -267,12 +296,6 @@ private:
     lw_shared_ptr<memtable> new_memtable();
 };
 
-}
-
-using sstable_list = sstables::sstable_list;
-
-namespace replica {
-
 class distributed_loader;
 class table_populator;
 
@@ -306,6 +329,9 @@ struct cf_stats {
     uint64_t total_view_updates_pushed_remote = 0;
     uint64_t total_view_updates_failed_local = 0;
     uint64_t total_view_updates_failed_remote = 0;
+
+    // How many times we build view updates only to realize it's the wrong node and drop the update
+    uint64_t total_view_updates_on_wrong_node = 0;
 };
 
 class table;
@@ -314,9 +340,6 @@ struct table_stats;
 using column_family_stats = table_stats;
 
 class database_sstable_write_monitor;
-class compaction_group;
-
-using enable_backlog_tracker = bool_class<class enable_backlog_tracker_tag>;
 
 extern const ssize_t new_reader_base_cost;
 
@@ -334,6 +357,7 @@ struct table_stats {
     int64_t memtable_partition_hits = 0;
     int64_t memtable_range_tombstone_reads = 0;
     int64_t memtable_row_tombstone_reads = 0;
+    int64_t tablet_count = 0;
     mutation_application_stats memtable_app_stats;
     utils::timed_rate_moving_average_summary_and_histogram reads{256};
     utils::timed_rate_moving_average_summary_and_histogram writes{256};
@@ -346,11 +370,37 @@ struct table_stats {
     utils::estimated_histogram estimated_coordinator_read;
 };
 
-class table : public enable_lw_shared_from_this<table> {
+using storage_options = data_dictionary::storage_options;
+
+// Smart table pointer that guards the table object
+// while it's being accessed asynchronously
+class table_holder {
+    gate::holder _holder;
+    lw_shared_ptr<table> _table_ptr;
+public:
+    explicit table_holder(table&);
+
+    const table& operator*() const noexcept {
+        return *_table_ptr;
+    }
+
+    table& operator*() noexcept {
+        return *_table_ptr;
+    }
+
+    const table* operator->() const noexcept {
+        return _table_ptr.operator->();
+    }
+
+    table* operator->() noexcept {
+        return _table_ptr.operator->();
+    }
+};
+
+class table : public enable_lw_shared_from_this<table>
+            , public weakly_referencable<table> {
 public:
     struct config {
-        std::vector<sstring> all_datadirs;
-        sstring datadir;
         bool enable_disk_writes = true;
         bool enable_disk_reads = true;
         bool enable_cache = true;
@@ -369,24 +419,16 @@ public:
         seastar::scheduling_group statement_scheduling_group;
         seastar::scheduling_group streaming_scheduling_group;
         bool enable_metrics_reporting = false;
-        db::timeout_semaphore* view_update_concurrency_semaphore;
+        bool enable_node_aggregated_table_metrics = true;
         size_t view_update_concurrency_semaphore_limit;
         db::data_listeners* data_listeners = nullptr;
-        // Not really table-specific (it's a global configuration parameter), but stored here
-        // for easy access from `table` member functions:
-        utils::updateable_value<bool> reversed_reads_auto_bypass_cache{false};
-        utils::updateable_value<bool> enable_optimized_reversed_reads{true};
-        // Can be updated by a schema change:
-        bool enable_optimized_twcs_queries{true};
         uint32_t tombstone_warn_threshold{0};
         unsigned x_log2_compaction_groups{0};
+        utils::updateable_value<bool> enable_compacting_data_for_streaming_and_repair;
+        utils::updateable_value<bool> enable_tombstone_gc_for_streaming_and_repair;
     };
-    struct no_commitlog {};
 
-    struct snapshot_details {
-        int64_t total;
-        int64_t live;
-    };
+    using snapshot_details = db::snapshot_ctl::table_snapshot_details;
     struct cache_hit_rate {
         cache_temperature rate;
         lowres_clock::time_point last_updated;
@@ -394,6 +436,9 @@ public:
 private:
     schema_ptr _schema;
     config _config;
+    locator::effective_replication_map_ptr _erm;
+    lw_shared_ptr<const storage_options> _storage_opts;
+    memtable_table_shared_data _memtable_shared_data;
     mutable table_stats _stats;
     mutable db::view::stats _view_stats;
     mutable row_locker::stats _row_locker_stats;
@@ -406,15 +451,13 @@ private:
     lw_shared_ptr<memtable_list> make_memory_only_memtable_list();
     lw_shared_ptr<memtable_list> make_memtable_list(compaction_group& cg);
 
-    // The value of the parameter controls the number of compaction groups in this table.
-    // 0 (default) means 1 compaction group. 3 means 8 compaction groups.
-    const unsigned _x_log2_compaction_groups = 0;
-
     compaction_manager& _compaction_manager;
     sstables::compaction_strategy _compaction_strategy;
-    std::vector<std::unique_ptr<compaction_group>> _compaction_groups;
+    // The storage_group_manager manages either a single storage_group for vnodes or per-tablet storage_group for tablets.
+    // It contains and manages both the compaction_groups list and the storage_groups vector.
+    std::unique_ptr<storage_group_manager> _sg_manager;
     // Compound SSTable set for all the compaction groups, which is useful for operations spanning all of them.
-    lw_shared_ptr<sstables::sstable_set> _sstables;
+    lw_shared_ptr<const sstables::sstable_set> _sstables;
     // Control background fibers waiting for sstables to be deleted
     seastar::gate _sstable_deletion_gate;
     // This semaphore ensures that an operation like snapshot won't have its selected
@@ -424,7 +467,8 @@ private:
     // Ensures that concurrent updates to sstable set will work correctly
     seastar::named_semaphore _sstable_set_mutation_sem = {1, named_semaphore_exception_factory{"sstable set mutation"}};
     mutable row_cache _cache; // Cache covers only sstables.
-    std::optional<int64_t> _sstable_generation = {};
+    // Initialized when the table is populated via update_sstables_known_generation.
+    std::optional<sstables::sstable_generation_generator> _sstable_generation_generator;
 
     db::replay_position _highest_rp;
     db::replay_position _flush_rp;
@@ -432,10 +476,17 @@ private:
 
     // Provided by the database that owns this commitlog
     db::commitlog* _commitlog;
+    // The table is constructed in readonly mode - this flag is true after the constructor finishes.
+    // This allows to read the table on the early stages of the node boot process,
+    // when the commitlog is not yet initialized.
+    // The flag is set to false in mark_ready_for_writes function, which
+    // is called when the commitlog is created and the table is ready to accept writes.
+    bool _readonly;
     bool _durable_writes;
     sstables::sstables_manager& _sstables_manager;
     secondary_index::secondary_index_manager _index_manager;
     bool _compaction_disabled_by_user = false;
+    bool _tombstone_gc_enabled = true;
     utils::phased_barrier _flush_barrier;
     std::vector<view_ptr> _views;
 
@@ -455,7 +506,7 @@ private:
     // holds cache hit rates per each node in a cluster
     // may not have information for some node, since it fills
     // in dynamically
-    std::unordered_map<gms::inet_address, cache_hit_rate> _cluster_cache_hit_rates;
+    std::unordered_map<locator::host_id, cache_hit_rate> _cluster_cache_hit_rates;
 
     // Operations like truncate, flush, query, etc, may depend on a column family being alive to
     // complete.  Some of them have their own gate already (like flush), used in specialized wait
@@ -482,12 +533,15 @@ private:
 
     // This field cashes the last truncation time for the table.
     // The master resides in system.truncated table
-    db_clock::time_point _truncated_at = db_clock::time_point::min();
+    std::optional<db_clock::time_point> _truncated_at;
 
     bool _is_bootstrap_or_replace = false;
-    sstables::shared_sstable make_sstable(sstring dir);
+    sstables::shared_sstable make_sstable(sstables::sstable_state state);
 
 public:
+    void on_flush_timer();
+    void deregister_metrics();
+
     data_dictionary::table as_data_dictionary() const;
 
     future<> add_sstable_and_update_cache(sstables::shared_sstable sst,
@@ -495,12 +549,10 @@ public:
     future<> add_sstables_and_update_cache(const std::vector<sstables::shared_sstable>& ssts);
     future<> move_sstables_from_staging(std::vector<sstables::shared_sstable>);
     sstables::shared_sstable make_sstable();
-    void cache_truncation_record(db_clock::time_point truncated_at) {
+    void set_truncation_time(db_clock::time_point truncated_at) noexcept {
         _truncated_at = truncated_at;
     }
-    db_clock::time_point get_truncation_record() {
-        return _truncated_at;
-    }
+    db_clock::time_point get_truncation_time() const;
 
     void notify_bootstrap_or_replace_start();
 
@@ -517,34 +569,84 @@ public:
         sstable_list_builder& operator=(const sstable_list_builder&) = delete;
         sstable_list_builder(const sstable_list_builder&) = delete;
 
+        // Struct to return the newly built sstable set and the removed sstables
+        struct result {
+            lw_shared_ptr<sstables::sstable_set> new_sstable_set;
+            std::vector<sstables::shared_sstable> removed_sstables;
+        };
+
         // Builds new sstable set from existing one, with new sstables added to it and old sstables removed from it.
-        future<lw_shared_ptr<sstables::sstable_set>>
+        // Returns the updated sstable set and a list of removed sstables.
+        future<result>
         build_new_list(const sstables::sstable_set& current_sstables,
                        sstables::sstable_set new_sstable_list,
                        const std::vector<sstables::shared_sstable>& new_sstables,
                        const std::vector<sstables::shared_sstable>& old_sstables);
     };
+
+    // Precondition: table needs tablet splitting.
+    // Returns true if all storage of table is ready for splitting.
+    bool all_storage_groups_split();
+    future<> split_all_storage_groups(tasks::task_info tablet_split_task_info);
+
+    // Splits compaction group of a single tablet, if and only if the underlying table has
+    // split request emitted by coordinator (found in tablet metadata).
+    // If split is required, then the compaction group of the given tablet is guaranteed to
+    // be split once it returns.
+    future<> maybe_split_compaction_group_of(locator::tablet_id);
+
+    dht::token_range get_token_range_after_split(const dht::token&) const noexcept;
 private:
-    using compaction_group_ptr = std::unique_ptr<compaction_group>;
-    std::vector<std::unique_ptr<compaction_group>> make_compaction_groups();
-    // Return compaction group if table owns a single one. Otherwise, null is returned.
-    compaction_group* single_compaction_group_if_available() const noexcept;
+    // If SSTable doesn't need split, the same input SSTable is returned as output.
+    // If SSTable needs split, then output SSTables are returned and the input SSTable is deleted.
+    // NOTE: it must only be used on new SSTables that weren't added to the set yet.
+    future<std::vector<sstables::shared_sstable>> maybe_split_new_sstable(const sstables::shared_sstable&);
+
+    // Called when coordinator executes tablet splitting, i.e. commit the new tablet map with
+    // each tablet split into two, so this replica will remap all of its compaction groups
+    // that were previously split.
+    future<> handle_tablet_split_completion(size_t old_tablet_count, const locator::tablet_map& new_tmap);
+
+    // Select a storage group from a given token.
+    storage_group& storage_group_for_token(dht::token token) const;
+    storage_group& storage_group_for_id(size_t i) const;
+
+    std::unique_ptr<storage_group_manager> make_storage_group_manager();
+    compaction_group* get_compaction_group(size_t id) const;
     // Select a compaction group from a given token.
-    compaction_group& compaction_group_for_token(dht::token token) const noexcept;
+    compaction_group& compaction_group_for_token(dht::token token) const;
+    // Return compaction groups, present in this shard, that own a particular token range.
+    utils::chunked_vector<compaction_group*> compaction_groups_for_token_range(dht::token_range tr) const;
     // Select a compaction group from a given key.
-    compaction_group& compaction_group_for_key(partition_key_view key, const schema_ptr& s) const noexcept;
+    compaction_group& compaction_group_for_key(partition_key_view key, const schema_ptr& s) const;
     // Select a compaction group from a given sstable based on its token range.
-    compaction_group& compaction_group_for_sstable(const sstables::shared_sstable& sst) noexcept;
-    // Returns a list of all compaction groups.
-    const std::vector<std::unique_ptr<compaction_group>>& compaction_groups() const noexcept;
+    compaction_group& compaction_group_for_sstable(const sstables::shared_sstable& sst) const;
     // Safely iterate through compaction groups, while performing async operations on them.
     future<> parallel_foreach_compaction_group(std::function<future<>(compaction_group&)> action);
+    void for_each_compaction_group(std::function<void(compaction_group&)> action);
+    void for_each_compaction_group(std::function<void(const compaction_group&)> action) const;
+    // Unsafe reference to all storage groups. Don't use it across preemption points.
+    const storage_group_map& storage_groups() const;
+
+    // Safely iterate through SSTables, with deletion guard taken to make sure they're not
+    // removed during iteration.
+    // WARNING: Be careful that the action doesn't perform an operation that will itself
+    // take the deletion guard, as that will cause a deadlock. For example, memtable flush
+    // can wait on compaction (backpressure) which in turn takes deletion guard on completion.
+    future<> safe_foreach_sstable(const sstables::sstable_set&, noncopyable_function<future<>(const sstables::shared_sstable&)> action);
+
+    // Returns a sstable set that can be safely used for purging any expired tombstone in a compaction group.
+    // Only the sstables in the compaction group is not sufficient, since there might be other compaction
+    // groups during tablet split with overlapping token range, and we need to include them all in a single
+    // sstable set to allow safe tombstone gc.
+    lw_shared_ptr<const sstables::sstable_set> sstable_set_for_tombstone_gc(const compaction_group&) const;
 
     bool cache_enabled() const {
         return _config.enable_cache && _schema->caching_options().enabled();
     }
     void update_stats_for_new_sstable(const sstables::shared_sstable& sst) noexcept;
-    future<> do_add_sstable_and_update_cache(sstables::shared_sstable sst, sstables::offstrategy offstrategy);
+    future<> do_add_sstable_and_update_cache(compaction_group& cg, sstables::shared_sstable sst, sstables::offstrategy, bool trigger_compaction);
+    future<> do_add_sstable_and_update_cache(sstables::shared_sstable sst, sstables::offstrategy offstrategy, bool trigger_compaction);
     // Helpers which add sstable on behalf of a compaction group and refreshes compound set.
     void add_sstable(compaction_group& cg, sstables::shared_sstable sstable);
     void add_maintenance_sstable(compaction_group& cg, sstables::shared_sstable sst);
@@ -556,25 +658,14 @@ private:
     future<> update_cache(compaction_group& cg, lw_shared_ptr<memtable> m, std::vector<sstables::shared_sstable> ssts);
     struct merge_comparator;
 
-    // update the sstable generation, making sure that new new sstables don't overwrite this one.
-    void update_sstables_known_generation(sstables::generation_type generation) {
-        if (!_sstable_generation) {
-            _sstable_generation = 1;
-        }
-        _sstable_generation = std::max<uint64_t>(*_sstable_generation, sstables::generation_value(generation) / smp::count + 1);
-    }
+    // update the sstable generation, making sure (in calculate_generation_for_new_table)
+    // that new new sstables don't overwrite this one.
+    void update_sstables_known_generation(sstables::generation_type generation);
 
-    sstables::generation_type calculate_generation_for_new_table() {
-        assert(_sstable_generation);
-        // FIXME: better way of ensuring we don't attempt to
-        // overwrite an existing table.
-        return sstables::generation_from_value((*_sstable_generation)++ * smp::count + this_shard_id());
-    }
+    sstables::generation_type calculate_generation_for_new_table();
 private:
     void rebuild_statistics();
-
-    // Called on schema change.
-    void update_optimized_twcs_queries_flag();
+    void subtract_compaction_group_from_stats(const compaction_group& cg) noexcept;
 private:
     mutation_source_opt _virtual_reader;
     std::optional<noncopyable_function<future<>(const frozen_mutation&)>> _virtual_writer;
@@ -583,23 +674,24 @@ private:
     // Caller needs to ensure that column_family remains live (FIXME: relax this).
     // The 'range' parameter must be live as long as the reader is used.
     // Mutations returned by the reader will all have given schema.
-    flat_mutation_reader_v2 make_sstable_reader(schema_ptr schema,
+    mutation_reader make_sstable_reader(schema_ptr schema,
                                         reader_permit permit,
-                                        lw_shared_ptr<sstables::sstable_set> sstables,
+                                        lw_shared_ptr<const sstables::sstable_set> sstables,
                                         const dht::partition_range& range,
                                         const query::partition_slice& slice,
-                                        const io_priority_class& pc,
                                         tracing::trace_state_ptr trace_state,
                                         streamed_mutation::forwarding fwd,
-                                        mutation_reader::forwarding fwd_mr) const;
+                                        mutation_reader::forwarding fwd_mr,
+                                        const sstables::sstable_predicate& = sstables::default_sstable_predicate()) const;
 
     lw_shared_ptr<sstables::sstable_set> make_maintenance_sstable_set() const;
-    lw_shared_ptr<sstables::sstable_set> make_compound_sstable_set();
+    lw_shared_ptr<const sstables::sstable_set> make_compound_sstable_set() const;
     // Compound sstable set must be refreshed whenever any of its managed sets are changed
     void refresh_compound_sstable_set();
 
+    max_purgeable_fn get_max_purgeable_fn_for_cache_underlying_reader() const;
     snapshot_source sstables_as_snapshot_source();
-    partition_presence_checker make_partition_presence_checker(lw_shared_ptr<sstables::sstable_set>);
+    partition_presence_checker make_partition_presence_checker(lw_shared_ptr<const sstables::sstable_set>);
     std::chrono::steady_clock::time_point _sstable_writes_disabled_at;
 
     dirty_memory_manager_logalloc::region_group& dirty_memory_region_group() const {
@@ -607,20 +699,20 @@ private:
     }
 
     // reserve_fn will be called before any element is added to readers
-    void add_memtables_to_reader_list(std::vector<flat_mutation_reader_v2>& readers,
+    void add_memtables_to_reader_list(std::vector<mutation_reader>& readers,
              const schema_ptr& s,
              const reader_permit& permit,
              const dht::partition_range& range,
              const query::partition_slice& slice,
-             const io_priority_class& pc,
              const tracing::trace_state_ptr& trace_state,
              streamed_mutation::forwarding fwd,
              mutation_reader::forwarding fwd_mr,
              std::function<void(size_t)> reserve_fn) const;
 public:
-    sstring dir() const {
-        return _config.datadir;
-    }
+    const storage_options& get_storage_options() const noexcept { return *_storage_opts; }
+    lw_shared_ptr<const storage_options> get_storage_options_ptr() const noexcept { return _storage_opts; }
+    future<> init_storage();
+    future<> destroy_storage();
 
     seastar::gate& async_gate() { return _async_gate; }
 
@@ -644,36 +736,29 @@ public:
     // to a db in memory only, and if anybody is about to write to a CF, that was most
     // likely already called. We need to call this explicitly when we are sure we're ready
     // to issue disk operations safely.
-    void mark_ready_for_writes() {
-        update_sstables_known_generation(sstables::generation_from_value(0));
-    }
+    void mark_ready_for_writes(db::commitlog* cl);
 
     // Creates a mutation reader which covers all data sources for this column family.
     // Caller needs to ensure that column_family remains live (FIXME: relax this).
     // Note: for data queries use query() instead.
     // The 'range' parameter must be live as long as the reader is used.
     // Mutations returned by the reader will all have given schema.
-    // If I/O needs to be issued to read anything in the specified range, the operations
-    // will be scheduled under the priority class given by pc.
-    flat_mutation_reader_v2 make_reader_v2(schema_ptr schema,
+    mutation_reader make_reader_v2(schema_ptr schema,
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            const io_priority_class& pc = default_priority_class(),
             tracing::trace_state_ptr trace_state = nullptr,
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const;
-    flat_mutation_reader_v2 make_reader_v2_excluding_sstables(schema_ptr schema,
+    mutation_reader make_reader_v2_excluding_staging(schema_ptr schema,
             reader_permit permit,
-            std::vector<sstables::shared_sstable>& sst,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            const io_priority_class& pc = default_priority_class(),
             tracing::trace_state_ptr trace_state = nullptr,
             streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
             mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::yes) const;
 
-    flat_mutation_reader_v2 make_reader_v2(schema_ptr schema, reader_permit permit, const dht::partition_range& range = query::full_partition_range) const {
+    mutation_reader make_reader_v2(schema_ptr schema, reader_permit permit, const dht::partition_range& range = query::full_partition_range) const {
         auto& full_slice = schema->full_slice();
         return make_reader_v2(std::move(schema), std::move(permit), range, full_slice);
     }
@@ -683,27 +768,42 @@ public:
     //    reader and a _bounded_ amount of writes which arrive later.
     //  - Does not populate the cache
     // Requires ranges to be sorted and disjoint.
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit,
-            const dht::partition_range_vector& ranges) const;
+    // When compaction_time is engaged, the reader's output will be compacted, with the provided query time.
+    // This compaction doesn't do tombstone garbage collection.
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit,
+            const dht::partition_range_vector& ranges, gc_clock::time_point compaction_time) const;
 
     // Single range overload.
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
             const query::partition_slice& slice,
-            mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no) const;
+            mutation_reader::forwarding fwd_mr,
+            gc_clock::time_point compaction_time) const;
 
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range) {
-        return make_streaming_reader(std::move(schema), std::move(permit), range, schema->full_slice());
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range, gc_clock::time_point compaction_time) {
+        return make_streaming_reader(schema, std::move(permit), range, schema->full_slice(), mutation_reader::forwarding::no, compaction_time);
     }
 
     // Stream reader from the given sstables
-    flat_mutation_reader_v2 make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
-            lw_shared_ptr<sstables::sstable_set> sstables) const;
+    mutation_reader make_streaming_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+            lw_shared_ptr<sstables::sstable_set> sstables, gc_clock::time_point compaction_time) const;
 
-    sstables::shared_sstable make_streaming_sstable_for_write(std::optional<sstring> subdir = {});
+    // Make a reader which reads only from the row-cache.
+    // The reader doesn't populate the cache, it reads only what is in the cache
+    // Supports reading only a single partition.
+    // Does not support reading in reverse.
+    mutation_reader make_nonpopulating_cache_reader(schema_ptr schema, reader_permit permit, const dht::partition_range& range,
+            const query::partition_slice& slice, tracing::trace_state_ptr ts);
+
+    sstables::shared_sstable make_streaming_sstable_for_write();
     sstables::shared_sstable make_streaming_staging_sstable();
 
     mutation_source as_mutation_source() const;
-    mutation_source as_mutation_source_excluding(std::vector<sstables::shared_sstable>& sst) const;
+    mutation_source as_mutation_source_excluding_staging() const;
+
+    // Select all memtables which contain this token and return them as mutation sources.
+    // We could return memtables here, but table has no public memtable accessors so far.
+    // Memtables are mutable objects, so it is best to keep it this way.
+    std::vector<mutation_source> select_memtables_as_mutation_sources(dht::token) const;
 
     void set_virtual_reader(mutation_source virtual_reader) {
         _virtual_reader = std::move(virtual_reader);
@@ -719,10 +819,12 @@ public:
     // FIXME: in case a query is satisfied from a single memtable, avoid a copy
     using const_mutation_partition_ptr = std::unique_ptr<const mutation_partition>;
     using const_row_ptr = std::unique_ptr<const row>;
-    // Return all active memtables, where there will be one per compaction group
-    // TODO: expose stats, whatever, instead of exposing active memtables themselves.
-    std::vector<memtable*> active_memtables();
+    // Allow an action to be performed on each active memtable, each of which belongs to a different compaction group.
+    void for_each_active_memtable(noncopyable_function<void(memtable&)> action);
     api::timestamp_type min_memtable_timestamp() const;
+    api::timestamp_type min_memtable_live_timestamp() const;
+    api::timestamp_type min_memtable_live_row_marker_timestamp() const;
+
     const row_cache& get_row_cache() const {
         return _cache;
     }
@@ -752,21 +854,35 @@ public:
     future<std::vector<locked_cell>> lock_counter_cells(const mutation& m, db::timeout_clock::time_point timeout);
 
     logalloc::occupancy_stats occupancy() const;
-private:
-    table(schema_ptr schema, config cfg, db::commitlog* cl, compaction_manager&, sstables::sstables_manager&, cell_locker_stats& cl_stats, cache_tracker& row_cache_tracker);
 public:
-    table(schema_ptr schema, config cfg, db::commitlog& cl, compaction_manager& cm, sstables::sstables_manager& sm, cell_locker_stats& cl_stats, cache_tracker& row_cache_tracker)
-        : table(schema, std::move(cfg), &cl, cm, sm, cl_stats, row_cache_tracker) {}
-    table(schema_ptr schema, config cfg, no_commitlog, compaction_manager& cm, sstables::sstables_manager& sm, cell_locker_stats& cl_stats, cache_tracker& row_cache_tracker)
-        : table(schema, std::move(cfg), nullptr, cm, sm, cl_stats, row_cache_tracker) {}
+    table(schema_ptr schema, config cfg, lw_shared_ptr<const storage_options> sopts, compaction_manager& cm, sstables::sstables_manager& sm, cell_locker_stats& cl_stats, cache_tracker& row_cache_tracker, locator::effective_replication_map_ptr erm);
+
     table(column_family&&) = delete; // 'this' is being captured during construction
     ~table();
+
+    table_holder hold() {
+        return table_holder(*this);
+    }
+
     const schema_ptr& schema() const { return _schema; }
     void set_schema(schema_ptr);
-    db::commitlog* commitlog() { return _commitlog; }
+    db::commitlog* commitlog() const;
+    const locator::effective_replication_map_ptr& get_effective_replication_map() const { return _erm; }
+    void update_effective_replication_map(locator::effective_replication_map_ptr);
+    [[gnu::always_inline]] bool uses_tablets() const;
+private:
+    future<> clear_inactive_reads_for_tablet(database& db, storage_group& sg);
+    future<> stop_compaction_groups(storage_group& sg);
+    future<> flush_compaction_groups(storage_group& sg);
+    future<> cleanup_compaction_groups(database& db, db::system_keyspace& sys_ks, locator::tablet_id tid, storage_group& sg);
+public:
+    future<> cleanup_tablet(database&, db::system_keyspace&, locator::tablet_id);
+    // For tests only.
+    future<> cleanup_tablet_without_deallocation(database& db, db::system_keyspace& sys_ks, locator::tablet_id tid);
     future<const_mutation_partition_ptr> find_partition(schema_ptr, reader_permit permit, const dht::decorated_key& key) const;
-    future<const_mutation_partition_ptr> find_partition_slow(schema_ptr, reader_permit permit, const partition_key& key) const;
     future<const_row_ptr> find_row(schema_ptr, reader_permit permit, const dht::decorated_key& partition_key, clustering_key clustering_key) const;
+    shard_id shard_for_reads(dht::token t) const;
+    dht::shard_replica_set shard_for_writes(dht::token t) const;
     // Applies given mutation to this column family
     // The mutation is always upgraded to current schema.
     void apply(const frozen_mutation& m, const schema_ptr& m_schema, db::rp_handle&& h = {}) {
@@ -812,7 +928,7 @@ public:
     // completion it contains the to-be saved querier for the next page (if
     // there is one). Pass nullptr when queriers are not saved.
     future<reconcilable_result>
-    mutation_query(schema_ptr s,
+    mutation_query(schema_ptr query_schema,
             reader_permit permit,
             const query::read_command& cmd,
             const dht::partition_range& range,
@@ -829,10 +945,12 @@ public:
 
     bool can_flush() const;
 
+    using do_flush = bool_class<struct do_flush_tag>;
+
     // Start a compaction of all sstables in a process known as major compaction
     // Active memtable is flushed first to guarantee that data like tombstone,
     // sitting in the memtable, will be compacted with shadowed data.
-    future<> compact_all_sstables();
+    future<> compact_all_sstables(tasks::task_info info, do_flush = do_flush::yes, bool consider_only_existing_data = false);
 
     future<bool> snapshot_exists(sstring name);
 
@@ -841,15 +959,15 @@ public:
 private:
     using snapshot_file_set = foreign_ptr<std::unique_ptr<std::unordered_set<sstring>>>;
 
-    future<snapshot_file_set> take_snapshot(database& db, sstring jsondir);
+    future<snapshot_file_set> take_snapshot(sstring jsondir);
     // Writes the table schema and the manifest of all files in the snapshot directory.
     future<> finalize_snapshot(database& db, sstring jsondir, std::vector<snapshot_file_set> file_sets);
     static future<> seal_snapshot(sstring jsondir, std::vector<snapshot_file_set> file_sets);
-
 public:
-    static future<> snapshot_on_all_shards(sharded<database>& sharded_db, const std::vector<foreign_ptr<lw_shared_ptr<table>>>& table_shards, sstring name);
+    static future<> snapshot_on_all_shards(sharded<database>& sharded_db, const global_table_ptr& table_shards, sstring name);
 
     future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
+    static future<snapshot_details> get_snapshot_details(std::filesystem::path snapshot_dir, std::filesystem::path datadir);
 
     /*!
      * \brief write the schema to a 'schema.cql' file at the given directory.
@@ -869,7 +987,7 @@ public:
      */
     future<> write_schema_as_cql(database& db, sstring dir) const;
 
-    const bool incremental_backups_enabled() const {
+    bool incremental_backups_enabled() const {
         return _config.enable_incremental_backups;
     }
 
@@ -877,12 +995,16 @@ public:
         _config.enable_incremental_backups = val;
     }
 
+    bool uses_static_sharding() const {
+        return !_erm || _erm->get_replication_strategy().is_vnode_based();
+    }
+
     /*!
      * \brief get sstables by key
      * Return a set of the sstables names that contain the given
      * partition key in nodetool format
      */
-    future<std::unordered_set<sstring>> get_sstables_by_partition_key(const sstring& key) const;
+    future<std::unordered_set<sstables::shared_sstable>> get_sstables_by_partition_key(const sstring& key) const;
 
     const sstables::sstable_set& get_sstable_set() const;
     lw_shared_ptr<const sstable_list> get_sstables() const;
@@ -900,8 +1022,10 @@ public:
     // Performs offstrategy compaction, if needed, returning
     // a future<bool> that is resolved when offstrategy_compaction completes.
     // The future value is true iff offstrategy compaction was required.
-    future<bool> perform_offstrategy_compaction();
-    future<> perform_cleanup_compaction(owned_ranges_ptr sorted_owned_ranges);
+    future<bool> perform_offstrategy_compaction(tasks::task_info info);
+    future<> perform_cleanup_compaction(owned_ranges_ptr sorted_owned_ranges,
+                                        tasks::task_info info,
+                                        do_flush = do_flush::yes);
     unsigned estimate_pending_compactions() const;
 
     void set_compaction_strategy(sstables::compaction_strategy_type strategy);
@@ -925,11 +1049,19 @@ public:
         return _stats;
     }
 
+    // The tablet filter is used to not double account migrating tablets, so it's important that
+    // only one of pending or leaving replica is accounted based on current migration stage.
+    locator::table_load_stats table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept;
+
     const db::view::stats& get_view_stats() const {
         return _view_stats;
     }
 
-    replica::cf_stats* cf_stats() {
+    db::view::stats& view_stats() const noexcept {
+        return _view_stats;
+    }
+
+    replica::cf_stats* cf_stats() const {
         return _config.cf_stats;
     }
 
@@ -953,12 +1085,20 @@ public:
         _global_cache_hit_rate = rate;
     }
 
-    void set_hit_rate(gms::inet_address addr, cache_temperature rate);
-    cache_hit_rate get_hit_rate(const gms::gossiper& g, gms::inet_address addr);
-    void drop_hit_rate(gms::inet_address addr);
+    void set_hit_rate(locator::host_id addr, cache_temperature rate);
+    cache_hit_rate get_my_hit_rate() const;
+    cache_hit_rate get_hit_rate(const gms::gossiper& g, locator::host_id addr);
+    void drop_hit_rate(locator::host_id addr);
 
     void enable_auto_compaction();
     future<> disable_auto_compaction();
+
+    void set_tombstone_gc_enabled(bool tombstone_gc_enabled) noexcept;
+
+    bool tombstone_gc_enabled() const noexcept {
+        return _tombstone_gc_enabled;
+    }
+
     bool is_auto_compaction_disabled_by_user() const {
       return _compaction_disabled_by_user;
     }
@@ -1011,18 +1151,22 @@ public:
     void remove_view(view_ptr v);
     void clear_views();
     const std::vector<view_ptr>& views() const;
-    future<row_locker::lock_holder> push_view_replica_updates(const schema_ptr& s, const frozen_mutation& fm, db::timeout_clock::time_point timeout,
+    future<row_locker::lock_holder> push_view_replica_updates(shared_ptr<db::view::view_update_generator> gen, const schema_ptr& s, const frozen_mutation& fm, db::timeout_clock::time_point timeout,
             tracing::trace_state_ptr tr_state, reader_concurrency_semaphore& sem) const;
-    future<row_locker::lock_holder> push_view_replica_updates(const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout,
+    future<row_locker::lock_holder> push_view_replica_updates(shared_ptr<db::view::view_update_generator> gen, const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout,
             tracing::trace_state_ptr tr_state, reader_concurrency_semaphore& sem) const;
     future<row_locker::lock_holder>
-    stream_view_replica_updates(const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout,
+    stream_view_replica_updates(shared_ptr<db::view::view_update_generator> gen, const schema_ptr& s, mutation&& m, db::timeout_clock::time_point timeout,
             std::vector<sstables::shared_sstable>& excluded_sstables) const;
 
     void add_coordinator_read_latency(utils::estimated_histogram::duration latency);
     std::chrono::milliseconds get_coordinator_read_latency_percentile(double percentile);
 
     secondary_index::secondary_index_manager& get_index_manager() {
+        return _index_manager;
+    }
+
+    const secondary_index::secondary_index_manager& get_index_manager() const noexcept {
         return _index_manager;
     }
 
@@ -1033,13 +1177,6 @@ public:
     const sstables::sstables_manager& get_sstables_manager() const noexcept {
         return _sstables_manager;
     }
-
-    // Reader's schema must be the same as the base schema of each of the views.
-    future<> populate_views(
-            std::vector<db::view::view_and_base>,
-            dht::token base_token,
-            flat_mutation_reader_v2&&,
-            gc_clock::time_point);
 
     reader_concurrency_semaphore& streaming_read_concurrency_semaphore() {
         return *_config.streaming_read_concurrency_semaphore;
@@ -1052,16 +1189,9 @@ public:
     size_t estimate_read_memory_cost() const;
 
 private:
-    future<row_locker::lock_holder> do_push_view_replica_updates(schema_ptr s, mutation m, db::timeout_clock::time_point timeout, mutation_source source,
-            tracing::trace_state_ptr tr_state, reader_concurrency_semaphore& sem, const io_priority_class& io_priority, query::partition_slice::option_set custom_opts) const;
-    std::vector<view_ptr> affected_views(const schema_ptr& base, const mutation& update) const;
-    future<> generate_and_propagate_view_updates(const schema_ptr& base,
-            reader_permit permit,
-            std::vector<db::view::view_and_base>&& views,
-            mutation&& m,
-            flat_mutation_reader_v2_opt existings,
-            tracing::trace_state_ptr tr_state,
-            gc_clock::time_point now) const;
+    future<row_locker::lock_holder> do_push_view_replica_updates(shared_ptr<db::view::view_update_generator> gen, schema_ptr s, mutation m, db::timeout_clock::time_point timeout, mutation_source source,
+            tracing::trace_state_ptr tr_state, reader_concurrency_semaphore& sem, query::partition_slice::option_set custom_opts) const;
+    std::vector<view_ptr> affected_views(shared_ptr<db::view::view_update_generator> gen, const schema_ptr& base, const mutation& update) const;
 
     mutable row_locker _row_locker;
     future<row_locker::lock_holder> local_base_lock(
@@ -1069,6 +1199,8 @@ private:
             const dht::decorated_key& pk,
             const query::clustering_row_ranges& rows,
             db::timeout_clock::time_point timeout) const;
+
+    timer<lowres_clock> _flush_timer;
 
     // One does not need to wait on this future if all we are interested in, is
     // initiating the write.  The writes initiated here will eventually
@@ -1084,6 +1216,9 @@ private:
     future<> seal_active_memtable(compaction_group& cg, flush_permit&&) noexcept;
 
     void check_valid_rp(const db::replay_position&) const;
+
+    void recalculate_tablet_count_stats();
+    int64_t calculate_tablet_count() const;
 public:
     // Iterate over all partitions.  Protocol is the same as std::all_of(),
     // so that iteration can be stopped by returning false.
@@ -1091,7 +1226,9 @@ public:
 
     friend std::ostream& operator<<(std::ostream& out, const column_family& cf);
     // Testing purposes.
+    // to let test classes access calculate_generation_for_new_table
     friend class ::column_family_test;
+    friend class ::table_for_tests;
 
     friend class distributed_loader;
     friend class table_populator;
@@ -1100,17 +1237,41 @@ private:
     timer<> _off_strategy_trigger;
     void do_update_off_strategy_trigger();
 
+    compaction_group* try_get_compaction_group_with_static_sharding() const;
 public:
     void update_off_strategy_trigger();
     void enable_off_strategy_trigger();
 
-    // FIXME: get rid of it once no users.
-    compaction::table_state& as_table_state() const noexcept;
+    compaction::table_state& try_get_table_state_with_static_sharding() const;
     // Safely iterate through table states, while performing async operations on them.
     future<> parallel_foreach_table_state(std::function<future<>(compaction::table_state&)> action);
+    compaction::table_state& table_state_for_sstable(const sstables::shared_sstable& sst) const noexcept {
+        return compaction_group_for_sstable(sst).as_table_state();
+    }
+
+    // Uncoditionally erase sst from `sstables_requiring_cleanup`
+    // Returns true iff sst was found and erased.
+    bool erase_sstable_cleanup_state(const sstables::shared_sstable& sst);
+
+    // Returns true if the sstable requires cleanup.
+    bool requires_cleanup(const sstables::shared_sstable& sst) const;
+
+    // Returns true if any of the sstables requires cleanup.
+    bool requires_cleanup(const sstables::sstable_set& set) const;
+
+    // Takes snapshot of current storage state (includes memtable and sstables) from
+    // all compaction groups that overlap with a given token range. The output is
+    // a list of SSTables that represent the snapshot.
+    future<utils::chunked_vector<sstables::sstable_files_snapshot>> take_storage_snapshot(dht::token_range tr);
+
+    // Clones storage of a given tablet. Memtable is flushed first to guarantee that the
+    // snapshot (list of sstables) will include all the data written up to the time it was taken.
+    future<utils::chunked_vector<sstables::entry_descriptor>> clone_tablet_storage(locator::tablet_id tid);
 
     friend class compaction_group;
 };
+
+lw_shared_ptr<sstables::sstable_set> make_tablet_sstable_set(schema_ptr, const storage_group_manager& sgm, const locator::tablet_map&);
 
 using user_types_metadata = data_dictionary::user_types_metadata;
 
@@ -1119,8 +1280,6 @@ using keyspace_metadata = data_dictionary::keyspace_metadata;
 class keyspace {
 public:
     struct config {
-        std::vector<sstring> all_datadirs;
-        sstring datadir;
         bool enable_commitlog = true;
         bool enable_disk_reads = true;
         bool enable_disk_writes = true;
@@ -1139,39 +1298,34 @@ public:
         seastar::scheduling_group statement_scheduling_group;
         seastar::scheduling_group streaming_scheduling_group;
         bool enable_metrics_reporting = false;
-        db::timeout_semaphore* view_update_concurrency_semaphore = nullptr;
         size_t view_update_concurrency_semaphore_limit;
     };
 private:
-    locator::abstract_replication_strategy::ptr_type _replication_strategy;
-    locator::effective_replication_map_ptr _effective_replication_map;
+    locator::replication_strategy_ptr _replication_strategy;
+    locator::vnode_effective_replication_map_ptr _effective_replication_map;
     lw_shared_ptr<keyspace_metadata> _metadata;
-    shared_promise<> _populated;
     config _config;
     locator::effective_replication_map_factory& _erm_factory;
 
-    locator::effective_replication_map_factory& get_erm_factory() noexcept {
-        return _erm_factory;
-    }
-
-    const locator::effective_replication_map_factory& get_erm_factory() const noexcept {
-        return _erm_factory;
-    }
-
 public:
     explicit keyspace(lw_shared_ptr<keyspace_metadata> metadata, config cfg, locator::effective_replication_map_factory& erm_factory);
+    keyspace(const keyspace&) = delete;
+    void operator=(const keyspace&) = delete;
+    keyspace(keyspace&&) = default;
 
     future<> shutdown() noexcept;
 
     future<> update_from(const locator::shared_token_metadata& stm, lw_shared_ptr<keyspace_metadata>);
+
+    future<> init_storage();
 
     /** Note: return by shared pointer value, since the meta data is
      * semi-volatile. I.e. we could do alter keyspace at any time, and
      * boom, it is replaced.
      */
     lw_shared_ptr<keyspace_metadata> metadata() const;
-    future<> create_replication_strategy(const locator::shared_token_metadata& stm, const locator::replication_strategy_config_options& options);
-    void update_effective_replication_map(locator::effective_replication_map_ptr erm);
+    future<> create_replication_strategy(const locator::shared_token_metadata& stm);
+    void update_effective_replication_map(locator::vnode_effective_replication_map_ptr erm);
 
     /**
      * This should not really be return by reference, since replication
@@ -1180,38 +1334,29 @@ public:
      * carry it across a continuation. So it is sort of same for now, but
      * should eventually be refactored.
      */
-    locator::abstract_replication_strategy& get_replication_strategy();
     const locator::abstract_replication_strategy& get_replication_strategy() const;
-    locator::abstract_replication_strategy::ptr_type get_replication_strategy_ptr() const {
+    locator::replication_strategy_ptr get_replication_strategy_ptr() const {
         return _replication_strategy;
     }
 
-    locator::effective_replication_map_ptr get_effective_replication_map() const {
-        return _effective_replication_map;
+    locator::vnode_effective_replication_map_ptr get_vnode_effective_replication_map() const;
+
+    bool uses_tablets() const {
+        return _replication_strategy->uses_tablets();
     }
 
     column_family::config make_column_family_config(const schema& s, const database& db) const;
-    future<> make_directory_for_column_family(const sstring& name, table_id uuid);
     void add_or_update_column_family(const schema_ptr& s);
     void add_user_type(const user_type ut);
     void remove_user_type(const user_type ut);
 
-    const bool incremental_backups_enabled() const {
+    bool incremental_backups_enabled() const {
         return _config.enable_incremental_backups;
     }
 
     void set_incremental_backups(bool val) {
         _config.enable_incremental_backups = val;
     }
-
-    const sstring& datadir() const {
-        return _config.datadir;
-    }
-
-    sstring column_family_directory(const sstring& base_path, const sstring& name, table_id uuid) const;
-
-    future<> ensure_populated() const;
-    void mark_as_populated();
 };
 
 using no_such_keyspace = data_dictionary::no_such_keyspace;
@@ -1225,6 +1370,8 @@ struct database_config {
     seastar::scheduling_group statement_scheduling_group;
     seastar::scheduling_group streaming_scheduling_group;
     seastar::scheduling_group gossip_scheduling_group;
+    seastar::scheduling_group commitlog_scheduling_group;
+    seastar::scheduling_group schema_commitlog_scheduling_group;
     size_t available_memory;
     std::optional<sstables::sstable_version_types> sstables_format;
 };
@@ -1240,10 +1387,10 @@ class db_user_types_storage;
 // Policy for distributed<database>:
 //   broadcast metadata writes
 //   local metadata reads
-//   use shard_of() for data
+//   use table::shard_for_reads()/table::shard_for_writes() for data
 
-class database : public peering_sharded_service<database> {
-    friend class ::database_test;
+class database : public peering_sharded_service<database>, qos::qos_configuration_change_subscriber {
+    friend class ::database_test_wrapper;
 public:
     enum class table_kind {
         system,
@@ -1261,18 +1408,58 @@ public:
         }
     };
 
+    using ks_cf_t = std::pair<sstring, sstring>;
+    using ks_cf_to_uuid_t =
+        flat_hash_map<ks_cf_t, table_id, utils::tuple_hash, string_pair_eq>;
+    class tables_metadata {
+        rwlock _cf_lock;
+        std::unordered_map<table_id, lw_shared_ptr<column_family>> _column_families;
+        ks_cf_to_uuid_t _ks_cf_to_uuid;
+    private:
+        void add_table_helper(database& db, keyspace& ks, table& cf, schema_ptr s);
+        void remove_table_helper(database& db, keyspace& ks, table& cf, schema_ptr s);
+    public:
+        size_t size() const noexcept;
+
+        future<> add_table(database& db, keyspace& ks, table& cf, schema_ptr s);
+        future<> remove_table(database& db, table& cf) noexcept;
+        table& get_table(table_id id) const;
+        table_id get_table_id(const std::pair<std::string_view, std::string_view>& kscf) const;
+        lw_shared_ptr<table> get_table_if_exists(table_id id) const;
+        table_id get_table_id_if_exists(const std::pair<std::string_view, std::string_view>& kscf) const;
+        bool contains(table_id id) const;
+        bool contains(std::pair<std::string_view, std::string_view> kscf) const;
+        void for_each_table(std::function<void(table_id, lw_shared_ptr<table>)> f) const;
+        void for_each_table_id(std::function<void(const ks_cf_t&, table_id)> f) const;
+        future<> for_each_table_gently(std::function<future<>(table_id, lw_shared_ptr<table>)> f);
+        future<> parallel_for_each_table(std::function<future<>(table_id, lw_shared_ptr<table>)> f);
+        const std::unordered_map<table_id, lw_shared_ptr<table>> get_column_families_copy() const;
+
+        auto filter(std::function<bool(std::pair<table_id, lw_shared_ptr<table>>)> f) const {
+            return _column_families | std::views::filter(std::move(f));
+        }
+    };
 private:
     replica::cf_stats _cf_stats;
     static constexpr size_t max_count_concurrent_reads{100};
+    static constexpr size_t max_count_concurrent_view_update_reads{50};
     size_t max_memory_concurrent_reads() { return _dbcfg.available_memory * 0.02; }
+    size_t max_memory_concurrent_view_update_reads() { return _dbcfg.available_memory * 0.01; }
     // Assume a queued read takes up 1kB of memory, and allow 2% of memory to be filled up with such reads.
     size_t max_inactive_queue_length() { return _dbcfg.available_memory * 0.02 / 1000; }
+    size_t max_inactive_view_update_queue_length() { return _dbcfg.available_memory * 0.01 / 1000; }
     // They're rather heavyweight, so limit more
     static constexpr size_t max_count_streaming_concurrent_reads{10};
     size_t max_memory_streaming_concurrent_reads() { return _dbcfg.available_memory * 0.02; }
     static constexpr size_t max_count_system_concurrent_reads{10};
     size_t max_memory_system_concurrent_reads() { return _dbcfg.available_memory * 0.02; };
-    size_t max_memory_pending_view_updates() const { return _dbcfg.available_memory * 0.1; }
+    size_t max_memory_pending_view_updates() const {
+        auto ret = _dbcfg.available_memory * 0.1;
+        utils::get_local_injector().inject("view_update_limit", [&ret] {
+            ret = 250000;
+        });
+        return ret;
+    }
 
     struct db_stats {
         uint64_t total_writes = 0;
@@ -1306,14 +1493,17 @@ private:
     flush_controller _memtable_controller;
     drain_progress _drain_progress {};
 
-    reader_concurrency_semaphore _read_concurrency_sem;
+
     reader_concurrency_semaphore _streaming_concurrency_sem;
     reader_concurrency_semaphore _compaction_concurrency_sem;
     reader_concurrency_semaphore _system_read_concurrency_sem;
 
+    // The view update read concurrency semaphores used for view updates coming from user writes.
+    reader_concurrency_semaphore_group _view_update_read_concurrency_semaphores_group;
     db::timeout_semaphore _view_update_concurrency_sem{max_memory_pending_view_updates()};
 
     cache_tracker _row_cache_tracker;
+    seastar::shared_ptr<db::view::view_update_generator> _view_update_generator;
 
     inheriting_concrete_execution_stage<
             future<>,
@@ -1326,10 +1516,7 @@ private:
             db::per_partition_rate_limit::info> _apply_stage;
 
     flat_hash_map<sstring, keyspace> _keyspaces;
-    std::unordered_map<table_id, lw_shared_ptr<column_family>> _column_families;
-    using ks_cf_to_uuid_t =
-        flat_hash_map<std::pair<sstring, sstring>, table_id, utils::tuple_hash, string_pair_eq>;
-    ks_cf_to_uuid_t _ks_cf_to_uuid;
+    tables_metadata _tables_metadata;
     std::unique_ptr<db::commitlog> _commitlog;
     std::unique_ptr<db::commitlog> _schema_commitlog;
     utils::updateable_value_source<table_schema_version> _version;
@@ -1340,7 +1527,6 @@ private:
     bool _enable_incremental_backups = false;
     bool _shutdown = false;
     bool _enable_autocompaction_toggle = false;
-    bool _uses_schema_commitlog = false;
     query::querier_cache _querier_cache;
 
     std::unique_ptr<db::large_data_handler> _large_data_handler;
@@ -1358,10 +1544,12 @@ private:
     gms::feature_service& _feat;
     std::vector<std::any> _listeners;
     const locator::shared_token_metadata& _shared_token_metadata;
+    lang::manager& _lang_manager;
 
-    sharded<sstables::directory_semaphore>& _sst_dir_semaphore;
+    reader_concurrency_semaphore_group _reader_concurrency_semaphores_group;
+    scheduling_group _default_read_concurrency_group;
+    noncopyable_function<future<>()> _unsubscribe_qos_configuration_change;
 
-    rust::Box<wasmtime::Engine> _wasm_engine;
     utils::cross_shard_barrier _stop_barrier;
 
     db::rate_limiter _rate_limiter;
@@ -1369,18 +1557,17 @@ private:
     serialized_action _update_memtable_flush_static_shares_action;
     utils::observer<float> _memtable_flush_static_shares_observer;
 
+    db_clock::time_point _all_tables_flushed_at;
+
 public:
     data_dictionary::database as_data_dictionary() const;
+    db::commitlog* commitlog_for(const schema_ptr& schema);
     std::shared_ptr<data_dictionary::user_types_storage> as_user_types_storage() const noexcept;
     const data_dictionary::user_types_storage& user_types() const noexcept;
     future<> init_commitlog();
     const gms::feature_service& features() const { return _feat; }
     future<> apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&&, db::timeout_clock::time_point timeout);
     future<> apply_in_memory(const mutation& m, column_family& cf, db::rp_handle&&, db::timeout_clock::time_point timeout);
-
-    wasmtime::Engine& wasm_engine() {
-        return *_wasm_engine;
-    }
 
     drain_progress get_drain_progress() const noexcept {
         return _drain_progress;
@@ -1391,15 +1578,21 @@ public:
     void plug_system_keyspace(db::system_keyspace& sys_ks) noexcept;
     void unplug_system_keyspace() noexcept;
 
+    void plug_view_update_generator(db::view::view_update_generator& generator) noexcept;
+    void unplug_view_update_generator() noexcept;
+
 private:
     future<> flush_non_system_column_families();
     future<> flush_system_column_families();
 
     using system_keyspace = bool_class<struct system_keyspace_tag>;
     future<> create_in_memory_keyspace(const lw_shared_ptr<keyspace_metadata>& ksm, locator::effective_replication_map_factory& erm_factory, system_keyspace system);
-    friend future<> db::system_keyspace_make(db::system_keyspace& sys_ks, distributed<database>& db, distributed<service::storage_service>& ss, sharded<gms::gossiper>& g, sharded<service::raft_group_registry>& raft_gr, db::config& cfg, db::table_selector&);
     void setup_metrics();
     void setup_scylla_memory_diagnostics_producer();
+    reader_concurrency_semaphore& read_concurrency_sem();
+    reader_concurrency_semaphore& view_update_read_concurrency_sem();
+    auto sum_read_concurrency_sem_var(std::invocable<reader_concurrency_semaphore&> auto member);
+    auto sum_read_concurrency_sem_stat(std::invocable<reader_concurrency_semaphore::stats&> auto stats_member);
 
     future<> do_apply(schema_ptr, const frozen_mutation&, tracing::trace_state_ptr tr_state, db::timeout_clock::time_point timeout, db::commitlog_force_sync sync, db::per_partition_rate_limit::info rate_limit_info);
     future<> do_apply_many(const std::vector<frozen_mutation>&, db::timeout_clock::time_point timeout);
@@ -1411,8 +1604,14 @@ private:
     template<typename Future>
     Future update_write_metrics(Future&& f);
     void update_write_metrics_for_timed_out_write();
-    future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&, locator::effective_replication_map_factory& erm_factory, bool is_bootstrap, system_keyspace system);
-    void remove(const table&) noexcept;
+    future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&, locator::effective_replication_map_factory& erm_factory, system_keyspace system);
+    future<> remove(table&) noexcept;
+    void drop_keyspace(const sstring& name);
+    future<> update_keyspace(const keyspace_metadata& tmp_ksm);
+    static future<> modify_keyspace_on_all_shards(sharded<database>& sharded_db, std::function<future<>(replica::database&)> func, std::function<future<>(replica::database&)> notifier);
+
+    future<> foreach_reader_concurrency_semaphore(std::function<future<>(reader_concurrency_semaphore&)> func);
+    friend class ::sigquit_handler; // wants access to all semaphores to dump diagnostics
 public:
     static table_schema_version empty_version;
 
@@ -1423,27 +1622,15 @@ public:
     void set_enable_incremental_backups(bool val) { _enable_incremental_backups = val; }
 
     void enable_autocompaction_toggle() noexcept { _enable_autocompaction_toggle = true; }
-    class autocompaction_toggle_guard {
-        database& _db;
-    public:
-        autocompaction_toggle_guard(database& db) : _db(db) {
-            assert(this_shard_id() == 0);
-            if (!_db._enable_autocompaction_toggle) {
-                throw std::runtime_error("Autocompaction toggle is busy");
-            }
-            _db._enable_autocompaction_toggle = false;
-        }
-        autocompaction_toggle_guard(const autocompaction_toggle_guard&) = delete;
-        autocompaction_toggle_guard(autocompaction_toggle_guard&&) = default;
-        ~autocompaction_toggle_guard() {
-            assert(this_shard_id() == 0);
-            _db._enable_autocompaction_toggle = true;
-        }
-    };
+    friend class api::autocompaction_toggle_guard;
 
+    // Load the schema definitions kept in schema tables from disk and initialize in-memory schema data structures
+    // (keyspace/table definitions, column mappings etc.)
     future<> parse_system_tables(distributed<service::storage_proxy>&, sharded<db::system_keyspace>&);
+
     database(const db::config&, database_config dbcfg, service::migration_notifier& mn, gms::feature_service& feat, const locator::shared_token_metadata& stm,
-            compaction_manager& cm, sharded<sstables::directory_semaphore>& sst_dir_sem, utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
+            compaction_manager& cm, sstables::storage_manager& sstm, lang::manager& langm, sstables::directory_semaphore& sst_dir_sem, const abort_source& abort,
+            utils::cross_shard_barrier barrier = utils::cross_shard_barrier(utils::cross_shard_barrier::solo{}) /* for single-shard usage */);
     database(database&&) = delete;
     ~database();
 
@@ -1465,7 +1652,6 @@ public:
         return &_cf_stats;
     }
 
-    seastar::scheduling_group get_statement_scheduling_group() const { return _dbcfg.statement_scheduling_group; }
     seastar::scheduling_group get_streaming_scheduling_group() const { return _dbcfg.streaming_scheduling_group; }
 
     compaction_manager& get_compaction_manager() {
@@ -1476,38 +1662,52 @@ public:
     }
 
     const locator::shared_token_metadata& get_shared_token_metadata() const { return _shared_token_metadata; }
+    locator::token_metadata_ptr get_token_metadata_ptr() const { return _shared_token_metadata.get(); }
     const locator::token_metadata& get_token_metadata() const { return *_shared_token_metadata.get(); }
+
+    lang::manager& lang() noexcept { return _lang_manager; }
+    const lang::manager& lang() const noexcept { return _lang_manager; }
 
     service::migration_notifier& get_notifier() { return _mnotifier; }
     const service::migration_notifier& get_notifier() const { return _mnotifier; }
 
-    void add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg);
-    void before_schema_keyspace_init();
-    future<> add_column_family_and_make_directory(schema_ptr schema);
+    // Setup in-memory data structures for this table (`table` and, if it doesn't exist yet, `keyspace` object).
+    // Create the keyspace data directories if the keyspace wasn't created yet.
+    //
+    // Note: 'system table' does not necessarily mean it sits in `system` keyspace, it could also be `system_schema`;
+    // in general we mean local tables created by the system (not the user).
+    future<> create_local_system_table(
+            schema_ptr table, bool write_in_user_memory, locator::effective_replication_map_factory&);
+
+    void init_schema_commitlog();
+    using is_new_cf = bool_class<struct is_new_cf_tag>;
+    future<> add_column_family_and_make_directory(schema_ptr schema, is_new_cf is_new);
 
     /* throws no_such_column_family if missing */
-    const table_id& find_uuid(std::string_view ks, std::string_view cf) const;
-    const table_id& find_uuid(const schema_ptr&) const;
+    table_id find_uuid(std::string_view ks, std::string_view cf) const;
+    table_id find_uuid(const schema_ptr&) const;
 
     /**
      * Creates a keyspace for a given metadata if it still doesn't exist.
      *
      * @return ready future when the operation is complete
      */
-    future<> create_keyspace(const lw_shared_ptr<keyspace_metadata>&, locator::effective_replication_map_factory& erm_factory);
+    static future<> create_keyspace_on_all_shards(sharded<database>& sharded_db, sharded<service::storage_proxy>& proxy, const keyspace_metadata& ksm);
     /* below, find_keyspace throws no_such_<type> on fail */
     keyspace& find_keyspace(std::string_view name);
     const keyspace& find_keyspace(std::string_view name) const;
     bool has_keyspace(std::string_view name) const;
     void validate_keyspace_update(keyspace_metadata& ksm);
     void validate_new_keyspace(keyspace_metadata& ksm);
-    future<> update_keyspace(sharded<service::storage_proxy>& proxy, const sstring& name);
-    void drop_keyspace(const sstring& name);
+    static future<> update_keyspace_on_all_shards(sharded<database>& sharded_db, const keyspace_metadata& ksm);
+    static future<> drop_keyspace_on_all_shards(sharded<database>& sharded_db, const sstring& name);
     std::vector<sstring> get_non_system_keyspaces() const;
     std::vector<sstring> get_user_keyspaces() const;
     std::vector<sstring> get_all_keyspaces() const;
     std::vector<sstring> get_non_local_strategy_keyspaces() const;
-    std::unordered_map<sstring, locator::effective_replication_map_ptr> get_non_local_strategy_keyspaces_erms() const;
+    std::vector<sstring> get_non_local_vnode_based_strategy_keyspaces() const;
+    std::unordered_map<sstring, locator::vnode_effective_replication_map_ptr> get_non_local_strategy_keyspaces_erms() const;
+    std::vector<sstring> get_tablets_keyspaces() const;
     column_family& find_column_family(std::string_view ks, std::string_view name);
     const column_family& find_column_family(std::string_view ks, std::string_view name) const;
     column_family& find_column_family(const table_id&);
@@ -1528,7 +1728,7 @@ public:
     /// reads, to speed up startup. After startup this should be reverted to
     /// the normal concurrency.
     void revert_initial_system_read_concurrency_boost();
-    future<> start();
+    future<> start(sharded<qos::service_level_controller>&);
     future<> shutdown();
     future<> stop();
     future<> close_tables(table_kind kind_to_close);
@@ -1547,10 +1747,10 @@ public:
             db::per_partition_rate_limit::account_and_enforce account_and_enforce_info,
             db::operation_type op_type);
 
-    future<std::tuple<lw_shared_ptr<query::result>, cache_temperature>> query(schema_ptr, const query::read_command& cmd, query::result_options opts,
+    future<std::tuple<lw_shared_ptr<query::result>, cache_temperature>> query(schema_ptr query_schema, const query::read_command& cmd, query::result_options opts,
                                                                   const dht::partition_range_vector& ranges, tracing::trace_state_ptr trace_state,
                                                                   db::timeout_clock::time_point timeout, db::per_partition_rate_limit::info rate_limit_info = std::monostate{});
-    future<std::tuple<reconcilable_result, cache_temperature>> query_mutations(schema_ptr, const query::read_command& cmd, const dht::partition_range& range,
+    future<std::tuple<reconcilable_result, cache_temperature>> query_mutations(schema_ptr query_schema, const query::read_command& cmd, const dht::partition_range& range,
                                                 tracing::trace_state_ptr trace_state, db::timeout_clock::time_point timeout);
     // Apply the mutation atomically.
     // Throws timed_out_error when timeout is reached.
@@ -1558,7 +1758,7 @@ public:
     // Apply mutations atomically.
     // On restart, either all mutations will be replayed or none of them.
     // All mutations must belong to the same commitlog domain.
-    // All mutations must be owned by the current shard (in terms of dht::shard_of).
+    // All mutations must be owned by the current shard.
     // Mutations may be partially visible to reads during the call.
     // Mutations may be partially visible to reads until restart on exception (FIXME).
     future<> apply(const std::vector<frozen_mutation>&, db::timeout_clock::time_point timeout);
@@ -1578,13 +1778,8 @@ public:
      */
     future<> clear_snapshot(sstring tag, std::vector<sstring> keyspace_names, const sstring& table_name);
 
-    struct snapshot_details_result {
-        sstring snapshot_name;
-        db::snapshot_ctl::snapshot_details details;
-        bool operator==(const snapshot_details_result&) const = default;
-    };
-
-    future<std::vector<snapshot_details_result>> get_snapshot_details();
+    using snapshot_details = db::snapshot_ctl::db_snapshot_details;
+    future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
 
     friend std::ostream& operator<<(std::ostream& out, const database& db);
     const flat_hash_map<sstring, keyspace>& get_keyspaces() const {
@@ -1595,22 +1790,17 @@ public:
         return _keyspaces;
     }
 
-    const std::unordered_map<table_id, lw_shared_ptr<column_family>>& get_column_families() const {
-        return _column_families;
+    const tables_metadata& get_tables_metadata() const {
+        return _tables_metadata;
     }
 
-    std::unordered_map<table_id, lw_shared_ptr<column_family>>& get_column_families() {
-        return _column_families;
+    tables_metadata& get_tables_metadata() {
+        return _tables_metadata;
     }
 
     std::vector<lw_shared_ptr<column_family>> get_non_system_column_families() const;
 
     std::vector<view_ptr> get_views() const;
-
-    const ks_cf_to_uuid_t&
-    get_column_families_mapping() const {
-        return _ks_cf_to_uuid;
-    }
 
     const db::config& get_config() const {
         return _cfg;
@@ -1618,18 +1808,22 @@ public:
     const db::extensions& extensions() const;
 
     sstables::sstables_manager& get_user_sstables_manager() const noexcept {
-        assert(_user_sstables_manager);
+        SCYLLA_ASSERT(_user_sstables_manager);
         return *_user_sstables_manager;
     }
 
     sstables::sstables_manager& get_system_sstables_manager() const noexcept {
-        assert(_system_sstables_manager);
+        SCYLLA_ASSERT(_system_sstables_manager);
         return *_system_sstables_manager;
+    }
+
+    sstables::sstables_manager& get_sstables_manager(system_keyspace is_sys_ks) const noexcept {
+        return is_sys_ks ? get_system_sstables_manager() : get_user_sstables_manager();
     }
 
     // Returns the list of ranges held by this endpoint
     // The returned list is sorted, and its elements are non overlapping and non wrap-around.
-    dht::token_range_vector get_keyspace_local_ranges(sstring ks);
+    future<dht::token_range_vector> get_keyspace_local_ranges(locator::vnode_effective_replication_map_ptr erm);
 
     void set_format(sstables::sstable_version_types format) noexcept;
     void set_format_by_config();
@@ -1644,35 +1838,39 @@ public:
     static future<> flush_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names);
     // flush all tables in a keyspace on all shards.
     static future<> flush_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name);
+    // flush all tables on this shard.
+    // Note: force_new_active_segment in the commitlog, so that
+    // flushing all tables will allow reclaiming of all commitlog segments
+    future<> flush_all_tables();
+    // a wrapper around flush_all_tables, allowing the caller to express intent more clearly
+    future<> flush_commitlog() { return flush_all_tables(); }
 
-    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring table_name, sstring tag, db::snapshot_ctl::snap_views, bool skip_flush);
-    static future<> snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, db::snapshot_ctl::snap_views, bool skip_flush);
+    static future<db_clock::time_point> get_all_tables_flushed_at(sharded<database>& sharded_db);
+
+    static future<> drop_cache_for_table_on_all_shards(sharded<database>& sharded_db, table_id id);
+    static future<> drop_cache_for_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name);
+
+    static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring table_name, sstring tag, bool skip_flush);
+    static future<> snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, bool skip_flush);
     static future<> snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, bool skip_flush);
 
 public:
     bool update_column_family(schema_ptr s);
 private:
+    future<> add_column_family(keyspace& ks, schema_ptr schema, column_family::config cfg, is_new_cf is_new);
     future<> detach_column_family(table& cf);
 
-    static future<std::vector<foreign_ptr<lw_shared_ptr<table>>>> get_table_on_all_shards(sharded<database>& db, table_id uuid);
+    struct table_truncate_state;
 
-    struct table_truncate_state {
-        gate::holder holder;
-        db_clock::time_point low_mark_at;
-        db::replay_position low_mark;
-        std::vector<compaction_manager::compaction_reenabler> cres;
-        bool did_flush;
-    };
-
-    static future<> truncate_table_on_all_shards(sharded<database>& db, const std::vector<foreign_ptr<lw_shared_ptr<table>>>&, std::optional<db_clock::time_point> truncated_at_opt, bool with_snapshot, std::optional<sstring> snapshot_name_opt);
-    future<> truncate(column_family& cf, const table_truncate_state&, db_clock::time_point truncated_at);
+    static future<> truncate_table_on_all_shards(sharded<database>& db, sharded<db::system_keyspace>& sys_ks, const global_table_ptr&, std::optional<db_clock::time_point> truncated_at_opt, bool with_snapshot, std::optional<sstring> snapshot_name_opt);
+    future<> truncate(db::system_keyspace& sys_ks, column_family& cf, const table_truncate_state&, db_clock::time_point truncated_at);
 public:
     /** Truncates the given column family */
     // If truncated_at_opt is not given, it is set to db_clock::now right after flush/clear.
-    static future<> truncate_table_on_all_shards(sharded<database>& db, sstring ks_name, sstring cf_name, std::optional<db_clock::time_point> truncated_at_opt = {}, bool with_snapshot = true, std::optional<sstring> snapshot_name_opt = {});
+    static future<> truncate_table_on_all_shards(sharded<database>& db, sharded<db::system_keyspace>& sys_ks, sstring ks_name, sstring cf_name, std::optional<db_clock::time_point> truncated_at_opt = {}, bool with_snapshot = true, std::optional<sstring> snapshot_name_opt = {});
 
     // drops the table on all shards and removes the table directory if there are no snapshots
-    static future<> drop_table_on_all_shards(sharded<database>& db, sstring ks_name, sstring cf_name, bool with_snapshot = true);
+    static future<> drop_table_on_all_shards(sharded<database>& db, sharded<db::system_keyspace>& sys_ks, sstring ks_name, sstring cf_name, bool with_snapshot = true);
 
     const dirty_memory_manager_logalloc::region_group& dirty_memory_region_group() const {
         return _dirty_memory_manager.region_group();
@@ -1702,28 +1900,39 @@ public:
         return *_data_listeners;
     }
 
-    // Get the maximum result size for an unlimited query, appropriate for the
+    // Get the maximum result size for a query, appropriate for the
     // query class, which is deduced from the current scheduling group.
-    query::max_result_size get_unlimited_query_max_result_size() const;
+    query::max_result_size get_query_max_result_size() const;
 
     // Get the reader concurrency semaphore, appropriate for the query class,
     // which is deduced from the current scheduling group.
     reader_concurrency_semaphore& get_reader_concurrency_semaphore();
 
     // Convenience method to obtain an admitted permit. See reader_concurrency_semaphore::obtain_permit().
-    future<reader_permit> obtain_reader_permit(table& tbl, const char* const op_name, db::timeout_clock::time_point timeout);
-    future<reader_permit> obtain_reader_permit(schema_ptr schema, const char* const op_name, db::timeout_clock::time_point timeout);
+    future<reader_permit> obtain_reader_permit(table& tbl, const char* const op_name, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
+    future<reader_permit> obtain_reader_permit(schema_ptr schema, const char* const op_name, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
 
     bool is_internal_query() const;
+    bool is_user_semaphore(const reader_concurrency_semaphore& semaphore) const;
 
-    sharded<sstables::directory_semaphore>& get_sharded_sst_dir_semaphore() {
-        return _sst_dir_semaphore;
+    db::timeout_semaphore& view_update_sem() {
+        return _view_update_concurrency_sem;
     }
 
-    bool uses_schema_commitlog() const {
-        return _uses_schema_commitlog;
-    }
+    future<> clear_inactive_reads_for_tablet(table_id table, dht::token_range tablet_range);
+
+    /** This callback is going to be called just before the service level is available **/
+    virtual future<> on_before_service_level_add(qos::service_level_options slo, qos::service_level_info sl_info) override;
+    /** This callback is going to be called just after the service level is removed **/
+    virtual future<> on_after_service_level_remove(qos::service_level_info sl_info) override;
+    /** This callback is going to be called just before the service level is changed **/
+    virtual future<> on_before_service_level_change(qos::service_level_options slo_before, qos::service_level_options slo_after, qos::service_level_info sl_info) override;
+    virtual future<> on_effective_service_levels_cache_reloaded() override;
 };
+
+// A helper function to parse the directory name back
+// into name and uuid of the table (see init_table_storage())
+std::pair<sstring, table_id> parse_table_directory_name(const sstring&);
 
 } // namespace replica
 
@@ -1733,7 +1942,96 @@ future<> start_large_data_handler(sharded<replica::database>& db);
 //
 // Shard readers are created via `table::make_streaming_reader()`.
 // Range generator must generate disjoint, monotonically increasing ranges.
-flat_mutation_reader_v2 make_multishard_streaming_reader(distributed<replica::database>& db, schema_ptr schema, reader_permit permit,
-        std::function<std::optional<dht::partition_range>()> range_generator);
+// Opt-in for compacting the output by passing `compaction_time`, see
+// make_streaming_reader() for more details.
+// Setting multishard_reader_buffer_size enables the multishard reader's buffer
+// size optimization (see make_multishard_combining_reader_v2()), using the
+// given size.
+mutation_reader make_multishard_streaming_reader(
+        distributed<replica::database>& db,
+        schema_ptr schema,
+        reader_permit permit,
+        std::function<std::optional<dht::partition_range>()> range_generator,
+        gc_clock::time_point compaction_time,
+        std::optional<size_t> multishard_reader_buffer_size,
+        read_ahead read_ahead);
+
+mutation_reader make_multishard_streaming_reader(
+        distributed<replica::database>& db,
+        schema_ptr schema,
+        reader_permit permit,
+        const dht::partition_range& range,
+        gc_clock::time_point compaction_time,
+        std::optional<size_t> multishard_reader_buffer_size,
+        read_ahead read_ahead);
 
 bool is_internal_keyspace(std::string_view name);
+
+class streaming_reader_lifecycle_policy
+    : public reader_lifecycle_policy_v2
+        , public enable_shared_from_this<streaming_reader_lifecycle_policy> {
+
+    template <typename T>
+    using foreign_unique_ptr = foreign_ptr<std::unique_ptr<T>>;
+
+    struct reader_context {
+        foreign_ptr<lw_shared_ptr<const dht::partition_range>> range;
+        foreign_unique_ptr<utils::phased_barrier::operation> read_operation;
+        reader_concurrency_semaphore* semaphore;
+    };
+    distributed<replica::database>& _db;
+    table_id _table_id;
+    gc_clock::time_point _compaction_time;
+    std::vector<reader_context> _contexts;
+public:
+    streaming_reader_lifecycle_policy(distributed<replica::database>& db, table_id table_id, gc_clock::time_point compaction_time)
+        : _db(db)
+        , _table_id(table_id)
+        , _compaction_time(compaction_time)
+        , _contexts(smp::count) {
+    }
+    virtual mutation_reader create_reader(
+        schema_ptr schema,
+        reader_permit permit,
+        const dht::partition_range& range,
+        const query::partition_slice& slice,
+        tracing::trace_state_ptr,
+        mutation_reader::forwarding fwd_mr) override {
+        const auto shard = this_shard_id();
+        auto& cf = _db.local().find_column_family(schema);
+
+        _contexts[shard].range = make_foreign(make_lw_shared<const dht::partition_range>(range));
+        _contexts[shard].read_operation = make_foreign(std::make_unique<utils::phased_barrier::operation>(cf.read_in_progress()));
+        _contexts[shard].semaphore = &cf.streaming_read_concurrency_semaphore();
+
+        return cf.make_streaming_reader(std::move(schema), std::move(permit), *_contexts[shard].range, slice, fwd_mr, _compaction_time);
+    }
+    virtual const dht::partition_range* get_read_range() const override {
+        const auto shard = this_shard_id();
+        return _contexts[shard].range.get();
+    }
+    virtual void update_read_range(lw_shared_ptr<const dht::partition_range> range) override {
+        const auto shard = this_shard_id();
+        _contexts[shard].range = make_foreign(std::move(range));
+    }
+    virtual future<> destroy_reader(stopped_reader reader) noexcept override {
+        auto ctx = std::move(_contexts[this_shard_id()]);
+        auto reader_opt = ctx.semaphore->unregister_inactive_read(std::move(reader.handle));
+        if  (!reader_opt) {
+            return make_ready_future<>();
+        }
+        return reader_opt->close().finally([ctx = std::move(ctx)] {});
+    }
+    virtual reader_concurrency_semaphore& semaphore() override {
+        const auto shard = this_shard_id();
+        if (!_contexts[shard].semaphore) {
+            auto& cf = _db.local().find_column_family(_table_id);
+            _contexts[shard].semaphore = &cf.streaming_read_concurrency_semaphore();
+        }
+        return *_contexts[shard].semaphore;
+    }
+    virtual future<reader_permit> obtain_reader_permit(schema_ptr schema, const char* const description, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr) override {
+        auto& cf = _db.local().find_column_family(_table_id);
+        return semaphore().obtain_permit(schema, description, cf.estimate_read_memory_cost(), timeout, std::move(trace_ptr));
+    }
+};

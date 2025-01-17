@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
+#include <optional>
 #include <string_view>
 #include <functional>
 
@@ -30,8 +31,6 @@ std::string_view creation_query();
 
 constexpr std::string_view name{"roles", 5};
 
-extern const std::string_view qualified_name;
-
 constexpr std::string_view role_col_name{"role", 4};
 
 }
@@ -43,13 +42,17 @@ constexpr std::string_view role_col_name{"role", 4};
 ///
 future<bool> default_role_row_satisfies(
         cql3::query_processor&,
-        std::function<bool(const cql3::untyped_result_set_row&)>);
+        std::function<bool(const cql3::untyped_result_set_row&)>,
+        std::optional<std::string> rolename = {}
+        );
 
 ///
 /// Check that any nondefault role satisfies a predicate. `false` if no nondefault roles exist.
 ///
 future<bool> any_nondefault_role_row_satisfies(
         cql3::query_processor&,
-        std::function<bool(const cql3::untyped_result_set_row&)>);
+        std::function<bool(const cql3::untyped_result_set_row&)>,
+        std::optional<std::string> rolename = {}
+        );
 
 }

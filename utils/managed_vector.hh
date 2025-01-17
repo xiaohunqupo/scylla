@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -34,7 +34,7 @@ private:
             _backref->_data = _data;
         }
         size_t storage_size() const noexcept {
-            return sizeof(*this) + sizeof(T[_backref->_capacity]);
+            return sizeof(*this) + sizeof(T) * _backref->_capacity;
         }
     };
     union maybe_constructed {

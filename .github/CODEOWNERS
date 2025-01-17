@@ -1,5 +1,5 @@
 # AUTH
-auth/* @elcallio @vladzcloudius
+auth/* @nuivall @ptrsmrn @KrzaQ
 
 # CACHE
 row_cache* @tgrabiec
@@ -7,9 +7,9 @@ row_cache* @tgrabiec
 test/boost/mvcc* @tgrabiec
 
 # CDC
-cdc/* @kbr- @elcallio @piodul @jul-stas
-test/cql/cdc_* @kbr- @elcallio @piodul @jul-stas
-test/boost/cdc_* @kbr- @elcallio @piodul @jul-stas
+cdc/* @kbr-scylla @elcallio @piodul
+test/cql/cdc_* @kbr-scylla @elcallio @piodul
+test/boost/cdc_* @kbr-scylla @elcallio @piodul
 
 # COMMITLOG / BATCHLOG
 db/commitlog/* @elcallio @eliransin
@@ -19,24 +19,24 @@ db/batch* @elcallio
 service/storage_proxy* @gleb-cloudius
 
 # COMPACTION
-compaction/* @raphaelsc @nyh
+compaction/* @raphaelsc
 
 # CQL TRANSPORT LAYER
 transport/*
 
 # CQL QUERY LANGUAGE
-cql3/* @tgrabiec @cvybhu @nyh
+cql3/* @tgrabiec @nuivall @ptrsmrn @KrzaQ
 
 # COUNTERS
-counters* @jul-stas
-tests/counter_test* @jul-stas
+counters* @nuivall @ptrsmrn @KrzaQ
+tests/counter_test* @nuivall @ptrsmrn @KrzaQ
 
 # DOCS
 docs/* @annastuchlik @tzach
-docs/alternator @annastuchlik @tzach @nyh @havaker @nuivall
+docs/alternator @annastuchlik @tzach @nyh @nuivall @ptrsmrn @KrzaQ
 
 # GOSSIP
-gms/* @tgrabiec @asias
+gms/* @tgrabiec @asias @kbr-scylla
 
 # DOCKER
 dist/docker/*
@@ -45,44 +45,44 @@ dist/docker/*
 utils/logalloc* @tgrabiec
 
 # MATERIALIZED VIEWS
-db/view/* @nyh @cvybhu @piodul
-cql3/statements/*view* @nyh @cvybhu @piodul
-test/boost/view_* @nyh @cvybhu @piodul
+db/view/* @nyh @piodul
+cql3/statements/*view* @nyh @piodul
+test/boost/view_* @nyh @piodul
 
 # PACKAGING
 dist/* @syuu1228
 
 # REPAIR
-repair/* @tgrabiec @asias @nyh
+repair/* @tgrabiec @asias
 
 # SCHEMA MANAGEMENT
-db/schema_tables* @tgrabiec @nyh
-db/legacy_schema_migrator* @tgrabiec @nyh
-service/migration* @tgrabiec @nyh
-schema* @tgrabiec @nyh
+db/schema_tables* @tgrabiec
+db/legacy_schema_migrator* @tgrabiec
+service/migration* @tgrabiec
+schema* @tgrabiec
 
 # SECONDARY INDEXES
-index/* @nyh @cvybhu @piodul
-cql3/statements/*index* @nyh @cvybhu @piodul
-test/boost/*index* @nyh @cvybhu @piodul
+index/* @nyh @piodul
+cql3/statements/*index* @nyh @piodul
+test/boost/*index* @nyh @piodul
 
 # SSTABLES
-sstables/* @tgrabiec @raphaelsc @nyh
+sstables/* @tgrabiec @raphaelsc
 
 # STREAMING
 streaming/* @tgrabiec @asias
 service/storage_service.* @tgrabiec @asias
 
 # ALTERNATOR
-alternator/* @nyh @havaker @nuivall
-test/alternator/* @nyh @havaker @nuivall
+alternator/* @nyh @nuivall @ptrsmrn @KrzaQ
+test/alternator/* @nyh @nuivall @ptrsmrn @KrzaQ
 
 # HINTED HANDOFF
 db/hints/* @piodul @vladzcloudius @eliransin
 
 # REDIS
-redis/* @nyh @syuu1228
-test/redis/* @nyh @syuu1228
+redis/* @syuu1228
+test/redis/* @syuu1228
 
 # READERS
 reader_* @denesb
@@ -91,11 +91,14 @@ test/boost/mutation_reader_test.cc @denesb
 test/boost/querier_cache_test.cc @denesb
 
 # PYTEST-BASED CQL TESTS
-test/cql-pytest/* @nyh
+test/cqlpy/* @nyh
 
 # RAFT
-raft/* @kbr- @gleb-cloudius @kostja
-test/raft/* @kbr- @gleb-cloudius @kostja
+raft/* @kbr-scylla @gleb-cloudius @kostja
+test/raft/* @kbr-scylla @gleb-cloudius @kostja
 
 # HEAT-WEIGHTED LOAD BALANCING
 db/heat_load_balance.* @nyh @gleb-cloudius
+
+# Tools
+tools/* @denesb

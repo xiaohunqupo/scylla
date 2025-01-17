@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "readers/combined.hh"
-#include "readers/flat_mutation_reader_v2.hh"
+#include "readers/mutation_reader.hh"
 #include "replica/memtable.hh"
 #include "utils/phased_barrier.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
@@ -55,13 +55,12 @@ private:
         auto new_mt = make_lw_shared<replica::memtable>(_s);
         tests::reader_concurrency_semaphore_wrapper semaphore;
         auto permit = semaphore.make_permit();
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         for (auto&& mt : _memtables) {
             readers.push_back(mt->make_flat_reader(new_mt->schema(),
                  permit,
                  query::full_partition_range,
                  new_mt->schema()->full_slice(),
-                 default_priority_class(),
                  nullptr,
                  streamed_mutation::forwarding::no,
                  mutation_reader::forwarding::yes));
@@ -81,9 +80,17 @@ public:
         : _s(s)
         , _compactor(seastar::async([this] () noexcept {
             while (!_closed) {
-                // condition_variable::wait() also allocates memory
+                std::optional<future<>> f;
+                {
+                    memory::scoped_critical_alloc_section dfg;
+                    // condition_variable::wait() also allocates memory
+                    f = _should_compact.wait();
+                }
+
+                // Waiting on the future should not be covered by critical section.
+                f->get();
+
                 memory::scoped_critical_alloc_section dfg;
-                _should_compact.wait().get();
                 while (should_compact()) {
                     compact();
                 }

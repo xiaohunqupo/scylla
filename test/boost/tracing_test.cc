@@ -3,30 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 
 #include "tracing/tracing.hh"
 #include "tracing/trace_state.hh"
-#include "utils/class_registrator.hh"
 
 #include "test/lib/cql_test_env.hh"
 
+BOOST_AUTO_TEST_SUITE(tracing_test)
+
 future<> do_with_tracing_env(std::function<future<>(cql_test_env&)> func, cql_test_config cfg_in = {}) {
     return do_with_cql_env_thread([func](auto &env) {
-        tracing::tracing::create_tracing("trace_keyspace_helper").get();
-
-        tracing::tracing::start_tracing(env.qp()).get();
-
-        func(env).finally([]() {
-            return tracing::tracing::tracing_instance().invoke_on_all([](tracing::tracing &local_tracing) {
-                return local_tracing.shutdown();
-            }).finally([]() {
-                return tracing::tracing::tracing_instance().stop();
-            });
-        }).get();
+        sharded<tracing::tracing>& tracing = tracing::tracing::tracing_instance();
+        tracing.start(sstring("trace_keyspace_helper")).get();
+        auto stop = defer([&tracing] { tracing.stop().get(); });
+        tracing.invoke_on_all(&tracing::tracing::start, std::ref(env.qp()), std::ref(env.migration_manager())).get();
+        func(env).get();
     }, std::move(cfg_in));
 }
 
@@ -87,3 +83,5 @@ SEASTAR_TEST_CASE(tracing_slow_query_fast_mode) {
         return make_ready_future<>();
     });
 }
+
+BOOST_AUTO_TEST_SUITE_END()

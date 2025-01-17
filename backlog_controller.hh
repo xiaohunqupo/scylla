@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -22,7 +22,7 @@
 // Goal is to consume the backlog as fast as we can, but not so fast that we steal all the CPU from
 // incoming requests, and at the same time minimize user-visible fluctuations in the quota.
 //
-// What that translates to is we'll try to keep the backlog's firt derivative at 0 (IOW, we keep
+// What that translates to is we'll try to keep the backlog's first derivative at 0 (IOW, we keep
 // backlog constant). As the backlog grows we increase CPU usage, decreasing CPU usage as the
 // backlog diminishes.
 //
@@ -37,10 +37,8 @@
 // The constants q1 and q2 are used to determine the proportional factor at each stage.
 class backlog_controller {
 public:
-    struct scheduling_group {
-        seastar::scheduling_group cpu = default_scheduling_group();
-        seastar::io_priority_class io = default_priority_class();
-    };
+    using scheduling_group = seastar::scheduling_group;
+
     future<> shutdown() {
         _update_timer.cancel();
         return std::move(_inflight_update);
@@ -58,11 +56,11 @@ protected:
     };
 
     scheduling_group _scheduling_group;
-    timer<> _update_timer;
 
     std::vector<control_point> _control_points;
 
     std::function<float()> _current_backlog;
+    timer<> _update_timer;
     // updating shares for an I/O class may contact another shard and returns a future.
     future<> _inflight_update;
 
@@ -82,9 +80,9 @@ protected:
                        std::vector<control_point> control_points, std::function<float()> backlog,
                        float static_shares = 0)
         : _scheduling_group(std::move(sg))
-        , _update_timer([this] { adjust(); })
         , _control_points()
         , _current_backlog(std::move(backlog))
+        , _update_timer([this] { adjust(); })
         , _inflight_update(make_ready_future<>())
         , _static_shares(static_shares)
     {

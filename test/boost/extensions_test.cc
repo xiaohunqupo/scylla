@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <variant>
@@ -12,7 +12,8 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
 
-#include "test/lib/scylla_test_case.hh"
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
 
@@ -25,6 +26,8 @@
 #include "db/paxos_grace_seconds_extension.hh"
 #include "transport/messages/result_message.hh"
 #include "utils/overloaded_functor.hh"
+
+BOOST_AUTO_TEST_SUITE(extensions_test)
 
 class dummy_ext : public schema_extension {
 public:
@@ -126,6 +129,8 @@ SEASTAR_TEST_CASE(paxos_grace_seconds_extension) {
     auto ext = std::make_shared<db::extensions>();
     ext->add_schema_extension<db::paxos_grace_seconds_extension>(db::paxos_grace_seconds_extension::NAME);
     auto cfg = ::make_shared<db::config>(ext);
+    cql_test_config cql_cfg(cfg);
+    cql_cfg.need_remote_proxy = true;
 
     return do_with_cql_env([] (cql_test_env& e) {
         // Verify that paxos_grace_seconds extensions gets recognized properly
@@ -142,7 +147,7 @@ SEASTAR_TEST_CASE(paxos_grace_seconds_extension) {
             return e.execute_prepared(prep_id, {cql3::raw_value::make_value(int32_type->decompose(1))});
         }).discard_result().then([&e] {
             return e.execute_cql("SELECT row_key, TTL(promise) FROM system.paxos")
-                .then([&e] (::shared_ptr<cql_transport::messages::result_message> msg) {
+                .then([] (::shared_ptr<cql_transport::messages::result_message> msg) {
                     assert_that(msg)
                         .is_rows()
                         .with_size(1);
@@ -156,7 +161,7 @@ SEASTAR_TEST_CASE(paxos_grace_seconds_extension) {
         });
 
         return f;
-    }, cfg);
+    }, std::move(cql_cfg));
 }
 
 SEASTAR_TEST_CASE(test_extension_remove) {
@@ -204,3 +209,5 @@ SEASTAR_TEST_CASE(test_extension_remove) {
         });
     }, ::make_shared<db::config>(ext));
 }
+
+BOOST_AUTO_TEST_SUITE_END()

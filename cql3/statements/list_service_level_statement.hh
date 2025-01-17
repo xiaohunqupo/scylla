@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -11,7 +11,6 @@
 #include <seastar/core/sstring.hh>
 
 #include "cql3/statements/service_level_statement.hh"
-#include "service/qos/qos_common.hh"
 
 namespace cql3 {
 namespace statements {
@@ -22,10 +21,9 @@ class list_service_level_statement final : public service_level_statement {
 public:
     list_service_level_statement(sstring service_level, bool describe_all);
     std::unique_ptr<cql3::statements::prepared_statement> prepare(data_dictionary::database db, cql_stats &stats) override;
-    void validate(query_processor&, const service::client_state&) const override;
     virtual future<> check_access(query_processor& qp, const service::client_state&) const override;
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(query_processor&, service::query_state&, const query_options&) const override;
+    execute(query_processor&, service::query_state&, const query_options&, std::optional<service::group0_guard> guard) const override;
 };
 
 }

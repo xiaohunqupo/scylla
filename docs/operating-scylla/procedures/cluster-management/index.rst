@@ -19,12 +19,12 @@ Cluster Management Procedures
    rebuild-node
    Remove a DC <decommissioning-data-center>
    Clear Data <clear-data>
-   Add a Decommissioned Node Back to a Scylla Cluster <revoke-decommission>
+   Add a Decommissioned Node Back to a ScyllaDB Cluster <revoke-decommission>
    Remove a Seed Node from Seed List <remove-seed>
    Update Topology Strategy From Simple to Network <update-topology-strategy-from-simple-to-network>
    Safely Shutdown Your Cluster <safe-shutdown>
    Safely Restart Your Cluster <safe-start>
-   Cluster Membership Change <membership-changes>
+   Handling Membership Change Failures <handling-membership-change-failures>
    repair-based-node-operation
 
 .. panel-box::
@@ -78,7 +78,7 @@ Cluster Management Procedures
 
   * :doc:`Add a Decommissioned Node Back to a ScyllaDB Cluster </operating-scylla/procedures/cluster-management/revoke-decommission/>`
 
-  * :doc:`Cluster Membership Change Notes </operating-scylla/procedures/cluster-management/membership-changes/>`
+  * :doc:`Handling Membership Change Failures </operating-scylla/procedures/cluster-management/handling-membership-change-failures>`
 
   * :ref:`Add Bigger Nodes to a Cluster <add-bigger-nodes-to-a-cluster>`
 
@@ -93,7 +93,7 @@ Cluster Management Procedures
 
 
   * :doc:`Update Topology Strategy From Simple to Network </operating-scylla/procedures/cluster-management/update-topology-strategy-from-simple-to-network>`
-  * Some of these procedures are also covered in the `MMS course <https://university.scylladb.com/courses/the-mutant-monitoring-system-training-course/>`_ on Scylla University
+  * Some of these procedures are also covered in the `MMS course <https://university.scylladb.com/courses/the-mutant-monitoring-system-training-course/>`_ and in the `ScyllaDB Operations course <https://university.scylladb.com/courses/scylla-operations>`_ on ScyllaDB University
 
 .. panel-box::
   :title: Handling Failures

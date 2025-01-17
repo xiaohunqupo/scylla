@@ -5,9 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/result_set.hh"
 
 namespace cql3 {
@@ -49,7 +50,7 @@ void metadata::set_paging_state(lw_shared_ptr<const service::pager::paging_state
 }
 
 void metadata::maybe_set_paging_state(lw_shared_ptr<const service::pager::paging_state> paging_state) {
-    assert(paging_state);
+    SCYLLA_ASSERT(paging_state);
     if (paging_state->get_remaining() > 0) {
         set_paging_state(std::move(paging_state));
     } else {
@@ -113,19 +114,32 @@ bool result_set::empty() const {
     return _rows.empty();
 }
 
-void result_set::add_row(std::vector<bytes_opt> row) {
-    assert(row.size() == _metadata->value_count());
+void result_set::add_row(std::vector<managed_bytes_opt> row) {
+    SCYLLA_ASSERT(row.size() == _metadata->value_count());
     _rows.emplace_back(std::move(row));
 }
 
-void result_set::add_column_value(bytes_opt value) {
+void result_set::add_row(std::vector<bytes_opt> row) {
+    row_type new_row;
+    new_row.reserve(row.size());
+    for (auto& bo : row) {
+        new_row.emplace_back(bo ? managed_bytes_opt(*bo) : managed_bytes_opt());
+    }
+    add_row(std::move(new_row));
+}
+
+void result_set::add_column_value(managed_bytes_opt value) {
     if (_rows.empty() || _rows.back().size() == _metadata->value_count()) {
-        std::vector<bytes_opt> row;
+        std::vector<managed_bytes_opt> row;
         row.reserve(_metadata->value_count());
         _rows.emplace_back(std::move(row));
     }
 
     _rows.back().emplace_back(std::move(value));
+}
+
+void result_set::add_column_value(bytes_opt value) {
+    add_column_value(to_managed_bytes_opt(value));
 }
 
 void result_set::reverse() {
@@ -146,7 +160,7 @@ const metadata& result_set::get_metadata() const {
     return *_metadata;
 }
 
-const utils::chunked_vector<std::vector<bytes_opt>>& result_set::rows() const {
+const utils::chunked_vector<std::vector<managed_bytes_opt>>& result_set::rows() const {
     return _rows;
 }
 

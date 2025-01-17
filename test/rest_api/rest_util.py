@@ -1,5 +1,6 @@
 import time
 import pytest
+import threading
 
 from contextlib import contextmanager
 
@@ -51,13 +52,17 @@ def scylla_inject_error(rest_api, err, one_shot=False):
 
 @contextmanager
 def new_test_module(rest_api):
-    name = "test_module"
-    resp = rest_api.send("POST", f"task_manager_test/{name}")
+    resp = rest_api.send("POST", f"task_manager_test/test_module")
     resp.raise_for_status()
     try:
         yield
     finally:
-        resp = rest_api.send("DELETE", f"task_manager_test/{name}")
+        resp = rest_api.send("GET", f"task_manager/list_module_tasks/test", { "internal": "true" })
+        resp.raise_for_status()
+        for task in resp.json():
+            rest_api.send("DELETE", "task_manager_test/test_task", { "task_id": task["task_id"] })
+
+        resp = rest_api.send("DELETE", f"task_manager_test/test_module")
         resp.raise_for_status()
 
 @contextmanager
@@ -72,11 +77,38 @@ def new_test_task(rest_api, args):
 
 @contextmanager
 def set_tmp_task_ttl(rest_api, seconds):
-    resp = rest_api.send("POST", "task_manager_test/ttl", { "ttl" : seconds })
+    resp = rest_api.send("POST", "task_manager/ttl", { "ttl" : seconds })
     resp.raise_for_status()
     old_ttl = resp.json()
     try:
         yield old_ttl
     finally:
-        resp = rest_api.send("POST", "task_manager_test/ttl", { "ttl" : old_ttl })
+        resp = rest_api.send("POST", "task_manager/ttl", { "ttl" : old_ttl })
         resp.raise_for_status()
+
+@contextmanager
+def set_tmp_user_task_ttl(rest_api, seconds):
+    resp = rest_api.send("POST", "task_manager/user_ttl", { "user_ttl" : seconds })
+    resp.raise_for_status()
+    old_ttl = resp.json()
+    try:
+        yield old_ttl
+    finally:
+        resp = rest_api.send("POST", "task_manager/user_ttl", { "user_ttl" : old_ttl })
+        resp.raise_for_status()
+
+# Unfortunately by default Python threads print their exceptions
+# (e.g., assertion failures) but don't propagate them to the join(),
+# so the overall test doesn't fail. The following Thread wrapper
+# causes join() to rethrow the exception, so the test will fail.
+class ThreadWrapper(threading.Thread):
+    def run(self):
+        try:
+            self.ret = self._target(*self._args, **self._kwargs)
+        except BaseException as e:
+            self.exception = e
+    def join(self, timeout=None):
+        super().join(timeout)
+        if hasattr(self, 'exception'):
+            raise self.exception
+        return self.ret

@@ -4,7 +4,9 @@ Nodetool scrub
 NAME
 ....
 
-**scrub** - Scrub the SSTable files in the specified keyspace or table(s)
+**scrub** - Help identify and fix corrupted SSTable.
+Remove faulty data,  eliminate tombstoned rows that have surpassed the table's gc_grace period, and fix out-of-order rows and partitions.
+
 
 SYNOPSIS
 ........
@@ -18,8 +20,6 @@ SYNOPSIS
                    [(-s | --skip-corrupted)]
                    [(-m <scrub_mode> | --mode <scrub_mode>)]
                    [--] <keyspace> [<table...>]
-
-.. versionadded:: version 4.6 ``scrub mode``
 
    Supported scrub modes: ABORT, SKIP, SEGREGATE, VALIDATE
 

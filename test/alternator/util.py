@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Various utility functions which are useful for multiple tests
 
@@ -117,6 +117,8 @@ def freeze(item):
         return frozenset((key, freeze(value)) for key, value in item.items())
     elif isinstance(item, list):
         return tuple(freeze(value) for value in item)
+    elif isinstance(item, bytearray):
+        return bytes(item)
     return item
 
 def multiset(items):
@@ -136,9 +138,14 @@ unique_table_name.last_ms = 0
 
 def create_test_table(dynamodb, **kwargs):
     name = unique_table_name()
+    BillingMode = 'PAY_PER_REQUEST'
+    if 'BillingMode' in kwargs:
+        BillingMode = kwargs['BillingMode']
+        del kwargs['BillingMode']
+
     print("fixture creating new table {}".format(name))
     table = dynamodb.create_table(TableName=name,
-        BillingMode='PAY_PER_REQUEST', **kwargs)
+        BillingMode=BillingMode, **kwargs)
     waiter = table.meta.client.get_waiter('table_exists')
     # recheck every second instead of the default, lower, frequency. This can
     # save a few seconds on AWS with its very slow table creation, but can
@@ -201,7 +208,7 @@ def list_tables(dynamodb, limit=100):
 # While these transformations are very convenient, they prevent us from
 # checking various *errors* in the format of API parameters, because boto3
 # verifies and/or modifies these parameters for us.
-# So the following contextmanager presents a boto3 client which is modifed
+# So the following contextmanager presents a boto3 client which is modified
 # to *not* do these transformations or validations at all.
 @contextmanager
 def client_no_transform(client):

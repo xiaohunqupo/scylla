@@ -85,6 +85,22 @@
                      "paramType":"path"
                   },
                   {
+                     "name":"flush_memtables",
+                     "description":"Controls flushing of memtables before compaction (true by default). Set to \"false\" to skip automatic flushing of memtables before compaction, e.g. when the table is flushed explicitly before invoking the compaction api.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"consider_only_existing_data",
+                     "description":"Set to \"true\" to flush all memtables and force tombstone garbage collection to check only the sstables being compacted (false by default). The memtable, commitlog and other uncompacted sstables will not be checked during tombstone garbage collection.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
                      "name":"split_output",
                      "description":"true if the output of the major compaction should be split in several sstables",
                      "required":false,
@@ -203,7 +219,7 @@
          "operations":[
             {
                "method":"POST",
-               "summary":"Sets the minumum and maximum number of sstables in queue before compaction kicks off",
+               "summary":"Sets the minimum and maximum number of sstables in queue before compaction kicks off",
                "type":"string",
                "nickname":"set_compaction_threshold",
                "produces":[
@@ -421,6 +437,68 @@
                "summary":"Disable table auto compaction",
                "type":"void",
                "nickname":"disable_auto_compaction",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"name",
+                     "description":"The table name in keyspace:name format",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/column_family/tombstone_gc/{name}",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Check if tombstone GC is enabled for a given table",
+               "type":"boolean",
+               "nickname":"get_tombstone_gc",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"name",
+                     "description":"The table name in keyspace:name format",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  }
+               ]
+            },
+            {
+               "method":"POST",
+               "summary":"Enable tombstone GC for a given table",
+               "type":"void",
+               "nickname":"enable_tombstone_gc",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"name",
+                     "description":"The table name in keyspace:name format",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  }
+               ]
+            },
+            {
+               "method":"DELETE",
+               "summary":"Disable tombstone GC for a given table",
+               "type":"void",
+               "nickname":"disable_tombstone_gc",
                "produces":[
                   "application/json"
                ],

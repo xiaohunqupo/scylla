@@ -3,50 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <stack>
 #include <boost/range/algorithm/heap_algorithm.hpp>
 
-#include "mutation.hh"
 #include "mutation_fragment.hh"
 #include "mutation_fragment_v2.hh"
 #include "clustering_interval_set.hh"
+#include "utils/assert.hh"
 #include "utils/hashing.hh"
 #include "utils/xx_hasher.hh"
-
-std::ostream&
-operator<<(std::ostream& os, const clustering_row::printer& p) {
-    auto& row = p._clustering_row;
-    return os << "{clustering_row: ck " << row._ck << " dr "
-              << deletable_row::printer(p._schema, row._row) << "}";
-}
-
-std::ostream&
-operator<<(std::ostream& os, const static_row::printer& p) {
-    return os << "{static_row: "<< row::printer(p._schema, column_kind::static_column, p._static_row._cells) << "}";
-}
-
-std::ostream&
-operator<<(std::ostream& os, const partition_start& ph) {
-    return os << "{partition_start: pk "<< ph._key << " partition_tombstone " << ph._partition_tombstone << "}";
-}
-
-std::ostream&
-operator<<(std::ostream& os, const partition_end& eop) {
-    return os << "{partition_end}";
-}
-
-std::string_view to_string(partition_region r) {
-    switch (r) {
-        case partition_region::partition_start: return "partition_start";
-        case partition_region::static_row: return "static_row";
-        case partition_region::clustered: return "clustered";
-        case partition_region::partition_end: return "partition_end";
-    }
-    std::abort(); // compiler will error before we reach here
-}
 
 partition_region parse_partition_region(std::string_view s) {
     if (s == "partition_start") {
@@ -62,73 +29,48 @@ partition_region parse_partition_region(std::string_view s) {
     }
 }
 
-std::ostream& operator<<(std::ostream& out, partition_region r) {
-    return out << to_string(r);
-}
-
-std::ostream& operator<<(std::ostream& os, position_in_partition_view::printer p) {
-    auto& pos = p._pipv;
-    fmt::print(os, "{{position: {},", pos._type);
-    if (pos._ck) {
-        fmt::print(os, "{}", clustering_key_prefix::with_schema_wrapper(p._schema, *pos._ck));
-    } else {
-        fmt::print(os, "null");
-    }
-    fmt::print(os, ", {}}}", int32_t(pos._bound_weight));
-    return os;
-}
-
-std::ostream& operator<<(std::ostream& out, position_in_partition_view pos) {
-    out << "{position: " << pos._type << ",";
-    if (pos._ck) {
-        out << *pos._ck;
-    } else {
-        out << "null";
-    }
-    return out << "," << int32_t(pos._bound_weight) << "}";
-}
-
-std::ostream& operator<<(std::ostream& out, const position_in_partition& pos) {
-    return out << static_cast<position_in_partition_view>(pos);
-}
-
-std::ostream& operator<<(std::ostream& out, const position_range& range) {
-    return out << "{" << range.start() << ", " << range.end() << "}";
-}
-
 mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, static_row&& r)
     : _kind(kind::static_row), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_static_row) static_row(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, clustering_row&& r)
     : _kind(kind::clustering_row), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_clustering_row) clustering_row(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, range_tombstone&& r)
     : _kind(kind::range_tombstone), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_range_tombstone) range_tombstone(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, partition_start&& r)
         : _kind(kind::partition_start), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_partition_start) partition_start(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment::mutation_fragment(const schema& s, reader_permit permit, partition_end&& r)
         : _kind(kind::partition_end), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_partition_end) partition_end(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
+}
+
+void mutation_fragment::reset_memory(const schema& s, std::optional<reader_resources> res) {
+    try {
+        _data->_memory.reset_to(res ? *res : reader_resources::with_memory(calculate_memory_usage(s)));
+    } catch (...) {
+        destroy_data();
+        throw;
+    }
 }
 
 void mutation_fragment::destroy_data() noexcept
@@ -156,35 +98,35 @@ mutation_fragment_v2::mutation_fragment_v2(const schema& s, reader_permit permit
     : _kind(kind::static_row), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_static_row) static_row(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment_v2::mutation_fragment_v2(const schema& s, reader_permit permit, clustering_row&& r)
     : _kind(kind::clustering_row), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_clustering_row) clustering_row(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment_v2::mutation_fragment_v2(const schema& s, reader_permit permit, range_tombstone_change&& r)
     : _kind(kind::range_tombstone_change), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_range_tombstone_chg) range_tombstone_change(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment_v2::mutation_fragment_v2(const schema& s, reader_permit permit, partition_start&& r)
         : _kind(kind::partition_start), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_partition_start) partition_start(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 mutation_fragment_v2::mutation_fragment_v2(const schema& s, reader_permit permit, partition_end&& r)
         : _kind(kind::partition_end), _data(std::make_unique<data>(std::move(permit)))
 {
     new (&_data->_partition_end) partition_end(std::move(r));
-    _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
+    reset_memory(s);
 }
 
 void mutation_fragment_v2::destroy_data() noexcept
@@ -208,6 +150,15 @@ void mutation_fragment_v2::destroy_data() noexcept
     }
 }
 
+void mutation_fragment_v2::reset_memory(const schema& s, std::optional<reader_resources> res) {
+    try {
+        _data->_memory.reset_to(res ? *res : reader_resources::with_memory(calculate_memory_usage(s)));
+    } catch (...) {
+        destroy_data();
+        throw;
+    }
+}
+
 namespace {
 
 struct get_key_visitor {
@@ -222,13 +173,13 @@ struct get_key_visitor {
 
 const clustering_key_prefix& mutation_fragment::key() const
 {
-    assert(has_key());
+    SCYLLA_ASSERT(has_key());
     return visit(get_key_visitor());
 }
 
 void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
 {
-    assert(mergeable_with(mf));
+    SCYLLA_ASSERT(mergeable_with(mf));
     switch (_kind) {
     case mutation_fragment::kind::partition_start:
         _data->_partition_start.partition_tombstone().apply(mf._data->_partition_start.partition_tombstone());
@@ -236,12 +187,10 @@ void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
         break;
     case kind::static_row:
         _data->_static_row.apply(s, std::move(mf._data->_static_row));
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
         mf._data->_static_row.~static_row();
         break;
     case kind::clustering_row:
         _data->_clustering_row.apply(s, std::move(mf._data->_clustering_row));
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
         mf._data->_clustering_row.~clustering_row();
         break;
     case mutation_fragment::kind::partition_end:
@@ -251,6 +200,7 @@ void mutation_fragment::apply(const schema& s, mutation_fragment&& mf)
     default: abort();
     }
     mf._data.reset();
+    reset_memory(s);
 }
 
 position_in_partition_view mutation_fragment::position() const
@@ -275,39 +225,46 @@ position_range mutation_fragment::range(const schema& s) const {
     abort();
 }
 
-std::ostream& operator<<(std::ostream& os, mutation_fragment::kind k)
-{
+auto fmt::formatter<mutation_fragment::kind>::format(mutation_fragment::kind k, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    std::string_view name;
     switch (k) {
-    case mutation_fragment::kind::static_row: return os << "static row";
-    case mutation_fragment::kind::clustering_row: return os << "clustering row";
-    case mutation_fragment::kind::range_tombstone: return os << "range tombstone";
-    case mutation_fragment::kind::partition_start: return os << "partition start";
-    case mutation_fragment::kind::partition_end: return os << "partition end";
+    case mutation_fragment::kind::static_row:
+        name = "static row"; break;
+    case mutation_fragment::kind::clustering_row:
+        name = "clustering row"; break;
+    case mutation_fragment::kind::range_tombstone:
+        name = "range tombstone"; break;
+    case mutation_fragment::kind::partition_start:
+        name = "partition start"; break;
+    case mutation_fragment::kind::partition_end:
+        name = "partition end"; break;
     }
-    abort();
+    return fmt::format_to(ctx.out(), "{}", name);
 }
 
-std::ostream& operator<<(std::ostream& os, const mutation_fragment::printer& p) {
+auto fmt::formatter<mutation_fragment::printer>::format(const mutation_fragment::printer& p, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     auto& mf = p._mutation_fragment;
-    os << "{mutation_fragment: " << mf._kind << " " << mf.position() << " ";
-    mf.visit(make_visitor(
-        [&] (const clustering_row& cr) { os << clustering_row::printer(p._schema, cr); },
-        [&] (const static_row& sr) { os << static_row::printer(p._schema, sr); },
-        [&] (const auto& what) -> void { os << what; }
+    auto out = ctx.out();
+    out = fmt::format_to(out, "{{mutation_fragment: {} {} ", mf._kind, mf.position());
+    out = mf.visit(make_visitor(
+        [&] (const clustering_row& cr) { return fmt::format_to(out, "{}", clustering_row::printer(p._schema, cr)); },
+        [&] (const static_row& sr) { return fmt::format_to(out, "{}", static_row::printer(p._schema, sr)); },
+        [&] (const auto& what) { return fmt::format_to(out, "{}", what); }
     ));
-    os << "}";
-    return os;
+    return fmt::format_to(out, "}}");
 }
 
 const clustering_key_prefix& mutation_fragment_v2::key() const
 {
-    assert(has_key());
+    SCYLLA_ASSERT(has_key());
     return visit(get_key_visitor());
 }
 
 void mutation_fragment_v2::apply(const schema& s, mutation_fragment_v2&& mf)
 {
-    assert(mergeable_with(mf));
+    SCYLLA_ASSERT(mergeable_with(mf));
     switch (_kind) {
     case mutation_fragment_v2::kind::partition_start:
         _data->_partition_start.partition_tombstone().apply(mf._data->_partition_start.partition_tombstone());
@@ -315,12 +272,10 @@ void mutation_fragment_v2::apply(const schema& s, mutation_fragment_v2&& mf)
         break;
     case kind::static_row:
         _data->_static_row.apply(s, std::move(mf._data->_static_row));
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
         mf._data->_static_row.~static_row();
         break;
     case kind::clustering_row:
         _data->_clustering_row.apply(s, std::move(mf._data->_clustering_row));
-        _data->_memory.reset(reader_resources::with_memory(calculate_memory_usage(s)));
         mf._data->_clustering_row.~clustering_row();
         break;
     case mutation_fragment_v2::kind::partition_end:
@@ -330,6 +285,7 @@ void mutation_fragment_v2::apply(const schema& s, mutation_fragment_v2&& mf)
     default: abort();
     }
     mf._data.reset();
+    reset_memory(s);
 }
 
 position_in_partition_view mutation_fragment_v2::position() const
@@ -339,26 +295,21 @@ position_in_partition_view mutation_fragment_v2::position() const
 
 std::ostream& operator<<(std::ostream& os, mutation_fragment_v2::kind k)
 {
-    switch (k) {
-    case mutation_fragment_v2::kind::static_row: return os << "static row";
-    case mutation_fragment_v2::kind::clustering_row: return os << "clustering row";
-    case mutation_fragment_v2::kind::range_tombstone_change: return os << "range tombstone change";
-    case mutation_fragment_v2::kind::partition_start: return os << "partition start";
-    case mutation_fragment_v2::kind::partition_end: return os << "partition end";
-    }
-    abort();
+    fmt::print(os, "{}", k);
+    return os;
 }
 
-std::ostream& operator<<(std::ostream& os, const mutation_fragment_v2::printer& p) {
+auto fmt::formatter<mutation_fragment_v2::printer>::format(const mutation_fragment_v2::printer& p, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
     auto& mf = p._mutation_fragment;
-    os << "{mutation_fragment: " << mf._kind << " " << mf.position() << " ";
-    mf.visit(make_visitor(
-        [&] (const clustering_row& cr) { os << clustering_row::printer(p._schema, cr); },
-        [&] (const static_row& sr) { os << static_row::printer(p._schema, sr); },
-        [&] (const auto& what) -> void { os << what; }
+    auto out = ctx.out();
+    out = fmt::format_to(out, "{{mutation_fragment: {} {} ", mf._kind, mf.position());
+    out = mf.visit(make_visitor(
+        [&] (const clustering_row& cr) { return fmt::format_to(out, "{}", clustering_row::printer(p._schema, cr)); },
+        [&] (const static_row& sr) { return fmt::format_to(out, "{}", static_row::printer(p._schema, sr)); },
+        [&] (const auto& what) { return fmt::format_to(out, "{}", what); }
     ));
-    os << "}";
-    return os;
+    return fmt::format_to(out, "}}");
 }
 
 mutation_fragment_opt range_tombstone_stream::do_get_next()
@@ -453,14 +404,6 @@ bool mutation_fragment_v2::relevant_for_range(const schema& s, position_in_parti
         return true;
     }
     return false;
-}
-
-std::ostream& operator<<(std::ostream& out, const range_tombstone_stream& rtl) {
-    return out << rtl._list;
-}
-
-std::ostream& operator<<(std::ostream& out, const clustering_interval_set& set) {
-    return out << "{" << ::join(",\n  ", set) << "}";
 }
 
 template<typename Hasher>

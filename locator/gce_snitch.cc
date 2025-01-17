@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 /*
@@ -12,9 +12,12 @@
 #include <seastar/core/seastar.hh>
 #include "locator/gce_snitch.hh"
 #include <seastar/http/reply.hh>
+#include <seastar/util/closeable.hh>
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
+
+#include "utils/class_registrator.hh"
 
 namespace locator {
 
@@ -39,7 +42,7 @@ future<> gce_snitch::load_config() {
             meta_server_url = _meta_server_url;
         }
 
-        return gce_api_call(std::move(meta_server_url), ZONE_NAME_QUERY_REQ).then([this, meta_server_url] (sstring az) {
+        return gce_api_call(meta_server_url, ZONE_NAME_QUERY_REQ).then([this, meta_server_url] (sstring az) {
             if (az.empty()) {
                 return make_exception_future(std::runtime_error(format("Got an empty zone name from the GCE meta server {}", meta_server_url)));
             }
@@ -77,13 +80,40 @@ future<> gce_snitch::start() {
 }
 
 future<sstring> gce_snitch::gce_api_call(sstring addr, sstring cmd) {
+    return do_with(int(0), [this, addr, cmd] (int& i) {
+        return repeat_until_value([this, addr, cmd, &i]() -> future<std::optional<sstring>> {
+            ++i;
+            return gce_api_call_once(addr, cmd).then([] (auto res) {
+                return make_ready_future<std::optional<sstring>>(std::move(res));
+            }).handle_exception([this, &i] (auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::system_error &e) {
+                    if (i >= GCE_API_CALL_RETRIES - 1) {
+                        logger().error("GCE API call failed: {}. Maximum number of retries exceeded", e.what());
+                        throw e;
+                    } else {
+                        logger().error("GCE API call failed: {}. Will retry in {} seconds", e.what(), std::chrono::duration_cast<std::chrono::seconds>(_gce_api_retry.sleep_time()).count());
+                    }
+                }
+                return _gce_api_retry.retry().then([] {
+                    return make_ready_future<std::optional<sstring>>(std::nullopt);
+                });
+            });
+        });
+    });
+}
+
+future<sstring> gce_snitch::gce_api_call_once(sstring addr, sstring cmd) {
     return seastar::async([addr = std::move(addr), cmd = std::move(cmd)] () -> sstring {
         using namespace boost::algorithm;
 
-        net::inet_address a = seastar::net::dns::resolve_name(addr, net::inet_address::family::INET).get0();
-        connected_socket sd(connect(socket_address(a, 80)).get0());
+        net::inet_address a = seastar::net::dns::resolve_name(addr, net::inet_address::family::INET).get();
+        connected_socket sd(connect(socket_address(a, 80)).get());
         input_stream<char> in(sd.input());
         output_stream<char> out(sd.output());
+        auto close_in = deferred_close(in);
+        auto close_out = deferred_close(out);
         sstring zone_req(seastar::format("GET {} HTTP/1.1\r\nHost: metadata\r\nMetadata-Flavor: Google\r\n\r\n", cmd));
 
         out.write(zone_req).get();
@@ -99,8 +129,8 @@ future<sstring> gce_snitch::gce_api_call(sstring addr, sstring cmd) {
 
         // Read HTTP response header first
         auto rsp = parser.get_parsed_response();
-        if (rsp->_status_code != static_cast<int>(http::reply::status_type::ok)) {
-            throw std::runtime_error(format("Error: HTTP response status {}", rsp->_status_code));
+        if (rsp->_status != http::reply::status_type::ok) {
+            throw std::runtime_error(format("Error: HTTP response status {}", rsp->_status));
         }
 
         auto it = rsp->_headers.find("Content-Length");
@@ -111,15 +141,11 @@ future<sstring> gce_snitch::gce_api_call(sstring addr, sstring cmd) {
         auto content_len = std::stoi(it->second);
 
         // Read HTTP response body
-        temporary_buffer<char> buf = in.read_exactly(content_len).get0();
+        temporary_buffer<char> buf = in.read_exactly(content_len).get();
 
         sstring res(buf.get(), buf.size());
         std::vector<std::string> splits;
         split(splits, res, is_any_of("/"));
-
-        // Close streams
-        out.close().get();
-        in.close().get();
 
         return sstring(splits[splits.size() - 1]);
     });

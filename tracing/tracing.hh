@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
 #include <vector>
-#include <atomic>
 #include <random>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
@@ -19,8 +18,12 @@
 #include "utils/UUID.hh"
 #include "gms/inet_address.hh"
 #include "enum_set.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "seastarx.hh"
+
+namespace service {
+class migration_manager;
+}
 
 namespace cql3 { class query_processor; }
 
@@ -87,8 +90,6 @@ public:
     static span_id make_span_id();
 };
 
-std::ostream& operator<<(std::ostream& os, const span_id& id);
-
 // !!!!IMPORTANT!!!!
 //
 // The enum_set based on this enum is serialized using IDL, therefore new items
@@ -151,8 +152,8 @@ public:
 
     i_tracing_backend_helper(tracing& tr) : _local_tracing(tr) {}
     virtual ~i_tracing_backend_helper() {}
-    virtual future<> start(cql3::query_processor& qp) = 0;
-    virtual future<> stop() = 0;
+    virtual future<> start(cql3::query_processor& qp, service::migration_manager& mm) = 0;
+    virtual future<> shutdown() = 0;
 
     /**
      * Write a bulk of tracing records.
@@ -171,9 +172,10 @@ private:
 };
 
 struct event_record {
-    sstring message;
+    std::string message;
     elapsed_clock::duration elapsed;
     i_tracing_backend_helper::wall_clock::time_point event_time_point;
+    sstring scheduling_group_name = current_scheduling_group().name();
 
     event_record(sstring message_, elapsed_clock::duration elapsed_, i_tracing_backend_helper::wall_clock::time_point event_time_point_)
         : message(std::move(message_))
@@ -201,9 +203,12 @@ private:
     bool _consumed = false;
 
 public:
-    session_record()
+    session_record(trace_type cmd, std::chrono::seconds ttl)
         : username("<unauthenticated request>")
-        , elapsed(-1) {}
+        , command(cmd)
+        , elapsed(-1)
+        , slow_query_record_ttl(ttl)
+    {}
 
     bool ready() const {
         return elapsed.count() >= 0 && !_consumed;
@@ -237,7 +242,8 @@ public:
     span_id parent_id;
     span_id my_span_id;
 
-    one_session_records();
+    one_session_records(trace_type type, std::chrono::seconds slow_query_ttl, std::chrono::seconds slow_query_rec_ttl,
+            std::optional<utils::UUID> session_id = std::nullopt, span_id parent_id = span_id::illegal_id);
 
     /**
      * Consume a single record from the per-shard budget.
@@ -412,13 +418,10 @@ public:
         return !_down;
     }
 
-    static future<> create_tracing(sstring tracing_backend_helper_class_name);
-    static future<> start_tracing(sharded<cql3::query_processor>& qp);
-    static future<> stop_tracing();
     tracing(sstring tracing_backend_helper_class_name);
 
     // Initialize a tracing backend (e.g. tracing_keyspace or logstash)
-    future<> start(cql3::query_processor& qp);
+    future<> start(cql3::query_processor& qp, service::migration_manager& mm);
 
     future<> stop();
 
@@ -524,7 +527,7 @@ public:
      * Checks if there is enough budget for the @param nr new records
      * @param nr number of new records
      *
-     * @return TRUE if there is enough budget, FLASE otherwise
+     * @return TRUE if there is enough budget, FALSE otherwise
      */
     bool have_records_budget(uint64_t nr = 1) {
         // We don't want the total amount of pending, active and flushing records to
@@ -657,3 +660,10 @@ inline span_id span_id::make_span_id() {
     return 1 + (tracing::get_local_tracing_instance().get_next_rand_uint64() << 1);
 }
 }
+
+template <> struct fmt::formatter<tracing::span_id> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const tracing::span_id& id, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", id.get_id());
+    }
+};

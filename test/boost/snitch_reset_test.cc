@@ -3,18 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 
-#include <boost/test/unit_test.hpp>
-#include "locator/gossiping_property_file_snitch.hh"
-#include "utils/fb_utilities.hh"
-#include "test/lib/scylla_test_case.hh"
-#include <seastar/util/std-compat.hh>
-#include <vector>
+#include <filesystem>
 #include <string>
-#include <tuple>
+#include <boost/test/unit_test.hpp>
+#include "locator/snitch_base.hh"
+#include "gms/inet_address.hh"
+#include "test/lib/scylla_test_case.hh"
+#include "seastarx.hh"
 
 namespace fs = std::filesystem;
 
@@ -26,9 +25,6 @@ future<> one_test(const std::string& property_fname1,
     using namespace locator;
     using namespace std::filesystem;
 
-    utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
-    utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
-
     printf("Testing %s and %s property files. Expected result is %s\n",
            property_fname1.c_str(), property_fname2.c_str(),
            (exp_result ? "success" : "failure"));
@@ -38,8 +34,8 @@ future<> one_test(const std::string& property_fname1,
         auto cpu0_rack = make_lw_shared<sstring>();
         auto cpu0_dc_new = make_lw_shared<sstring>();
         auto cpu0_rack_new = make_lw_shared<sstring>();
-        auto my_address = utils::fb_utilities::get_broadcast_address();
         sharded<snitch_ptr> snitch;
+        auto my_address = gms::inet_address("localhost");
 
         try {
             path fname1(test_files_subdir);
@@ -52,6 +48,8 @@ future<> one_test(const std::string& property_fname1,
                 snitch_config cfg;
                 cfg.name = "org.apache.cassandra.locator.GossipingPropertyFileSnitch";
                 cfg.properties_file_name = fname1.string();
+                cfg.listen_address = my_address;
+                cfg.broadcast_address = my_address;
                 snitch.start(cfg).get();
                 snitch.invoke_on_all(&snitch_ptr::start).get();
             } catch (std::exception& e) {
@@ -61,7 +59,7 @@ future<> one_test(const std::string& property_fname1,
             }
 
             snitch.invoke_on(0,
-                    [cpu0_dc, cpu0_rack, my_address] (snitch_ptr& inst) {
+                    [cpu0_dc, cpu0_rack] (snitch_ptr& inst) {
                 *cpu0_dc =inst->get_datacenter();
                 *cpu0_rack = inst->get_rack();
             }).get();
@@ -82,7 +80,7 @@ future<> one_test(const std::string& property_fname1,
 
             // Check that the returned DC and Rack values are different now
             snitch.invoke_on(0,
-                    [cpu0_dc_new, cpu0_rack_new, my_address] (snitch_ptr& inst) {
+                    [cpu0_dc_new, cpu0_rack_new] (snitch_ptr& inst) {
                 *cpu0_dc_new =inst->get_datacenter();
                 *cpu0_rack_new = inst->get_rack();
             }).get();
@@ -95,7 +93,7 @@ future<> one_test(const std::string& property_fname1,
 
             // Check that the new DC and Rack values have been propagated to all CPUs
             snitch.invoke_on_all(
-                    [cpu0_dc_new, cpu0_rack_new, res, my_address] (snitch_ptr& inst) {
+                    [cpu0_dc_new, cpu0_rack_new, res] (snitch_ptr& inst) {
                 if (*cpu0_dc_new != inst->get_datacenter() ||
                     *cpu0_rack_new != inst->get_rack()) {
                     *res = false;
@@ -117,7 +115,7 @@ future<> one_test(const std::string& property_fname1,
                 // despite the insuccessful reset_snitch() call.
                 //
                 snitch.invoke_on(0,
-                        [cpu0_dc_new, cpu0_rack_new, my_address] (snitch_ptr& inst) {
+                        [cpu0_dc_new, cpu0_rack_new] (snitch_ptr& inst) {
                     *cpu0_dc_new =inst->get_datacenter();
                     *cpu0_rack_new = inst->get_rack();
                 }).get();

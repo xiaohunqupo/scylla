@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -32,10 +32,8 @@ public:
 
     virtual seastar::future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    virtual void validate(query_processor&, const service::client_state& state) const override;
-
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-    execute(query_processor& qp, service::query_state& state, const query_options& options) const override;
+    execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
 };
 
 }

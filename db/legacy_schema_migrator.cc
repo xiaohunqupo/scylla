@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 // Since Scylla 2.0, we use system tables whose schemas were introduced in
@@ -32,7 +32,6 @@
 #include "schema/schema_builder.hh"
 #include "service/storage_proxy.hh"
 #include "utils/rjson.hh"
-#include "utils/fmt-compat.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/untyped_result_set.hh"
 #include "cql3/util.hh"
@@ -49,14 +48,14 @@ class migrator {
 public:
     static const std::unordered_set<sstring> legacy_schema_tables;
 
-    migrator(sharded<service::storage_proxy>& sp, sharded<replica::database>& db, cql3::query_processor& qp)
-                    : _sp(sp), _db(db), _qp(qp) {
+    migrator(sharded<service::storage_proxy>& sp, sharded<replica::database>& db, sharded<db::system_keyspace>& sys_ks, cql3::query_processor& qp)
+                    : _sp(sp), _db(db), _sys_ks(sys_ks), _qp(qp) {
     }
     migrator(migrator&&) = default;
 
     typedef db_clock::time_point time_point;
 
-    // TODO: we dont't support triggers.
+    // TODO: we don't support triggers.
     // this is a placeholder.
     struct trigger {
         time_point timestamp;
@@ -138,10 +137,10 @@ public:
                         db::schema_tables::legacy::read_table_mutations(_sp, dst.name, cf_name, db::system_keyspace::legacy::column_families()))
                     .then([&dst, cf_name, timestamp](result_tuple&& t) {
 
-            result_set_type tables = std::get<0>(t).get0();
-            result_set_type columns = std::get<1>(t).get0();
-            result_set_type triggers = std::get<2>(t).get0();
-            db::schema_tables::legacy::schema_mutations sm = std::get<3>(t).get0();
+            result_set_type tables = std::get<0>(t).get();
+            result_set_type columns = std::get<1>(t).get();
+            result_set_type triggers = std::get<2>(t).get();
+            db::schema_tables::legacy::schema_mutations sm = std::get<3>(t).get();
 
             row_type& td = tables->one();
 
@@ -357,12 +356,6 @@ public:
                 builder.set_regular_column_name_type(db::schema_tables::parse_type(comparator));
             }
 
-            if (td.has("read_repair_chance")) {
-                builder.set_read_repair_chance(td.get_as<double>("read_repair_chance"));
-            }
-            if (td.has("local_read_repair_chance")) {
-                builder.set_dc_local_read_repair_chance(td.get_as<double>("local_read_repair_chance"));
-            }
             if (td.has("gc_grace_seconds")) {
                 builder.set_gc_grace_seconds(td.get_as<int32_t>("gc_grace_seconds"));
             }
@@ -392,9 +385,9 @@ public:
                 try {
                     builder.set_compaction_strategy(sstables::compaction_strategy::type(strategy));
                 } catch (const exceptions::configuration_exception& e) {
-                    // If compaction strategy class isn't supported, fallback to size tiered.
-                    mlogger.warn("Falling back to size-tiered compaction strategy after the problem: {}", e.what());
-                    builder.set_compaction_strategy(sstables::compaction_strategy_type::size_tiered);
+                    // If compaction strategy class isn't supported, fallback to incremental.
+                    mlogger.warn("Falling back to incremental compaction strategy after the problem: {}", e.what());
+                    builder.set_compaction_strategy(sstables::compaction_strategy_type::incremental);
                 }
             }
             if (td.has("compaction_strategy_options")) {
@@ -448,7 +441,7 @@ public:
         // TODO: Unfortunately there is not a single REGULAR column in system.schema_usertypes, so annoyingly we cannot
         // use the writeTime() CQL function, and must resort to a lower level.
         // Origin digs up the actual cells of target partition and gets timestamp from there.
-        // We should do the same, but g-dam thats messy. Lets give back dung value for now.
+        // We should do the same, but g-dam that's messy. Lets give back dung value for now.
         return make_ready_future<time_point>(dst.timestamp);
     }
 
@@ -535,7 +528,7 @@ public:
         mlogger.info("Dropping legacy schema tables");
         auto with_snapshot = !_keyspaces.empty();
         return parallel_for_each(legacy_schema_tables, [this, with_snapshot](const sstring& cfname) {
-            return replica::database::drop_table_on_all_shards(_db, db::system_keyspace::NAME, cfname, with_snapshot);
+            return replica::database::drop_table_on_all_shards(_db, _sys_ks, db::system_keyspace::NAME, cfname, with_snapshot);
         });
     }
 
@@ -549,6 +542,7 @@ public:
             auto ksm = ::make_lw_shared<keyspace_metadata>(ks.name
                             , ks.replication_params["class"] // TODO, make ksm like c3?
                             , ks.replication_params
+                            , std::nullopt
                             , ks.durable_writes);
 
             // we want separate time stamps for tables/types, so cannot bulk them into the ksm.
@@ -582,6 +576,7 @@ public:
 
     sharded<service::storage_proxy>& _sp;
     sharded<replica::database>& _db;
+    sharded<db::system_keyspace>& _sys_ks;
     cql3::query_processor& _qp;
     std::vector<keyspace> _keyspaces;
 };
@@ -600,7 +595,7 @@ const std::unordered_set<sstring> migrator::legacy_schema_tables = {
 }
 
 future<>
-db::legacy_schema_migrator::migrate(sharded<service::storage_proxy>& sp, sharded<replica::database>& db, cql3::query_processor& qp) {
-    return do_with(migrator(sp, db, qp), std::bind(&migrator::migrate, std::placeholders::_1));
+db::legacy_schema_migrator::migrate(sharded<service::storage_proxy>& sp, sharded<replica::database>& db, sharded<db::system_keyspace>& sys_ks, cql3::query_processor& qp) {
+    return do_with(migrator(sp, db, sys_ks, qp), std::bind(&migrator::migrate, std::placeholders::_1));
 }
 

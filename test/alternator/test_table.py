@@ -1,17 +1,21 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 
 # Tests for basic table operations: CreateTable, DeleteTable, ListTables.
 # Also some basic tests for UpdateTable - although UpdateTable usually
 # enables more elaborate features (such as GSI or Streams) and those are
 # tested elsewhere.
 
-import pytest
-import time
 import threading
+import time
+from re import fullmatch
+
+import pytest
 from botocore.exceptions import ClientError
-from util import list_tables, unique_table_name, create_test_table, random_string, new_test_table
+
+from test.alternator.util import list_tables, unique_table_name, create_test_table, random_string, new_test_table, is_aws
+
 
 # Utility function for create a table with a given name and some valid
 # schema.. This function initiates the table's creation, but doesn't
@@ -182,6 +186,60 @@ def test_create_table_invalid_schema(dynamodb):
                 { 'AttributeName': 'k', 'AttributeType': 'Q' }
             ],
         )
+
+# Another case of an invalid schema is repeating the same AttributeName
+# twice in AttributeDefinitions. DynamoDB has no way of knowing which of
+# the two definitions was intended.
+# Reproduces #13870
+def test_create_table_duplicate_attribute_name(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException.*uplicate.*xyz'):
+        dynamodb.create_table(
+            TableName='name_doesnt_matter',
+            BillingMode='PAY_PER_REQUEST',
+            KeySchema=[
+                { 'AttributeName': 'xyz', 'KeyType': 'HASH' },
+            ],
+            AttributeDefinitions=[
+                { 'AttributeName': 'xyz', 'AttributeType': 'S' },
+                { 'AttributeName': 'xyz', 'AttributeType': 'N' }
+            ],
+        )
+
+# In addition to the specific AttributeDefinitions error reported in
+# issue #13870, there are other ways which AttributeDefinitions can be
+# invalid - let's check they are detected correctly:
+def test_create_table_invalid_attribute_definitions(dynamodb):
+    # Missing "AttributeName" in one of the members of AttributeDefinitions.
+    # DynamoDB prints a rather ugly error message: "1 validation error
+    # detected: Value null at 'attributeDefinitions.1.member.attributeName'
+    # failed to satisfy constraint: Member must not be null".
+    with pytest.raises(ClientError, match='ValidationException.*ttributeName'):
+        dynamodb.create_table(
+            TableName='name_doesnt_matter',
+            BillingMode='PAY_PER_REQUEST',
+            KeySchema=[
+                { 'AttributeName': 'xyz', 'KeyType': 'HASH' },
+            ],
+            AttributeDefinitions=[
+                { 'AttributeType': 'S' }, # missing AttributeName
+            ],
+        )
+    # Missing "AttributeType" in one of the members of AttributeDefinitions.
+    with pytest.raises(ClientError, match='ValidationException.*ttributeType'):
+        dynamodb.create_table(
+            TableName='name_doesnt_matter',
+            BillingMode='PAY_PER_REQUEST',
+            KeySchema=[
+                { 'AttributeName': 'xyz', 'KeyType': 'HASH' },
+            ],
+            AttributeDefinitions=[
+                { 'AttributeName': 'xyz' }, # missing AttributeType
+            ],
+        )
+
+    # I'm not sure why, but even though we tried to disable boto3's parameter
+    # validation in conftest.py, boto3 still doesn't us test the case of
+    # extra fields in AttributeDefinitions, and catches such errors itself.
 
 # Test that trying to create a table that already exists fails in the
 # appropriate way (ResourceInUseException)
@@ -366,7 +424,7 @@ def test_list_tables_wrong_limit(dynamodb):
 # Reproduces issue #7031.
 def test_table_sse_off(dynamodb):
     # If StreamSpecification is given, but has StreamEnabled=false, it's as
-    # if StreamSpecification was missing, and fine. No other attribues are
+    # if StreamSpecification was missing, and fine. No other attributes are
     # necessary.
     table = create_test_table(dynamodb, SSESpecification = {'Enabled': False},
         KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
@@ -394,10 +452,9 @@ def test_update_table_non_existent(dynamodb, test_table):
 # fixture. When consistent mode becomes the default, this fixture can be removed.
 @pytest.fixture(scope="session")
 def check_pre_consistent_cluster_management(dynamodb):
-    from util import is_aws
     # If not running on Scylla, return false.
     if is_aws(dynamodb):
-        return false
+        return False
     # In Scylla, we check Raft mode by inspecting the configuration via a
     # system table (which is also visible in Alternator)
     config_table = dynamodb.Table('.scylla.alternator.system.config')
@@ -428,7 +485,7 @@ def fails_without_consistent_cluster_management(request, check_pre_consistent_cl
 # InternalServerError) in the *middle* of the table creation or deletion.
 # Such a failure may even leave behind some half-created table.
 #
-# NOTE: This test, like all cql-pytest tests, runs on a single node. So it
+# NOTE: This test, like all cqlpy tests, runs on a single node. So it
 # doesn't exercise the most general possibility that two concurrent schema
 # modifications from two different coordinators collide. So multi-node
 # tests will be needed to check for that potential problem as well.
@@ -552,3 +609,99 @@ def test_concurrent_create_and_delete_table(dynamodb, table_def, fails_without_c
                     time.sleep(1)
                     continue
                 raise
+
+# Test that DeleteTable returns correct TableDescription (issue #11472)
+def test_delete_table_description(dynamodb):
+    table_name = unique_table_name()
+
+    table = create_table(dynamodb, table_name)
+    table.meta.client.get_waiter('table_exists').wait(TableName=table_name)
+    got = table.delete()['TableDescription']
+
+    assert got['TableName'] == table_name
+    assert got['TableStatus'] == 'DELETING'
+    assert 'TableId' in got
+    assert fullmatch('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', got['TableId'])
+
+    assert 'TableArn' in got and got['TableArn'].startswith('arn:')
+
+    assert not 'CreationDateTime' in got
+    assert not 'KeySchema' in got 
+    assert not 'AttributeDefinitions' in got
+
+    assert got['BillingModeSummary']['BillingMode'] == 'PAY_PER_REQUEST'
+    assert 'LastUpdateToPayPerRequestDateTime' in got['BillingModeSummary']
+    assert got['BillingModeSummary']['LastUpdateToPayPerRequestDateTime'] != None
+
+    assert got['ProvisionedThroughput']['NumberOfDecreasesToday'] == 0
+    assert got['ProvisionedThroughput']['WriteCapacityUnits'] == 0
+    assert got['ProvisionedThroughput']['ReadCapacityUnits'] == 0
+
+# Test that DeleteTable returns correct TableDescription (issue #11472) and has no not implemented fields (see #5026 issue)
+# after any field implementation move its testing code to the 'test_delete_table_description' test
+@pytest.mark.xfail(reason="#5026: TableDescription still doesn't implement these fields")
+def test_delete_table_description_missing_fields(dynamodb):
+    table_name = unique_table_name()
+
+    table = create_table(dynamodb, table_name)
+    table.meta.client.get_waiter('table_exists').wait(TableName=table_name)
+    got = table.delete()['TableDescription']
+
+    assert 'TableSizeBytes' in got
+    assert 'ItemCount' in got    
+
+# Above in test_delete_table_description() we tested the correctness of the
+# return value of DeleteTable, and in particular that it doesn't include all
+# the fields available in DescribeTable. The table in that test did not have
+# secondary indexes, so in the following test we check the case of a table
+# which does have secondary indexes. We note that whereas DescribeTable
+# returns a description of the indexes (in fields "GlobalSecondaryIndexes"
+# and "LocalSecondaryIndexes"), DeleteTable doesn't.
+def test_delete_table_description_with_si(dynamodb):
+    table = create_test_table(dynamodb,
+        KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'},
+                   {'AttributeName': 'c', 'KeyType': 'RANGE'}],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' },
+                               { 'AttributeName': 'c', 'AttributeType': 'S' },
+                               { 'AttributeName': 'x', 'AttributeType': 'S' }],
+        GlobalSecondaryIndexes=[
+            {   'IndexName': 'hello',
+                'KeySchema': [{ 'AttributeName': 'x', 'KeyType': 'HASH' }],
+                'Projection': { 'ProjectionType': 'ALL' }
+            }],
+        LocalSecondaryIndexes=[
+            {   'IndexName': 'hithere',
+                'KeySchema': [{'AttributeName': 'p', 'KeyType': 'HASH'},
+                              {'AttributeName': 'x', 'KeyType': 'RANGE'}],
+                'Projection': { 'ProjectionType': 'ALL' }
+            }]
+    )
+    # Check that DescribeTable returns the table's KeySchema,
+    # AttributeDefinitions, GlobalSecondaryIndexes and LocalSecondaryIndexes,
+    # but DeleteTable does *not* return those, even though it could.
+    got_describe = table.meta.client.describe_table(TableName=table.name)['Table']
+    got_delete = table.delete()['TableDescription']
+    assert got_describe['TableName'] == table.name
+    assert got_delete['TableName'] == table.name
+    for i in ['KeySchema', 'AttributeDefinitions', 'GlobalSecondaryIndexes', 'LocalSecondaryIndexes']:
+        assert i in got_describe
+        assert not i in got_delete
+
+# Test that CreateTable rejects spurious entries in AttributeDefinitions
+# (entries which aren't used as a key of the table or any GSI or LSI).
+# Reproduces issue #19784.
+def test_create_table_spurious_attribute_definitions(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException.*AttributeDefinitions'):
+        with new_test_table(dynamodb,
+            KeySchema=[{ 'AttributeName': 'p', 'KeyType': 'HASH' }],
+            AttributeDefinitions=[{ 'AttributeName': 'p', 'AttributeType': 'S' },
+                                  { 'AttributeName': 'c', 'AttributeType': 'S' }]) as table:
+                pass
+
+# Currently, because of incomplete LWT support, Alternator tables do not use
+# tablets by default - even if the tablets experimental feature is enabled.
+# This test enshrines this fact - that an Alternator table doesn't use tablets.
+# This is a temporary test: When we reverse this decision and tablets go back
+# to being used by default on Alternator tables, this test should be deleted.
+def test_alternator_doesnt_use_tablets(dynamodb, has_tablets):
+    assert not has_tablets

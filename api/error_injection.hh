@@ -3,15 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "api.hh"
+#include "api/api_init.hh"
 
 namespace api {
 
-void set_error_injection(http_context& ctx, routes& r);
+void set_error_injection(http_context& ctx, httpd::routes& r);
 
 }

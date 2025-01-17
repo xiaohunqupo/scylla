@@ -3,25 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
-#include "dht/i_partitioner.hh"
-#include "readers/flat_mutation_reader_fwd.hh"
+#include "dht/i_partitioner_fwd.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "readers/mutation_reader.hh"
 #include "schema/schema_fwd.hh"
 #include "seastarx.hh"
-
-namespace seastar {
-class io_priority_class;
-}
 
 class reader_permit;
 class mutation_source;
 
 namespace tracing {
 class trace_state_ptr;
+}
+
+namespace query {
+class partition_slice;
 }
 
 /// Make an auto-paused evictable reader.
@@ -35,21 +36,20 @@ class trace_state_ptr;
 /// transparent to its user.
 /// Parameters passed by reference have to be kept alive while the reader is
 /// alive.
-flat_mutation_reader_v2 make_auto_paused_evictable_reader_v2(
+mutation_reader make_auto_paused_evictable_reader_v2(
         mutation_source ms,
         schema_ptr schema,
         reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& ps,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         mutation_reader::forwarding fwd_mr);
 
 class evictable_reader_v2;
 
 class evictable_reader_handle_v2 {
-    friend std::pair<flat_mutation_reader_v2, evictable_reader_handle_v2> make_manually_paused_evictable_reader_v2(mutation_source, schema_ptr, reader_permit,
-            const dht::partition_range&, const query::partition_slice&, const io_priority_class&, tracing::trace_state_ptr, mutation_reader::forwarding);
+    friend std::pair<mutation_reader, evictable_reader_handle_v2> make_manually_paused_evictable_reader_v2(mutation_source, schema_ptr, reader_permit,
+            const dht::partition_range&, const query::partition_slice&, tracing::trace_state_ptr, mutation_reader::forwarding);
 
 private:
     evictable_reader_v2* _r;
@@ -72,12 +72,11 @@ public:
 /// transparent to its user.
 /// Parameters passed by reference have to be kept alive while the reader is
 /// alive.
-std::pair<flat_mutation_reader_v2, evictable_reader_handle_v2> make_manually_paused_evictable_reader_v2(
+std::pair<mutation_reader, evictable_reader_handle_v2> make_manually_paused_evictable_reader_v2(
         mutation_source ms,
         schema_ptr schema,
         reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& ps,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         mutation_reader::forwarding fwd_mr);

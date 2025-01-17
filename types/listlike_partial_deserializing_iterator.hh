@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -13,7 +13,7 @@
 #include "utils/fragment_range.hh"
 #include "utils/managed_bytes.hh"
 #include "exceptions/exceptions.hh"
-#include "types.hh"
+#include "types/types.hh"
 
 int read_collection_size(bytes_view& in);
 bytes_view read_collection_key(bytes_view& in);
@@ -96,9 +96,6 @@ public:
     }
     bool operator==(const listlike_partial_deserializing_iterator& x) const {
         return _remain == x._remain;
-    }
-    bool operator!=(const listlike_partial_deserializing_iterator& x) const {
-        return _remain != x._remain;
     }
     static listlike_partial_deserializing_iterator begin(managed_bytes_view& in) {
         return { in };

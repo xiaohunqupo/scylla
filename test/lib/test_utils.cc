@@ -3,17 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "test/lib/test_utils.hh"
 
+#include <seastar/util/file.hh>
 #include <boost/range/adaptor/map.hpp>
-#include <boost/range/algorithm/sort.hpp>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/util/backtrace.hh>
 #include "test/lib/log.hh"
 #include "test/lib/simple_schema.hh"
+#include "utils/to_string.hh"
 #include "seastarx.hh"
 #include <random>
 
@@ -21,13 +22,13 @@ namespace tests {
 
 namespace {
 
-std::string format_msg(std::string_view test_function_name, bool ok, std::source_location sl, std::string_view msg) {
+std::string format_msg(std::string_view test_function_name, bool ok, seastar::compat::source_location sl, std::string_view msg) {
     return fmt::format("{}(): {} @ {}() {}:{:d}{}{}", test_function_name, ok ? "OK" : "FAIL", sl.function_name(), sl.file_name(), sl.line(), msg.empty() ? "" : ": ", msg);
 }
 
 }
 
-bool do_check(bool condition, std::source_location sl, std::string_view msg) {
+bool do_check(bool condition, seastar::compat::source_location sl, std::string_view msg) {
     if (condition) {
         testlog.trace("{}", format_msg(__FUNCTION__, condition, sl, msg));
     } else {
@@ -36,7 +37,7 @@ bool do_check(bool condition, std::source_location sl, std::string_view msg) {
     return condition;
 }
 
-void do_require(bool condition, std::source_location sl, std::string_view msg) {
+void do_require(bool condition, seastar::compat::source_location sl, std::string_view msg) {
     if (condition) {
         testlog.trace("{}", format_msg(__FUNCTION__, condition, sl, msg));
     } else {
@@ -47,8 +48,19 @@ void do_require(bool condition, std::source_location sl, std::string_view msg) {
 
 }
 
-void fail(std::string_view msg, std::source_location sl) {
+void fail(std::string_view msg, seastar::compat::source_location sl) {
     throw_with_backtrace<std::runtime_error>(format_msg(__FUNCTION__, false, sl, msg));
+}
+
+
+extern boost::test_tools::assertion_result has_scylla_test_env(boost::unit_test::test_unit_id) {
+    if (::getenv("SCYLLA_TEST_ENV")) {
+        return true;
+    }
+
+    testlog.info("Test environment is not configured. "
+        "Check test/pylib/minio_server.py for an example of how to configure the environment for it to run.");
+    return false;
 }
 
 }
@@ -71,4 +83,21 @@ sstring make_random_numeric_string(size_t size) {
         b = dist(rng);
     }
     return str;
+}
+
+namespace tests {
+
+future<bool> compare_files(std::string fa, std::string fb) {
+    auto cont_a = co_await util::read_entire_file_contiguous(fa);
+    auto cont_b = co_await util::read_entire_file_contiguous(fb);
+    co_return cont_a == cont_b;
+}
+
+future<> touch_file(std::string name) {
+    auto f = co_await open_file_dma(name, open_flags::create);
+    co_await f.close();
+}
+
+std::mutex boost_logger_mutex;
+
 }

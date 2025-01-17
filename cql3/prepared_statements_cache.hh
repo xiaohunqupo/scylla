@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -14,6 +14,7 @@
 #include "utils/hash.hh"
 #include "cql3/statements/prepared_statement.hh"
 #include "cql3/column_specification.hh"
+#include "cql3/dialect.hh"
 
 namespace cql3 {
 
@@ -27,50 +28,43 @@ struct prepared_cache_entry_size {
 };
 
 typedef bytes cql_prepared_id_type;
-typedef int32_t thrift_prepared_id_type;
 
 /// \brief The key of the prepared statements cache
 ///
-/// We are going to store the CQL and Thrift prepared statements in the same cache therefore we need generate the key
-/// that is going to be unique in both cases. Thrift use int32_t as a prepared statement ID, CQL - MD5 digest.
-///
-/// We are going to use an std::pair<CQL_PREP_ID_TYPE, int64_t> as a key. For CQL statements we will use {CQL_PREP_ID, std::numeric_limits<int64_t>::max()} as a key
-/// and for Thrift - {CQL_PREP_ID_TYPE(0), THRIFT_PREP_ID}. This way CQL and Thrift keys' values will never collide.
+/// TODO: consolidate prepared_cache_key_type and the nested cache_key_type
+///       the latter was introduced for unifying the CQL and Thrift prepared
+///       statements so that they can be stored in the same cache.
 class prepared_cache_key_type {
 public:
-    using cache_key_type = std::pair<cql_prepared_id_type, int64_t>;
+    // derive from cql_prepared_id_type so we can customize the formatter of
+    // cache_key_type
+    struct cache_key_type : public cql_prepared_id_type {
+        cache_key_type(cql_prepared_id_type&& id, cql3::dialect d) : cql_prepared_id_type(std::move(id)), dialect(d) {}
+        cql3::dialect dialect; // Not part of hash, but we don't expect collisions because of that
+        bool operator==(const cache_key_type& other) const = default;
+    };
 
 private:
     cache_key_type _key;
 
 public:
-    prepared_cache_key_type() = default;
-    explicit prepared_cache_key_type(cql_prepared_id_type cql_id) : _key(std::move(cql_id), std::numeric_limits<int64_t>::max()) {}
-    explicit prepared_cache_key_type(thrift_prepared_id_type thrift_id) : _key(cql_prepared_id_type(), thrift_id) {}
+    explicit prepared_cache_key_type(cql_prepared_id_type cql_id, dialect d) : _key(std::move(cql_id), d) {}
 
     cache_key_type& key() { return _key; }
     const cache_key_type& key() const { return _key; }
 
     static const cql_prepared_id_type& cql_id(const prepared_cache_key_type& key) {
-        return key.key().first;
-    }
-    static thrift_prepared_id_type thrift_id(const prepared_cache_key_type& key) {
-        return key.key().second;
+        return key.key();
     }
 
-    bool operator==(const prepared_cache_key_type& other) const {
-        return _key == other._key;
-    }
-
-    bool operator!=(const prepared_cache_key_type& other) const {
-        return !(*this == other);
-    }
+    bool operator==(const prepared_cache_key_type& other) const = default;
 };
 
 class prepared_statements_cache {
 public:
     struct stats {
         uint64_t prepared_cache_evictions = 0;
+        uint64_t privileged_entries_evictions_on_size = 0;
         uint64_t unprivileged_entries_evictions_on_size = 0;
     };
 
@@ -86,6 +80,9 @@ public:
         static void inc_evictions() noexcept {
             ++shard_stats().prepared_cache_evictions;
         }
+        static void inc_privileged_on_cache_size_eviction() noexcept {
+            ++shard_stats().privileged_entries_evictions_on_size;
+        }
         static void inc_unprivileged_on_cache_size_eviction() noexcept {
             ++shard_stats().unprivileged_entries_evictions_on_size;
         }
@@ -100,7 +97,7 @@ private:
     //
     // Therefore a typical "pollution" (when a cache entry is used only once) would involve
     // 2 cache hits.
-    using cache_type = utils::loading_cache<cache_key_type, prepared_cache_entry, 2, utils::loading_cache_reload_enabled::no, prepared_cache_entry_size, utils::tuple_hash, std::equal_to<cache_key_type>, prepared_cache_stats_updater, prepared_cache_stats_updater>;
+    using cache_type = utils::loading_cache<cache_key_type, prepared_cache_entry, 2, utils::loading_cache_reload_enabled::no, prepared_cache_entry_size, std::hash<cache_key_type>, std::equal_to<cache_key_type>, prepared_cache_stats_updater, prepared_cache_stats_updater>;
     using cache_value_ptr = typename cache_type::value_ptr;
     using checked_weak_ptr = typename statements::prepared_statement::checked_weak_ptr;
 
@@ -128,7 +125,7 @@ public:
 
     // "Touch" the corresponding cache entry in order to bump up its reference count.
     void touch(const key_type& key) {
-        // loading_cache::find() returns a value_ptr object which contructor does the "thouching".
+        // loading_cache::find() returns a value_ptr object which constructor does the "thouching".
         _cache.find(key.key());
     }
 
@@ -162,21 +159,34 @@ public:
 };
 }
 
-namespace std { // for prepared_statements_cache log printouts
-inline std::ostream& operator<<(std::ostream& os, const typename cql3::prepared_cache_key_type::cache_key_type& p) {
-    os << "{cql_id: " << p.first << ", thrift_id: " << p.second << "}";
-    return os;
-}
+namespace std {
 
-inline std::ostream& operator<<(std::ostream& os, const cql3::prepared_cache_key_type& p) {
-    os << p.key();
-    return os;
-}
+template<>
+struct hash<cql3::prepared_cache_key_type::cache_key_type> final {
+    size_t operator()(const cql3::prepared_cache_key_type::cache_key_type& k) const {
+        return std::hash<cql3::cql_prepared_id_type>()(k);
+    }
+};
 
 template<>
 struct hash<cql3::prepared_cache_key_type> final {
     size_t operator()(const cql3::prepared_cache_key_type& k) const {
-        return utils::tuple_hash()(k.key());
+        return std::hash<cql3::cql_prepared_id_type>()(k.key());
     }
 };
 }
+
+// for prepared_statements_cache log printouts
+template <> struct fmt::formatter<cql3::prepared_cache_key_type::cache_key_type> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const cql3::prepared_cache_key_type::cache_key_type& p, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{cql_id: {}, dialect: {}}}", static_cast<const cql3::cql_prepared_id_type&>(p), p.dialect);
+    }
+};
+
+template <> struct fmt::formatter<cql3::prepared_cache_key_type> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const cql3::prepared_cache_key_type& p, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", p.key());
+    }
+};

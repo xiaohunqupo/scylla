@@ -3,19 +3,27 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #ifndef SCYLLA_BUILD_MODE_RELEASE
 
 #pragma once
 
-#include "api.hh"
-#include "db/config.hh"
+#include <seastar/core/sharded.hh>
+
+namespace tasks {
+class task_manager;
+}
+
+namespace seastar::httpd {
+class routes;
+}
 
 namespace api {
-
-void set_task_manager_test(http_context& ctx, routes& r, db::config& cfg);
+struct http_context;
+void set_task_manager_test(http_context& ctx, seastar::httpd::routes& r, seastar::sharded<tasks::task_manager>& tm);
+void unset_task_manager_test(http_context& ctx, seastar::httpd::routes& r);
 
 }
 

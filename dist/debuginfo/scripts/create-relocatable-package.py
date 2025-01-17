@@ -5,17 +5,14 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import argparse
-import io
 import os
 import subprocess
 import tarfile
-import pathlib
-import shutil
-
+import tempfile
 
 RELOC_PREFIX='scylla-debuginfo'
 def reloc_add(self, name, arcname=None, recursive=True, *, filter=None):
@@ -35,14 +32,16 @@ def reloc_add(ar, name, arcname=None):
 ap = argparse.ArgumentParser(description='Create a relocatable scylla-debuginfo package.')
 ap.add_argument('dest',
                 help='Destination file (tar format)')
-ap.add_argument('--mode', dest='mode', default='release',
-                help='Build mode (debug/release) to use')
+ap.add_argument('--build-dir', default='build/release',
+                help='Build dir ("build/debug" or "build/release") to use')
+ap.add_argument('--node-exporter-dir', default='build/node_exporter',
+                help='the directory where node_exporter is located')
 
 args = ap.parse_args()
 
 executables_scylla = [
-                'build/{}/scylla'.format(args.mode),
-                'build/{}/iotune'.format(args.mode)]
+                '{}/scylla'.format(args.build_dir),
+                '{}/iotune'.format(args.build_dir)]
 
 output = args.dest
 
@@ -56,16 +55,15 @@ gzip_process = subprocess.Popen("pigz > "+output, shell=True, stdin=subprocess.P
 
 ar = tarfile.open(fileobj=gzip_process.stdin, mode='w|')
 # relocatable package format version = 2.1
-shutil.rmtree(f'build/{SCYLLA_DIR}', ignore_errors=True)
-os.makedirs(f'build/{SCYLLA_DIR}')
-with open(f'build/{SCYLLA_DIR}/.relocatable_package_version', 'w') as f:
-    f.write('2.1\n')
-ar.add(f'build/{SCYLLA_DIR}/.relocatable_package_version', arcname='.relocatable_package_version')
+with tempfile.NamedTemporaryFile('w+t') as version_file:
+    version_file.write('2.1\n')
+    version_file.flush()
+    ar.add(version_file.name, arcname='.relocatable_package_version')
 
 for exe in executables_scylla:
     basename = os.path.basename(exe)
     ar.reloc_add(f'{exe}.debug', arcname=f'libexec/.debug/{basename}.debug')
-ar.reloc_add('build/node_exporter/node_exporter.debug', arcname='node_exporter/.debug/node_exporter.debug')
+ar.reloc_add(f'{args.node_exporter_dir}/node_exporter.debug', arcname='node_exporter/.debug/node_exporter.debug')
 ar.reloc_add('dist/debuginfo/install.sh', arcname='install.sh')
 
 # Complete the tar output, and wait for the gzip process to complete

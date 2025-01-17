@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "cql3/type_json.hh"
@@ -72,7 +72,7 @@ static sstring quote_json_string(const sstring& value) {
         }
     }
     oss.put('"');
-    return oss.str();
+    return std::move(oss).str();
 }
 
 
@@ -94,7 +94,7 @@ template <typename T> static T to_int(const rjson::value& value) {
         }
         return u64_result;
     } else if (value.IsDouble()) {
-        // We allow specifing integer constants
+        // We allow specifying integer constants
         // using scientific notation (for example 1.3e8)
         // and floating-point numbers ending with .0 (for example 12.0),
         // but not floating-point numbers with fractional part (12.34).
@@ -119,7 +119,27 @@ template <typename T> static T to_int(const rjson::value& value) {
                 "for int64 type: {} (it should not contain fractional part {})", value, fractional));
         }
 
-        if (std::numeric_limits<T>::min() > double_value || double_value > std::numeric_limits<T>::max()) {
+        // At this point we know that `double_value` is an integer.
+        // Now we only have to check that it's within the target type's limits.
+        //
+        // It's tempting to check that `double_value <= std::numeric_limits<T>::max()`,
+        // but that's wrong because the right side might not be exactly representable as a double,
+        // and can get rounded up. 
+        //
+        // For example, in the C++ expression `std::ldexp(1, 64) <= std::numeric_limits<uint64_t>::max()`,
+        // the right side will (most likely) be rounded up to `std::ldexp(1, 64)`, and the comparison
+        // will evaluate to `true` even though `std::ldexp(1, 64)` doesn't fit into `uint64_t`.
+        //
+        // So we have to be careful.
+        // Instead of `double_value <= std::numeric_limits<T>::max()`,
+        // we use `double_value < max_limit`, where `max_limit` is a `double` *mathematically*
+        // equal to `std::numeric_limits<T>::max() + 1`. This value is a power of 2, so it's
+        // exactly representable in `double`.
+        //
+        // The formula for `max_limit` is carefully constructed so that float arithmetic
+        // happens on powers of 2, without any rounding.
+        constexpr double max_limit = 2.0 * ((std::numeric_limits<T>::max() / 2) + 1);
+        if (std::numeric_limits<T>::min() > double_value || double_value >= max_limit) {
             throw marshal_exception(format("Value {} out of range", double_value));
         }
 
@@ -151,14 +171,21 @@ static bytes from_json_object_aux(const map_type_impl& t, const rjson::value& va
     std::map<bytes, bytes, serialized_compare> raw_map(t.get_keys_type()->as_less_comparator());
     for (auto it = value.MemberBegin(); it != value.MemberEnd(); ++it) {
         bytes value = from_json_object(*t.get_values_type(), it->value);
-        if (!t.get_keys_type()->is_compatible_with(*utf8_type)) {
-            // Keys in maps can only be strings in JSON, but they can also be a string representation
-            // of another JSON type, which needs to be reparsed. Example - map<frozen<list<int>>, int>
-            // will be represented like this: { "[1, 3, 6]": 3, "[]": 0, "[1, 2]": 2 }
-            rjson::value map_key = rjson::parse(rjson::to_string_view(it->name));
-            raw_map.emplace(from_json_object(*t.get_keys_type(), map_key), std::move(value));
-        } else {
+        // For all native (non-collection, non-tuple) key types, they are
+        // represented as a string in JSON. For more elaborate types, they
+        // can also be a string representation of another JSON type, which
+        // needs to be reparsed as JSON. For example,
+        // map<frozen<list<int>>, int> will be represented as:
+        // { "[1, 3, 6]": 3, "[]": 0, "[1, 2]": 2 }
+        if (t.get_keys_type()->underlying_type()->is_native()) {
             raw_map.emplace(from_json_object(*t.get_keys_type(), it->name), std::move(value));
+        } else {
+            try {
+                rjson::value map_key = rjson::parse(rjson::to_string_view(it->name));
+                raw_map.emplace(from_json_object(*t.get_keys_type(), map_key), std::move(value));
+            } catch (rjson::error& e) {
+                throw marshal_exception(format("Failed parsing map_key {}: {}", it->name, e.what()));
+            }
         }
     }
     return map_type_impl::serialize_to_bytes(raw_map);
@@ -226,7 +253,7 @@ static bytes from_json_object_aux(const user_type_impl& ut, const rjson::value& 
     }
 
     if (!remaining_names.empty()) {
-        throw marshal_exception(format(
+        throw marshal_exception(seastar::format(
                 "Extraneous field definition for user type {}: {}", ut.get_name_as_string(), *remaining_names.begin()));
     }
     return ut.build_value(std::move(raw_tuple));
@@ -369,7 +396,7 @@ static sstring to_json_string_aux(const map_type_impl& t, bytes_view bv) {
         out << to_json_string(*t.get_values_type(), vb);
     }
     out << '}';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const set_type_impl& t, bytes_view bv) {
@@ -392,7 +419,7 @@ static sstring to_json_string_aux(const set_type_impl& t, bytes_view bv) {
         }
     });
     out << ']';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const list_type_impl& t, bytes_view bv) {
@@ -414,7 +441,7 @@ static sstring to_json_string_aux(const list_type_impl& t, bytes_view bv) {
         }
     });
     out << ']';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const tuple_type_impl& t, bytes_view bv) {
@@ -438,7 +465,7 @@ static sstring to_json_string_aux(const tuple_type_impl& t, bytes_view bv) {
     }
 
     out << ']';
-    return out.str();
+    return std::move(out).str();
 }
 
 static sstring to_json_string_aux(const user_type_impl& t, bytes_view bv) {
@@ -465,7 +492,7 @@ static sstring to_json_string_aux(const user_type_impl& t, bytes_view bv) {
     }
 
     out << '}';
-    return out.str();
+    return std::move(out).str();
 }
 
 namespace {
@@ -489,7 +516,7 @@ struct to_json_string_visitor {
     sstring operator()(const string_type_impl& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const bytes_type_impl& t) { return quote_json_string("0x" + t.to_string(bv)); }
     sstring operator()(const boolean_type_impl& t) { return t.to_string(bv); }
-    sstring operator()(const timestamp_date_base_class& t) { return quote_json_string(t.to_string(bv)); }
+    sstring operator()(const timestamp_date_base_class& t) { return quote_json_string(timestamp_to_json_string(t, bv)); }
     sstring operator()(const timeuuid_type_impl& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const map_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const set_type_impl& t) { return to_json_string_aux(t, bv); }
@@ -497,7 +524,7 @@ struct to_json_string_visitor {
     sstring operator()(const tuple_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const user_type_impl& t) { return to_json_string_aux(t, bv); }
     sstring operator()(const simple_date_type_impl& t) { return quote_json_string(t.to_string(bv)); }
-    sstring operator()(const time_type_impl& t) { return t.to_string(bv); }
+    sstring operator()(const time_type_impl& t) { return quote_json_string(t.to_string(bv)); }
     sstring operator()(const empty_type_impl& t) { return "null"; }
     sstring operator()(const duration_type_impl& t) {
         auto v = t.deserialize(bv);

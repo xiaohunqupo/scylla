@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
@@ -27,6 +27,11 @@ static thread_local schema_ptr s = schema_builder("ks", "cf")
         .build();
 
 static auto gc_now = gc_clock::now();
+
+static std::ostream& operator<<(std::ostream& out, const range_tombstone_entry& entry) {
+    fmt::print(out, "{}", entry);
+    return out;
+}
 
 static clustering_key_prefix key(std::vector<int32_t> components) {
     std::vector<bytes> exploded;
@@ -481,7 +486,7 @@ static std::vector<range_tombstone> make_random() {
              */
             start_b = bound_view(start_key, bound_kind::incl_start);
             if (less(end_b, start_b)) {
-                std::cout << "Unfixable slice " << start_b << " ... " << end_b << std::endl;
+                fmt::print("Unfixable slice {} ... {}\n", start_b, end_b);
                 std::abort();
             }
         }
@@ -519,11 +524,11 @@ BOOST_AUTO_TEST_CASE(test_random_list_is_not_overlapped) {
         if (!assert_valid(l)) {
             std::cout << "For input:" << std::endl;
             for (auto&& rt : input) {
-                std::cout << rt << std::endl;
+                fmt::print(std::cout, "{}\n", rt);
             }
             std::cout << "Produced:" << std::endl;
             for (auto&& rt : l) {
-                std::cout << rt << std::endl;
+                fmt::print(std::cout, "{}\n", rt);
             }
             BOOST_REQUIRE(false);
         }

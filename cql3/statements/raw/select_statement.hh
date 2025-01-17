@@ -5,13 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/statements/raw/cf_statement.hh"
 #include "cql3/statements/prepared_statement.hh"
+#include "cql3/restrictions/statement_restrictions.hh"
 #include "cql3/attributes.hh"
 #include "db/config.hh"
 #include <seastar/core/shared_ptr.hh>
@@ -21,11 +22,8 @@ namespace cql3 {
 namespace selection {
     class selection;
     class raw_selector;
+    class prepared_selector;
 } // namespace selection
-
-namespace restrictions {
-    class statement_restrictions;
-} // namespace restrictions
 
 namespace statements {
 
@@ -48,7 +46,7 @@ public:
     class parameters final {
     public:
         using orderings_type = std::vector<std::pair<shared_ptr<column_identifier::raw>, ordering>>;
-        enum class statement_subtype { REGULAR, JSON, PRUNE_MATERIALIZED_VIEW };
+        enum class statement_subtype { REGULAR, JSON, PRUNE_MATERIALIZED_VIEW, MUTATION_FRAGMENTS };
     private:
         const orderings_type _orderings;
         const bool _is_distinct;
@@ -68,6 +66,7 @@ public:
         bool is_distinct() const;
         bool allow_filtering() const;
         bool is_json() const;
+        bool is_mutation_fragments() const;
         bool bypass_cache() const;
         bool is_prune_materialized_view() const;
         orderings_type const& orderings() const;
@@ -75,8 +74,10 @@ public:
     template<typename T>
     using compare_fn = std::function<bool(const T&, const T&)>;
 
-    using result_row_type = std::vector<bytes_opt>;
+    using result_row_type = std::vector<managed_bytes_opt>;
     using ordering_comparator_type = compare_fn<result_row_type>;
+protected:
+    virtual audit::statement_category category() const override;
 private:
     using prepared_orderings_type = std::vector<std::pair<const column_definition*, ordering>>;
 private:
@@ -102,20 +103,21 @@ public:
     }
     std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, bool for_view);
 private:
-    void maybe_jsonize_select_clause(data_dictionary::database db, schema_ptr schema);
+    std::vector<selection::prepared_selector> maybe_jsonize_select_clause(std::vector<selection::prepared_selector> select, data_dictionary::database db, schema_ptr schema);
     ::shared_ptr<restrictions::statement_restrictions> prepare_restrictions(
         data_dictionary::database db,
         schema_ptr schema,
         prepare_context& ctx,
         ::shared_ptr<selection::selection> selection,
         bool for_view = false,
-        bool allow_filtering = false);
+        bool allow_filtering = false,
+        restrictions::check_indexes do_check_indexes = restrictions::check_indexes::yes);
 
     /** Returns an expression for the limit or nullopt if no limit is set */
     std::optional<expr::expression> prepare_limit(data_dictionary::database db, prepare_context& ctx, const std::optional<expr::expression>& limit);
 
     // Checks whether it is legal to have ORDER BY in this statement
-    static void verify_ordering_is_allowed(const restrictions::statement_restrictions& restrictions);
+    static void verify_ordering_is_allowed(const parameters& params, const restrictions::statement_restrictions& restrictions);
 
     void handle_unrecognized_ordering_column(const column_identifier& column) const;
 

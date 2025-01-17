@@ -30,6 +30,8 @@ fi
 debian_base_packages=(
     clang
     gdb
+    cargo
+    wabt
     liblua5.3-dev
     python3-aiohttp
     python3-pyparsing
@@ -38,23 +40,28 @@ debian_base_packages=(
     libsnappy-dev
     libjsoncpp-dev
     rapidjson-dev
-    scylla-libthrift010-dev
     scylla-antlr35-c++-dev
-    thrift-compiler
     git
     pigz
     libunistring-dev
     libzstd-dev
     libdeflate-dev
-    libabsl-dev
+    librapidxml-dev
+    libcrypto++-dev
+    libxxhash-dev
+    slapd
+    ldap-utils
+    libcpp-jwt-dev
 )
 
 fedora_packages=(
     clang
+    compiler-rt
+    libasan
+    libubsan
     gdb
     lua-devel
     yaml-cpp-devel
-    thrift-devel
     antlr3-tool
     antlr3-C++-devel
     jsoncpp-devel
@@ -62,15 +69,11 @@ fedora_packages=(
     snappy-devel
     libdeflate-devel
     systemd-devel
-    abseil-cpp-devel
+    cryptopp-devel
     git
+    git-lfs
     python
     sudo
-    java-1.8.0-openjdk-headless
-    java-1.8.0-openjdk-devel
-    ant
-    ant-junit
-    maven
     patchelf
     python3
     python3-aiohttp
@@ -82,6 +85,9 @@ fedora_packages=(
     python3-pytest
     python3-pytest-asyncio
     python3-redis
+    python3-unidiff
+    python3-humanfriendly
+    python3-jinja2
     dnf-utils
     pigz
     net-tools
@@ -95,6 +101,7 @@ fedora_packages=(
     xxhash-devel
     makeself
     libzstd-static libzstd-devel
+    lz4-static lz4-devel
     rpm-build
     devscripts
     debhelper
@@ -104,6 +111,23 @@ fedora_packages=(
     curl
     rust
     cargo
+    rapidxml-devel
+    rust-std-static-wasm32-wasi
+    wabt
+    binaryen
+    lcov
+    java-11-openjdk-devel # for tools/java
+
+    llvm-bolt
+    moreutils
+    iproute
+    llvm
+    openldap-servers
+    openldap-devel
+    toxiproxy
+    cyrus-sasl
+    fipscheck
+    cpp-jwt-devel
 )
 
 # lld is not available on s390x, see
@@ -117,19 +141,24 @@ fedora_python3_packages=(
     python3-urwid
     python3-pyparsing
     python3-requests
-    python3-pyudev
     python3-setuptools
     python3-psutil
     python3-distro
     python3-click
     python3-six
+    python3-pyudev
 )
 
-pip_packages=(
-    scylla-driver
-    geomet
-    traceback-with-variables
-    scylla-api-client
+# an associative array from packages to constrains
+declare -A pip_packages=(
+    [scylla-driver]=
+    [geomet]="<0.3,>=0.1"
+    [traceback-with-variables]=
+    [scylla-api-client]=
+    [treelib]=
+    [allure-pytest]=
+    [pytest-xdist]=
+    [pykmip]=
 )
 
 pip_symlinks=(
@@ -139,7 +168,6 @@ pip_symlinks=(
 centos_packages=(
     gdb
     yaml-cpp-devel
-    thrift-devel
     scylla-antlr35-tool
     scylla-antlr35-C++-devel
     jsoncpp-devel snappy-devel
@@ -148,6 +176,9 @@ centos_packages=(
     scylla-python34-pyparsing20
     systemd-devel
     pigz
+    openldap-servers
+    openldap-devel
+    cpp-jwt-devel
 )
 
 # 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
@@ -171,24 +202,27 @@ arch_packages=(
     python3
     rapidjson
     snappy
-    thrift
 )
 
-NODE_EXPORTER_VERSION=1.5.0
+go_arch() {
+    local -A GO_ARCH=(
+        ["x86_64"]=amd64
+        ["aarch64"]=arm64
+        ["s390x"]=s390x
+    )
+    echo ${GO_ARCH["$(arch)"]}
+}
+
+NODE_EXPORTER_VERSION=1.8.2
 declare -A NODE_EXPORTER_CHECKSUM=(
-    ["x86_64"]=af999fd31ab54ed3a34b9f0b10c28e9acee9ef5ac5a5d5edfdde85437db7acbb
-    ["aarch64"]=e031a539af9a619c06774788b54c23fccc2a852d41437315725a086ccdb0ed16
-    ["s390x"]=fc5be2c18cb5a13de56ae2b8e91d3fabb40bf1ece398be690df1cd5c43008747
-)
-declare -A NODE_EXPORTER_ARCH=(
-    ["x86_64"]=amd64
-    ["aarch64"]=arm64
-    ["s390x"]=s390x
+    ["x86_64"]=6809dd0b3ec45fd6e992c19071d6b5253aed3ead7bf0686885a51d85c6643c66
+    ["aarch64"]=627382b9723c642411c33f48861134ebe893e70a63bcc8b3fc0619cd0bfac4be
+    ["s390x"]=971481f06a985e9fcaee9bcd8da99a830d5b9e5f21e5225694de7e23401327c4
 )
 NODE_EXPORTER_DIR=/opt/scylladb/dependencies
 
 node_exporter_filename() {
-    echo "node_exporter-$NODE_EXPORTER_VERSION.linux-${NODE_EXPORTER_ARCH["$(arch)"]}.tar.gz"
+    echo "node_exporter-$NODE_EXPORTER_VERSION.linux-$(go_arch).tar.gz"
 }
 
 node_exporter_fullpath() {
@@ -201,6 +235,27 @@ node_exporter_checksum() {
 
 node_exporter_url() {
     echo "https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION/$(node_exporter_filename)"
+}
+
+MINIO_BINARIES_DIR=/usr/local/bin
+
+minio_server_url() {
+    echo "https://dl.minio.io/server/minio/release/linux-$(go_arch)/minio"
+}
+
+minio_client_url() {
+    echo "https://dl.min.io/client/mc/release/linux-$(go_arch)/mc"
+}
+
+minio_download_jobs() {
+    cfile=$(mktemp)
+    echo $(curl -s "$(minio_server_url).sha256sum" | cut -f1 -d' ') "${MINIO_BINARIES_DIR}/minio" > $cfile
+    echo $(curl -s "$(minio_client_url).sha256sum" | cut -f1 -d' ') "${MINIO_BINARIES_DIR}/mc" >> $cfile
+    sha256sum -c $cfile | grep -F FAILED | sed \
+        -e 's/:.*$//g' \
+        -e "s#${MINIO_BINARIES_DIR}/minio#$(minio_server_url) -o ${MINIO_BINARIES_DIR}/minio#" \
+        -e "s#${MINIO_BINARIES_DIR}/mc#$(minio_client_url) -o ${MINIO_BINARIES_DIR}/mc#"
+    rm -f ${cfile}
 }
 
 print_usage() {
@@ -251,7 +306,7 @@ if $PRINT_PYTHON3; then
 fi
 
 if $PRINT_PIP; then
-    echo "${pip_packages[@]}"
+    echo "${!pip_packages[@]}"
     exit 0
 fi
 
@@ -265,8 +320,9 @@ if $PRINT_NODE_EXPORTER; then
     exit 0
 fi
 
+umask 0022
+
 ./seastar/install-dependencies.sh
-./tools/jmx/install-dependencies.sh
 ./tools/java/install-dependencies.sh
 
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
@@ -280,8 +336,11 @@ if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     else
         apt-get -y install libsystemd-dev antlr3 libyaml-cpp-dev
     fi
-    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-thrift --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
+    apt-get -y install libssl-dev
+
+    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
 elif [ "$ID" = "fedora" ]; then
+    fedora_packages+=(openssl-devel)
     if rpm -q --quiet yum-utils; then
         echo
         echo "This script will install dnf-utils package, witch will conflict with currently installed package: yum-utils"
@@ -290,12 +349,13 @@ elif [ "$ID" = "fedora" ]; then
     fi
     dnf install -y "${fedora_packages[@]}" "${fedora_python3_packages[@]}"
     PIP_DEFAULT_ARGS="--only-binary=:all: -v"
-    pip3 install "$PIP_DEFAULT_ARGS" "geomet<0.3,>=0.1"
-    pip3 install "$PIP_DEFAULT_ARGS" scylla-driver
-    pip3 install "$PIP_DEFAULT_ARGS" traceback-with-variables
-    pip3 install "$PIP_DEFAULT_ARGS" scylla-api-client
+    pip_constrained_packages=""
+    for package in "${!pip_packages[@]}"
+    do
+        pip_constrained_packages="${pip_constrained_packages} ${package}${pip_packages[$package]}"
+    done
+    pip3 install "$PIP_DEFAULT_ARGS" $pip_constrained_packages
 
-    cargo --config net.git-fetch-with-cli=true install cxxbridge-cmd --root /usr/local
     if [ -f "$(node_exporter_fullpath)" ] && node_exporter_checksum; then
         echo "$(node_exporter_filename) already exists, skipping download"
     else
@@ -307,6 +367,7 @@ elif [ "$ID" = "fedora" ]; then
         fi
     fi
 elif [ "$ID" = "centos" ]; then
+    centos_packages+=(openssl-devel)
     dnf install -y "${centos_packages[@]}"
     echo -e "Configure example:\n\tpython3.4 ./configure.py --enable-dpdk --mode=release --static-boost --compiler=/opt/scylladb/bin/g++-7.3 --python python3.4 --ldflag=-Wl,-rpath=/opt/scylladb/lib64 --cflags=-I/opt/scylladb/include --with-antlr3=/opt/scylladb/bin/antlr3"
 elif [ "$ID" == "arch" ]; then
@@ -345,4 +406,15 @@ elif [ "$ID" == "arch" ]; then
         popd > /dev/null || exit 1
     fi
     echo -e "Configure example:\n\t./configure.py\n\tninja release"
+fi
+
+cargo --config net.git-fetch-with-cli=true install cxxbridge-cmd --root /usr/local
+
+CURL_ARGS=$(minio_download_jobs)
+if [ ! -z "${CURL_ARGS}" ]; then
+    curl -fSL --remove-on-error --parallel --parallel-immediate ${CURL_ARGS}
+    chmod +x "${MINIO_BINARIES_DIR}/minio"
+    chmod +x "${MINIO_BINARIES_DIR}/mc"
+else
+    echo "Minio server and client are up-to-date, skipping download"
 fi

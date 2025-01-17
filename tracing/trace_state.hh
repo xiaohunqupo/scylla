@@ -5,12 +5,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
 #include <deque>
-#include <unordered_set>
 #include <seastar/util/lazy.hh>
 #include <seastar/core/weak_ptr.hh>
 #include <seastar/core/checked_ptr.hh>
@@ -18,7 +17,7 @@
 #include "gms/inet_address.hh"
 #include "auth/authenticated_user.hh"
 #include "db/consistency_level_type.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "timestamp.hh"
 #include "inet_address_vectors.hh"
 
@@ -36,7 +35,7 @@ namespace tracing {
 
 extern logging::logger trace_state_logger;
 
-using prepared_checked_weak_ptr = seastar::checked_ptr<seastar::weak_ptr<cql3::statements::prepared_statement>>;
+using prepared_checked_weak_ptr = seastar::checked_ptr<seastar::weak_ptr<const cql3::statements::prepared_statement>>;
 
 class trace_state final {
 public:
@@ -63,15 +62,15 @@ public:
     };
 
 private:
+    shared_ptr<tracing> _local_tracing_ptr;
+    trace_state_props_set _state_props;
     lw_shared_ptr<one_session_records> _records;
     // Used for calculation of time passed since the beginning of a tracing
     // session till each tracing event. Secondary slow-query-logging sessions inherit `_start` from parents.
     elapsed_clock::time_point _start;
     std::optional<uint64_t> _supplied_start_ts_us; // Parent's `_start`, as microseconds from POSIX epoch.
     std::chrono::microseconds _slow_query_threshold;
-    trace_state_props_set _state_props;
     state _state = state::inactive;
-    shared_ptr<tracing> _local_tracing_ptr;
 
     struct params_values;
     struct params_values_deleter {
@@ -97,38 +96,39 @@ private:
         }
     } _params_ptr;
 
-public:
-    trace_state(trace_type type, trace_state_props_set props)
-        : _state_props(props)
-        , _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
-    {
-        if (!full_tracing() && !log_slow_query()) {
+    static trace_state_props_set make_primary(trace_state_props_set props) {
+        if (!props.contains(trace_state_props::full_tracing) && !props.contains(trace_state_props::log_slow_query)) {
             throw std::logic_error("A primary session has to be created for either full tracing or a slow query logging");
         }
-
-        // This is a primary session
-        _state_props.set(trace_state_props::primary);
-
-        init_session_records(type, _local_tracing_ptr->slow_query_record_ttl());
-        _slow_query_threshold = _local_tracing_ptr->slow_query_threshold();
+        props.set(trace_state_props::primary);
+        return props;
     }
 
-    trace_state(const trace_info& info)
-        : _state_props(info.state_props)
-        , _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
-    {
-        // This is a secondary session
-        _state_props.remove(trace_state_props::primary);
-
+    static trace_state_props_set make_secondary(trace_state_props_set props) noexcept {
+        props.remove(trace_state_props::primary);
         // Default a secondary session to a full tracing.
         // We may get both zeroes for a full_tracing and a log_slow_query if a
         // primary session is created with an older server version.
-        _state_props.set_if<trace_state_props::full_tracing>(!full_tracing() && !log_slow_query());
+        props.set_if<trace_state_props::full_tracing>(!props.contains(trace_state_props::full_tracing) && !props.contains(trace_state_props::log_slow_query));
+        return props;
+    }
 
+public:
+    trace_state(trace_type type, trace_state_props_set props)
+        : _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
+        , _state_props(make_primary(props))
+        , _records(make_lw_shared<one_session_records>(type, ttl_by_type(type, _local_tracing_ptr->slow_query_record_ttl()), _local_tracing_ptr->slow_query_record_ttl()))
+        , _slow_query_threshold(_local_tracing_ptr->slow_query_threshold())
+    {
+    }
+
+    trace_state(const trace_info& info)
+        : _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
+        , _state_props(make_secondary(info.state_props))
         // inherit the slow query threshold and ttl from the coordinator
-        init_session_records(info.type, std::chrono::seconds(info.slow_query_ttl_sec), info.session_id, info.parent_id);
-        _slow_query_threshold = std::chrono::microseconds(info.slow_query_threshold_us);
-
+        , _records(make_lw_shared<one_session_records>(info.type, ttl_by_type(info.type, std::chrono::seconds(info.slow_query_ttl_sec)), std::chrono::seconds(info.slow_query_ttl_sec), info.session_id, info.parent_id))
+        , _slow_query_threshold(info.slow_query_threshold_us)
+    {
         if (info.state_props.contains<trace_state_props::log_slow_query>() && info.start_ts_us > 0u) {
             _supplied_start_ts_us = info.start_ts_us;
         }
@@ -225,9 +225,17 @@ private:
         return log_slow_query() && e > _slow_query_threshold;
     }
 
-    void init_session_records(trace_type type, std::chrono::seconds slow_query_ttl,
-        std::optional<utils::UUID> session_id = std::nullopt,
-        span_id parent_id = span_id::illegal_id);
+    std::chrono::seconds ttl_by_type(trace_type type, std::chrono::seconds slow_query_ttl) noexcept {
+        if (full_tracing()) {
+            if (!log_slow_query()) {
+                return ::tracing::ttl_by_type(type);
+            } else {
+                return std::max(::tracing::ttl_by_type(type), slow_query_ttl);
+            }
+        } else {
+            return slow_query_ttl;
+        }
+    }
 
     bool should_write_records() const {
         return full_tracing() || _records->do_log_slow_query;
@@ -243,7 +251,7 @@ private:
     /**
      * Initiates a tracing session.
      *
-     * Starts the tracing session time measurments.
+     * Starts the tracing session time measurements.
      * This overload is meant for secondary sessions.
      */
     void begin() {
@@ -263,7 +271,7 @@ private:
     /**
      * Initiates a tracing session.
      *
-     * Starts the tracing session time measurments.
+     * Starts the tracing session time measurements.
      * This overload is meant for primary sessions.
      *
      * @param request description of a request being traces
@@ -290,7 +298,7 @@ private:
      *
      * @param val the set of batchlog endpoints
      */
-    void set_batchlog_endpoints(const inet_address_vector_replica_set& val);
+    void set_batchlog_endpoints(const host_id_vector_replica_set& val);
 
     /**
      * Stores a consistency level of a query being traced.
@@ -354,7 +362,7 @@ private:
      *
      * @param val the query string
      */
-    void add_query(sstring_view val);
+    void add_query(std::string_view val);
 
     /**
      * Store a custom session parameter.
@@ -364,7 +372,7 @@ private:
      * @param key the parameter key
      * @param val the parameter value
      */
-    void add_session_param(sstring_view key, sstring_view val);
+    void add_session_param(std::string_view key, std::string_view val);
 
     /**
      * Store a user provided timestamp.
@@ -420,7 +428,7 @@ private:
      * @param param_name_prefix prefix of the parameter key in the map, e.g. "param" or "param[1]"
      */
     void build_parameters_map_for_one_prepared(const prepared_checked_weak_ptr& prepared_ptr,
-            std::optional<std::vector<sstring_view>>& names_opt,
+            std::optional<std::vector<std::string_view>>& names_opt,
             cql3::raw_value_view_vector_with_unset& values, const sstring& param_name_prefix);
 
     /**
@@ -429,24 +437,16 @@ private:
      * @note This method is allowed to throw.
      * @param msg the trace message to store
      */
-    void trace_internal(sstring msg);
+    void trace_internal(std::string&& msg);
 
     /**
      * Add a single trace entry - a special case for a simple string.
      *
      * @param msg trace message
      */
-    void trace(sstring msg) noexcept {
+    void trace(std::string&& msg) noexcept {
         try {
             trace_internal(std::move(msg));
-        } catch (...) {
-            // Bump up an error counter and ignore
-            ++_local_tracing_ptr->stats.trace_errors;
-        }
-    }
-    void trace(const char* msg) noexcept {
-        try {
-            trace_internal(sstring(msg));
         } catch (...) {
             // Bump up an error counter and ignore
             ++_local_tracing_ptr->stats.trace_errors;
@@ -468,23 +468,25 @@ private:
      * @param fmt format string
      * @param a positional parameters
      */
-    template <typename... A>
-    void trace(const char* fmt, A&&... a) noexcept;
+    template <typename... T>
+    void trace(fmt::format_string<T...> fmt, T&&... args) noexcept;
 
     template <typename... A>
     friend void begin(const trace_state_ptr& p, A&&... a);
 
-    template <typename... A>
-    friend void trace(const trace_state_ptr& p, A&&... a) noexcept;
+    template <typename... T>
+    friend void trace(const trace_state_ptr& p, fmt::format_string<T...>, T&&... args) noexcept;
+
+    friend void trace(const trace_state_ptr& p, std::string&& msg) noexcept;
 
     friend void set_page_size(const trace_state_ptr& p, int32_t val);
     friend void set_request_size(const trace_state_ptr& p, size_t s) noexcept;
     friend void set_response_size(const trace_state_ptr& p, size_t s) noexcept;
-    friend void set_batchlog_endpoints(const trace_state_ptr& p, const inet_address_vector_replica_set& val);
+    friend void set_batchlog_endpoints(const trace_state_ptr& p, const host_id_vector_replica_set& val);
     friend void set_consistency_level(const trace_state_ptr& p, db::consistency_level val);
     friend void set_optional_serial_consistency_level(const trace_state_ptr& p, const std::optional<db::consistency_level>&val);
-    friend void add_query(const trace_state_ptr& p, sstring_view val);
-    friend void add_session_param(const trace_state_ptr& p, sstring_view key, sstring_view val);
+    friend void add_query(const trace_state_ptr& p, std::string_view val);
+    friend void add_session_param(const trace_state_ptr& p, std::string_view key, std::string_view val);
     friend void set_user_timestamp(const trace_state_ptr& p, api::timestamp_type val);
     friend void add_prepared_statement(const trace_state_ptr& p, prepared_checked_weak_ptr& prepared);
     friend void set_username(const trace_state_ptr& p, const std::optional<auth::authenticated_user>& user);
@@ -519,7 +521,7 @@ public:
     }
 };
 
-inline void trace_state::trace_internal(sstring message) {
+inline void trace_state::trace_internal(std::string&& message) {
     if (is_in_state(state::inactive)) {
         throw std::logic_error("trying to use a trace() before begin() for \"" + message + "\" tracepoint");
     }
@@ -564,10 +566,10 @@ inline void trace_state::trace_internal(sstring message) {
     }
 }
 
-template <typename... A>
-void trace_state::trace(const char* fmt, A&&... a) noexcept {
+template <typename... T>
+void trace_state::trace(fmt::format_string<T...> fmt, T&&... args) noexcept {
     try {
-        trace_internal(seastar::format(fmt, std::forward<A>(a)...));
+        trace_internal(fmt::format(fmt, std::forward<T>(args)...));
     } catch (...) {
         // Bump up an error counter and ignore
         ++_local_tracing_ptr->stats.trace_errors;
@@ -601,7 +603,7 @@ inline void set_response_size(const trace_state_ptr& p, size_t s) noexcept {
     }
 }
 
-inline void set_batchlog_endpoints(const trace_state_ptr& p, const inet_address_vector_replica_set& val) {
+inline void set_batchlog_endpoints(const trace_state_ptr& p, const host_id_vector_replica_set& val) {
     if (p) {
         p->set_batchlog_endpoints(val);
     }
@@ -619,13 +621,13 @@ inline void set_optional_serial_consistency_level(const trace_state_ptr& p, cons
     }
 }
 
-inline void add_query(const trace_state_ptr& p, sstring_view val) {
+inline void add_query(const trace_state_ptr& p, std::string_view val) {
     if (p) {
         p->add_query(std::move(val));
     }
 }
 
-inline void add_session_param(const trace_state_ptr& p, sstring_view key, sstring_view val) {
+inline void add_session_param(const trace_state_ptr& p, std::string_view key, std::string_view val) {
     if (p) {
         p->add_session_param(std::move(key), std::move(val));
     }
@@ -665,7 +667,7 @@ inline bool should_return_id_in_response(const trace_state_ptr& p) {
 /**
  * A helper for conditional invoking trace_state::begin() functions.
  *
- * If trace state is initialized the operation takes place immediatelly,
+ * If trace state is initialized the operation takes place immediately,
  * otherwise nothing happens.
  *
  * @tparam A
@@ -693,14 +695,14 @@ inline void begin(const trace_state_ptr& p, A&&... a) {
  * that positional parameters are both copiable and that the copy is not
  * expensive.
  *
- * @param A
+ * @param args
  * @param p trace state handle
  * @param a trace message format string with optional parameters
  */
-template <typename... A>
-inline void trace(const trace_state_ptr& p, A&&... a) noexcept {
+template <typename... T>
+inline void trace(const trace_state_ptr& p, fmt::format_string<T...> fmt, T&&... args) noexcept {
     if (p && !p->ignore_events()) {
-        p->trace(std::forward<A>(a)...);
+        p->trace(fmt, std::forward<T>(args)...);
     }
 }
 

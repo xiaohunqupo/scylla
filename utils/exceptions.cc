@@ -2,10 +2,10 @@
  * Copyright 2015-present ScyllaDB
  */
 
-/* SPDX-License-Identifier: AGPL-3.0-or-later
+/* SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/rpc/rpc.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/backtrace.hh>
@@ -13,11 +13,8 @@
 
 #include <exception>
 #include <system_error>
-#include <atomic>
 #include "exceptions.hh"
 #include "utils/abi/eh_ia64.hh"
-
-#include <iostream>
 
 bool check_exception(system_error_lambda_t f)
 {
@@ -47,8 +44,8 @@ bool is_system_error_errno(int err_no)
 
 bool should_stop_on_system_error(const std::system_error& e) {
     if (e.code().category() == std::system_category()) {
-	// Whitelist of errors that don't require us to stop the server:
-	switch (e.code().value()) {
+        // Whitelist of errors that don't require us to stop the server:
+        switch (e.code().value()) {
         case EEXIST:
         case ENOENT:
             return false;

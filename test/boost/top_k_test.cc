@@ -3,17 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
 #include "utils/top_k.hh"
+#include "test/lib/test_utils.hh"
+#include <fmt/ranges.h>
 #include <vector>
 #include <algorithm>
-
-using namespace std;
+#include <optional>
 
 //---------------------------------------------------------------------------------------------
 
@@ -21,10 +22,10 @@ using top_k_t = utils::space_saving_top_k<unsigned>;
 using results_t = top_k_t::results;
 
 // a permutation of 1..17
-vector<unsigned> freq{13, 8, 12, 4, 11, 2, 15, 1, 5, 3, 16, 7, 6, 9, 14, 10, 17};
+std::vector<unsigned> freq{13, 8, 12, 4, 11, 2, 15, 1, 5, 3, 16, 7, 6, 9, 14, 10, 17};
 
 // expected results
-vector<unsigned> exp_results(unsigned k = 10) {
+std::vector<unsigned> exp_results(unsigned k = 10) {
     auto v = freq;
     std::sort(v.begin(), v.end(), std::greater<unsigned>());
     v.resize(k);
@@ -32,8 +33,8 @@ vector<unsigned> exp_results(unsigned k = 10) {
 }
 
 
-vector<unsigned> count(const utils::space_saving_top_k<unsigned>::results& res) {
-    vector<unsigned> v;
+std::vector<unsigned> count(const utils::space_saving_top_k<unsigned>::results& res) {
+    std::vector<unsigned> v;
     for (auto& c : res) {
         v.push_back(c.count);
     }
@@ -52,7 +53,7 @@ BOOST_AUTO_TEST_CASE(test_top_k_straight_insertion) {
         }
     }
 
-    vector<unsigned> res = count(top.top(10));
+    std::vector<unsigned> res = count(top.top(10));
     BOOST_REQUIRE_EQUAL(res, exp_results());
 }
 
@@ -103,7 +104,7 @@ BOOST_AUTO_TEST_CASE(test_top_k_single_value) {
     }
 
     auto res{count(top.top(10))};
-    BOOST_REQUIRE_EQUAL(res, (vector<unsigned>{100}));
+    BOOST_REQUIRE_EQUAL(res, (std::vector<unsigned>{100}));
 }
 
 //---------------------------------------------------------------------------------------------

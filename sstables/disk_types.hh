@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -15,7 +15,6 @@
 #include <boost/variant/get.hpp>
 #include <unordered_map>
 #include <type_traits>
-#include <deque>
 #include "mutation/atomic_cell.hh"
 
 namespace sstables {
@@ -24,7 +23,7 @@ namespace sstables {
 // represents how large they are. They can be a byte-length, in the case of a
 // string, number of elements, in the case of an array, etc.
 //
-// For those elements, we encapsulate the underlying type in an outter
+// For those elements, we encapsulate the underlying type in an outer
 // structure that embeds how large is the in-disk size. It is a lot more
 // convenient to embed it in the size than explicitly writing it in the parser.
 // This way, we don't need to encode this information in multiple places at
@@ -88,7 +87,8 @@ struct disk_array_ref {
 
 template <typename Size, typename Key, typename Value>
 struct disk_hash {
-    std::unordered_map<Key, Value, std::hash<Key>> map;
+    using map_type = std::unordered_map<Key, Value, std::hash<Key>>;
+    map_type map;
 };
 
 template <typename TagType, TagType Tag, typename T>

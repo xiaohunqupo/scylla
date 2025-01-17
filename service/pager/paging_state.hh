@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -15,7 +15,6 @@
 #include "bytes.hh"
 #include "keys.hh"
 #include "query-request.hh"
-#include "dht/i_partitioner.hh"
 #include "db/read_repair_decision.hh"
 #include "mutation/position_in_partition.hh"
 #include "locator/host_id.hh"

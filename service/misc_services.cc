@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include <seastar/core/sleep.hh>
@@ -44,11 +44,11 @@ future<std::map<sstring, double>> load_meter::get_load_map() {
                 load_map.emplace(format("{}", x.first), x.second);
                 llogger.debug("get_load_map endpoint={}, load={}", x.first, x.second);
             }
+            load_map.emplace(format("{}",
+                    _lb->gossiper().get_broadcast_address()), get_load());
         } else {
             llogger.debug("load_broadcaster is not set yet!");
         }
-        load_map.emplace(format("{}",
-                utils::fb_utilities::get_broadcast_address()), get_load());
         return load_map;
     });
 }
@@ -68,10 +68,6 @@ double load_meter::get_load() const {
     return bytes;
 }
 
-sstring load_meter::get_load_string() const {
-    return format("{:f}", get_load());
-}
-
 void load_broadcaster::start_broadcasting() {
     _done = make_ready_future<>();
 
@@ -82,9 +78,9 @@ void load_broadcaster::start_broadcasting() {
         llogger.debug("Disseminating load info ...");
         _done = _db.map_reduce0([](replica::database& db) {
             int64_t res = 0;
-            for (auto i : db.get_column_families()) {
-                res += i.second->get_stats().live_disk_space_used;
-            }
+            db.get_tables_metadata().for_each_table([&] (table_id, lw_shared_ptr<replica::table> table) {
+                res += table->get_stats().live_disk_space_used;
+            });
             return res;
         }, int64_t(0), std::plus<int64_t>()).then([this] (int64_t size) {
             return _gossiper.add_local_application_state(gms::application_state::LOAD,
@@ -120,7 +116,7 @@ void cache_hitrate_calculator::recalculate_timer() {
         if (f.failed()) {
             d = std::chrono::milliseconds(2000);
         } else {
-            d = f.get0();
+            d = f.get();
         }
         p->run_on((this_shard_id() + 1) % smp::count, d);
     });
@@ -141,8 +137,8 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
     };
 
     auto cf_to_cache_hit_stats = [non_system_filter] (replica::database& db) {
-        return boost::copy_range<std::unordered_map<table_id, stat>>(db.get_column_families() | boost::adaptors::filtered(non_system_filter) |
-                boost::adaptors::transformed([]  (const std::pair<table_id, lw_shared_ptr<replica::column_family>>& cf) {
+        return std::ranges::to<std::unordered_map<table_id, stat>>(db.get_tables_metadata().filter(non_system_filter) |
+                std::views::transform([]  (const std::pair<table_id, lw_shared_ptr<replica::column_family>>& cf) {
             auto& stats = cf.second->get_row_cache().stats();
             return std::make_pair(cf.first, stat{float(stats.reads_with_no_misses.rate().rates[0]), float(stats.reads_with_misses.rate().rates[0])});
         }));
@@ -163,11 +159,11 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
         // set calculated rates on all shards
         return _db.invoke_on_all([this, cpuid = this_shard_id()] (replica::database& db) {
             return do_for_each(_rates, [this, cpuid, &db] (auto&& r) mutable {
-                auto it = db.get_column_families().find(r.first);
-                if (it == db.get_column_families().end()) { // a table may be added before map/reduce completes and this code runs
+                auto cf_opt = db.get_tables_metadata().get_table_if_exists(r.first);
+                if (!cf_opt) { // a table may be added before map/reduce completes and this code runs
                     return;
                 }
-                auto& cf = *it;
+                auto& cf = cf_opt;
                 stat& s = r.second;
                 float rate = 0;
                 if (s.h) {
@@ -175,10 +171,10 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
                 }
                 if (this_shard_id() == cpuid) {
                     // calculate max difference between old rate and new one for all cfs
-                    _diff = std::max(_diff, std::abs(float(cf.second->get_global_cache_hit_rate()) - rate));
-                    _gstate += format("{}.{}:{:0.6f};", cf.second->schema()->ks_name(), cf.second->schema()->cf_name(), rate);
+                    _diff = std::max(_diff, std::abs(float(cf->get_global_cache_hit_rate()) - rate));
+                    _gstate += format("{}.{}:{:0.6f};", cf->schema()->ks_name(), cf->schema()->cf_name(), rate);
                 }
-                cf.second->set_global_cache_hit_rate(cache_temperature(rate));
+                cf->set_global_cache_hit_rate(cache_temperature(rate));
             });
         });
     }).then([this] {
@@ -208,8 +204,10 @@ future<lowres_clock::duration> cache_hitrate_calculator::recalculate_hitrates() 
             llogger.debug("Send CACHE_HITRATES update max_diff={}, published_nr={}", _diff, _published_nr);
             ++_published_nr;
             _published_time = now;
-            return _gossiper.add_local_application_state(gms::application_state::CACHE_HITRATES,
-                    gms::versioned_value::cache_hitrates(_gstate)).then([recalculate_duration] {
+            return container().invoke_on(0, [&gstate = _gstate] (cache_hitrate_calculator& self) {
+                return self._gossiper.add_local_application_state(gms::application_state::CACHE_HITRATES,
+                        gms::versioned_value::cache_hitrates(gstate));
+            }).then([recalculate_duration] {
                 return recalculate_duration;
             });
         } else {
@@ -242,10 +240,9 @@ future<> view_update_backlog_broker::start() {
         // Gossiper runs only on shard 0, and there's no API to add multiple, per-shard application states.
         // Also, right now we aggregate all backlogs, since the coordinator doesn't keep per-replica shard backlogs.
         _started = seastar::async([this] {
-            std::optional<db::view::update_backlog> backlog_published;
             while (!_as.abort_requested()) {
-                auto backlog = _sp.local().get_view_update_backlog();
-                if (backlog_published && *backlog_published == backlog) {
+                auto backlog = _sp.local().get_view_update_backlog_if_changed().get();
+                if (!backlog) {
                     sleep_abortable(gms::gossiper::INTERVAL, _as).get();
                     continue;
                 }
@@ -254,8 +251,7 @@ future<> view_update_backlog_broker::start() {
                 //FIXME: discarded future.
                 (void)_gossiper.add_local_application_state(
                         gms::application_state::VIEW_BACKLOG,
-                        gms::versioned_value(seastar::format("{}:{}:{}", backlog.current, backlog.max, now)));
-                backlog_published = backlog;
+                        gms::versioned_value(seastar::format("{}:{}:{}", backlog->get_current_bytes(), backlog->get_max_bytes(), now)));
                 sleep_abortable(gms::gossiper::INTERVAL, _as).get();
             }
         }).handle_exception_type([] (const seastar::sleep_aborted& ignored) { });
@@ -270,38 +266,46 @@ future<> view_update_backlog_broker::stop() {
     });
 }
 
-future<> view_update_backlog_broker::on_change(gms::inet_address endpoint, gms::application_state state, const gms::versioned_value& value) {
-    if (state == gms::application_state::VIEW_BACKLOG) {
+future<> view_update_backlog_broker::on_change(gms::inet_address endpoint, const gms::application_state_map& states, gms::permit_id pid) {
+    return on_application_state_change(endpoint, states, gms::application_state::VIEW_BACKLOG, pid, [this] (gms::inet_address endpoint, const gms::versioned_value& value, gms::permit_id) {
+        if (utils::get_local_injector().enter("skip_updating_local_backlog_via_view_update_backlog_broker")) {
+            return make_ready_future<>();
+        }
+
         size_t current;
         size_t max;
         api::timestamp_type ticks;
-        const char* start_bound = value.value.data();
+        const char* start_bound = value.value().data();
         char* end_bound;
         for (auto* ptr : {&current, &max}) {
+            errno = 0;
             *ptr = std::strtoull(start_bound, &end_bound, 10);
-            if (*ptr == ULLONG_MAX) {
-                return make_ready_future();;
+            if (errno == ERANGE) {
+                return make_ready_future();
             }
             start_bound = end_bound + 1;
         }
         if (max == 0) {
             return make_ready_future();
         }
+        errno = 0;
         ticks = std::strtoll(start_bound, &end_bound, 10);
-        if (ticks == 0 || ticks == LLONG_MAX || end_bound != value.value.data() + value.value.size()) {
+        if (ticks == 0 || errno == ERANGE || end_bound != value.value().data() + value.value().size()) {
             return make_ready_future();
         }
         auto backlog = view_update_backlog_timestamped{db::view::update_backlog{current, max}, ticks};
-        auto[it, inserted] = _sp.local()._view_update_backlogs.try_emplace(endpoint, std::move(backlog));
-        if (!inserted && it->second.ts < backlog.ts) {
-            it->second = std::move(backlog);
-        }
-    }
-    return make_ready_future();
+        return _sp.invoke_on_all([id = _gossiper.get_host_id(endpoint), backlog] (service::storage_proxy& sp) {
+            auto[it, inserted] = sp._view_update_backlogs.try_emplace(id, backlog);
+            if (!inserted && it->second.ts < backlog.ts) {
+                it->second = backlog;
+            }
+            return make_ready_future();
+        });
+    });
 }
 
-future<> view_update_backlog_broker::on_remove(gms::inet_address endpoint) {
-    _sp.local()._view_update_backlogs.erase(endpoint);
+future<> view_update_backlog_broker::on_remove(gms::inet_address endpoint, gms::permit_id) {
+    _sp.local()._view_update_backlogs.erase(_gossiper.get_host_id(endpoint));
     return make_ready_future();
 }
 

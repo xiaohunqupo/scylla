@@ -16,7 +16,7 @@ To repair **all** of the data in the cluster, you need to run a repair on **all*
   It is strongly recommended to **not** do **any** maintenance operations (add/remove/decommission/replace/rebuild) **or** schema changes (CREATE/DROP/TRUNCATE/ALTER CQL commands) while repairs are running. Repairs running during any of these operations are likely ro result in an error.
 
 
-Scylla nodetool repair command supports the following options:
+ScyllaDB nodetool repair command supports the following options:
                                                                                                          
 
 - ``-dc`` ``--in-dc`` syncs the **repair master** data subset between all nodes in one Data Center (DC). 
@@ -41,14 +41,6 @@ Scylla nodetool repair command supports the following options:
 
      nodetool repair -et 90874935784
      nodetool repair --end-token 90874935784
-
-- ``-seq``, ``--sequential`` Use *-seq* to carry out a sequential repair.
-
-  For example, a sequential repair of all keyspaces on a node:
-
-  ::
-
-     nodetool repair -seq
      
 - ``-hosts`` ``--in-hosts`` syncs the **repair master** data subset only between a list of nodes, using host ID or Address. The list *must* include the **repair master**.
 

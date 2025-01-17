@@ -5,11 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "cql3/statements/select_statement.hh"
 #include "cql3/expr/expression.hh"
+#include "cql3/expr/evaluate.hh"
+#include "cql3/expr/expr-utils.hh"
 #include "cql3/statements/index_target.hh"
 #include "cql3/statements/raw/select_statement.hh"
 #include "cql3/query_processor.hh"
@@ -17,15 +19,16 @@
 #include "cql3/statements/strongly_consistent_select_statement.hh"
 
 #include "service/broadcast_tables/experimental/lang.hh"
+#include "service/qos/qos_common.hh"
 #include "transport/messages/result_message.hh"
 #include "cql3/functions/as_json_function.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/util.hh"
 #include "cql3/restrictions/statement_restrictions.hh"
-#include "cql3/selection/selector_factories.hh"
 #include "validation.hh"
 #include "exceptions/unrecognized_entity_exception.hh"
 #include <optional>
+#include <ranges>
 #include <seastar/core/shared_ptr.hh>
 #include "query-result-reader.hh"
 #include "query_ranges_to_vnodes.hh"
@@ -40,11 +43,13 @@
 #include "db/consistency_level_validations.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "test/lib/select_statement_utils.hh"
-#include <boost/algorithm/cxx11/any_of.hpp>
 #include "gms/feature_service.hh"
-#include "utils/result.hh"
+#include "utils/assert.hh"
 #include "utils/result_combinators.hh"
 #include "utils/result_loop.hh"
+#include "replica/database.hh"
+#include "replica/mutation_dump.hh"
+
 
 template<typename T = void>
 using coordinator_result = cql3::statements::select_statement::coordinator_result<T>;
@@ -54,6 +59,8 @@ bool is_internal_keyspace(std::string_view name);
 namespace cql3 {
 
 namespace statements {
+
+static logging::logger logger("select_statement");
 
 template<typename C>
 struct result_to_error_message_wrapper {
@@ -84,6 +91,12 @@ struct result_to_error_message_wrapper {
 template<typename C>
 auto wrap_result_to_error_message(C&& c) {
     return result_to_error_message_wrapper<C>{std::move(c)};
+}
+
+template <typename T>
+shared_ptr<cql_transport::messages::result_message::exception>
+failed_result_to_result_message(coordinator_result<T>&& r) {
+    return ::make_shared<cql_transport::messages::result_message::exception>(std::move(r).assume_error());
 }
 
 static constexpr int DEFAULT_INTERNAL_PAGING_SIZE = select_statement::DEFAULT_COUNT_PAGE_SIZE;
@@ -125,6 +138,10 @@ bool select_statement::parameters::is_json() const {
    return _statement_subtype == statement_subtype::JSON;
 }
 
+bool select_statement::parameters::is_mutation_fragments() const {
+   return _statement_subtype == statement_subtype::MUTATION_FRAGMENTS;
+}
+
 bool select_statement::parameters::allow_filtering() const {
     return _allow_filtering;
 }
@@ -164,6 +181,7 @@ select_statement::select_statement(schema_ptr schema,
                                    std::unique_ptr<attributes> attrs)
     : cql_statement(select_timeout(*restrictions))
     , _schema(schema)
+    , _query_schema(is_reversed ? schema->get_reversed() : schema)
     , _bound_terms(bound_terms)
     , _parameters(std::move(parameters))
     , _selection(std::move(selection))
@@ -187,7 +205,18 @@ select_statement::select_statement(schema_ptr schema,
 }
 
 db::timeout_clock::duration select_statement::get_timeout(const service::client_state& state, const query_options& options) const {
-    return _attrs->is_timeout_set() ? _attrs->get_timeout(options) : state.get_timeout_config().*get_timeout_config_selector();
+    if (_attrs->is_timeout_set()) {
+        return _attrs->get_timeout(options);
+    }
+
+    if (_attrs->is_service_level_set()) {
+        auto slo = _attrs->get_service_level(state.get_service_level_controller());
+        if (auto* timeout = std::get_if<lowres_clock::duration>(&slo.timeout)) {
+            return *timeout;
+        }
+    }
+
+    return state.get_timeout_config().*get_timeout_config_selector();
 }
 
 ::shared_ptr<const cql3::metadata> select_statement::get_result_metadata() const {
@@ -204,15 +233,19 @@ future<> select_statement::check_access(query_processor& qp, const service::clie
         const data_dictionary::database db = qp.db();
         auto&& s = db.find_schema(keyspace(), column_family());
         auto& cf_name = s->is_view() ? s->view_info()->base_name() : column_family();
-        return state.has_column_family_access(db, keyspace(), cf_name, auth::permission::SELECT);
+        co_await state.has_column_family_access(keyspace(), cf_name, auth::permission::SELECT);
     } catch (const data_dictionary::no_such_column_family& e) {
         // Will be validated afterwards.
-        return make_ready_future<>();
+        co_return;
     }
-}
-
-void select_statement::validate(query_processor&, const service::client_state& state) const {
-    // Nothing to do, all validation has been done by raw_statemet::prepare()
+    if (!_selection->is_trivial()) {
+        std::vector<::shared_ptr<functions::function>> used_functions = _selection->used_functions();
+        auto not_native = [] (::shared_ptr<functions::function> func) { return !func->is_native(); };
+        for (const auto& used_function : used_functions | std::ranges::views::filter(not_native)) {
+            sstring encoded_signature = auth::encode_signature(used_function->name().name, used_function->arg_types());
+            co_await state.has_function_access(used_function->name().keyspace, encoded_signature, auth::permission::EXECUTE);
+        }
+    }
 }
 
 bool select_statement::depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const {
@@ -262,33 +295,48 @@ select_statement::make_partition_slice(const query_options& options) const
     }
     if (_is_reversed) {
         std::reverse(bounds.begin(), bounds.end());
+        for (auto& bound : bounds) {
+            bound = query::reverse(bound);
+        }
         ++_stats.reverse_queries;
     }
+
+    const uint64_t per_partition_limit = get_inner_loop_limit(get_limit(options, _per_partition_limit),
+        _selection->is_aggregate());
     return query::partition_slice(std::move(bounds),
-        std::move(static_columns), std::move(regular_columns), _opts, nullptr, get_per_partition_limit(options));
+        std::move(static_columns), std::move(regular_columns), _opts, nullptr, per_partition_limit);
 }
 
-uint64_t select_statement::do_get_limit(const query_options& options,
-                                        const std::optional<expr::expression>& limit,
-                                        const expr::unset_bind_variable_guard& limit_unset_guard,
-                                        uint64_t default_limit) const {
-    if (!limit.has_value() || limit_unset_guard.is_unset(options) || _selection->is_aggregate()) {
-        return default_limit;
-    }
-
-    auto val = expr::evaluate(*limit, options);
-    if (val.is_null()) {
-        throw exceptions::invalid_request_exception("Invalid null value of limit");
+select_statement::get_limit_result select_statement::get_limit(
+    const query_options& options, const std::optional<expr::expression>& limit, bool is_per_partition_limit) const
+{
+    if (!limit.has_value()) {
+        return bo::success(query::max_rows);
     }
     try {
+        auto val = expr::evaluate(*limit, options);
+        if (val.is_null()) {
+            return bo::failure(exceptions::invalid_request_exception("Invalid null value of limit"));
+        }
         auto l = val.view().validate_and_deserialize<int32_t>(*int32_type);
         if (l <= 0) {
-            throw exceptions::invalid_request_exception("LIMIT must be strictly positive");
+            auto msg = is_per_partition_limit ? "PER PARTITION LIMIT must be strictly positive" : "LIMIT must be strictly positive";
+            return bo::failure(exceptions::invalid_request_exception(msg));
         }
-        return l;
+        return bo::success(l);
     } catch (const marshal_exception& e) {
-        throw exceptions::invalid_request_exception("Invalid limit value");
+        return bo::failure(exceptions::invalid_request_exception("Invalid limit value"));
+    } catch (const exceptions::invalid_request_exception& e) {
+        return bo::failure(e);
     }
+}
+
+uint64_t select_statement::get_inner_loop_limit(const select_statement::get_limit_result& limit, bool is_aggregate)
+{
+    if (!limit.has_value() || is_aggregate) {
+        return query::max_rows;
+    }
+    return limit.value();
 }
 
 bool select_statement::needs_post_query_ordering() const {
@@ -310,16 +358,18 @@ static thread_local inheriting_concrete_execution_stage<
 future<shared_ptr<cql_transport::messages::result_message>>
 select_statement::execute(query_processor& qp,
                              service::query_state& state,
-                             const query_options& options) const
+                             const query_options& options,
+                             std::optional<service::group0_guard> guard) const
 {
-    return execute_without_checking_exception_message(qp, state, options)
+    return execute_without_checking_exception_message(qp, state, options, std::move(guard))
             .then(cql_transport::messages::propagate_exception_as_future<shared_ptr<cql_transport::messages::result_message>>);
 }
 
 future<shared_ptr<cql_transport::messages::result_message>>
 select_statement::execute_without_checking_exception_message(query_processor& qp,
                              service::query_state& state,
-                             const query_options& options) const
+                             const query_options& options,
+                             std::optional<service::group0_guard> guard) const
 {
     return select_stage(this, seastar::ref(qp), seastar::ref(state), seastar::cref(options));
 }
@@ -329,13 +379,16 @@ select_statement::do_execute(query_processor& qp,
                           service::query_state& state,
                           const query_options& options) const
 {
+    (void)validation::validate_column_family(qp.db(), keyspace(), column_family());
+
     tracing::add_table_name(state.get_trace_state(), keyspace(), column_family());
 
     auto cl = options.get_consistency();
 
     validate_for_read(cl);
 
-    uint64_t limit = get_limit(options);
+    const auto parsed_limit = get_limit(options, _limit);
+    const uint64_t inner_loop_limit = get_inner_loop_limit(parsed_limit, _selection->is_aggregate());
     auto now = gc_clock::now();
 
     _stats.filtered_reads += _restrictions_need_filtering;
@@ -352,12 +405,12 @@ select_statement::do_execute(query_processor& qp,
     auto slice = make_partition_slice(options);
     auto max_result_size = qp.proxy().get_max_result_size(slice);
     auto command = ::make_lw_shared<query::read_command>(
-            _schema->id(),
-            _schema->version(),
+            _query_schema->id(),
+            _query_schema->version(),
             std::move(slice),
             max_result_size,
             query::tombstone_limit(qp.proxy().get_tombstone_limit()),
-            query::row_limit(limit),
+            query::row_limit(inner_loop_limit),
             query::partition_limit(query::max_partitions),
             now,
             tracing::make_trace_info(state.get_trace_state()),
@@ -365,29 +418,44 @@ select_statement::do_execute(query_processor& qp,
             query::is_first_page::no,
             options.get_timestamp(state));
     command->allow_limit = db::allow_per_partition_rate_limit::yes;
+    logger.trace("Executing read query (reversed {}): table schema {}, query schema {}",
+        slice.is_reversed(), _schema->version(), _query_schema->version());
+    tracing::trace(state.get_trace_state(), "Executing read query (reversed {})", slice.is_reversed());
 
     int32_t page_size = options.get_page_size();
 
     _stats.unpaged_select_queries(_ks_sel) += page_size <= 0;
 
-    // An aggregation query will never be paged for the user, but we always page it internally to avoid OOM.
-    // If we user provided a page_size we'll use that to page internally (because why not), otherwise we use our default
-    // Note that if there are some nodes in the cluster with a version less than 2.0, we can't use paging (CASSANDRA-6707).
+    // An aggregation query may not be paged for the user, but we always page it internally to avoid OOM.
+    // If the user provided a page_size we'll use that to page internally (because why not), otherwise we use our default
     // Also note: all GROUP BY queries are considered aggregation.
     const bool aggregate = _selection->is_aggregate() || has_group_by();
     const bool nonpaged_filtering = _restrictions_need_filtering && page_size <= 0;
     if (aggregate || nonpaged_filtering) {
-        page_size = internal_paging_size;
+        page_size = page_size <= 0 ? internal_paging_size : page_size;
     }
 
     auto key_ranges = _restrictions->get_partition_key_ranges(options);
+
+    auto token = dht::token();
+    std::optional<locator::tablet_routing_info> tablet_info = {};
+
+    auto&& table = _schema->table();
+    if (_may_use_token_aware_routing && table.uses_tablets() && state.get_client_state().is_protocol_extension_set(cql_transport::cql_protocol_extension::TABLETS_ROUTING_V1)) {
+        if (key_ranges.size() == 1 && query::is_single_partition(key_ranges.front())) {
+            token = key_ranges[0].start()->value().as_decorated_key().token();
+
+            auto erm = table.get_effective_replication_map();
+            tablet_info = erm->check_locality(token);
+        }
+    }
 
     if (db::is_serial_consistency(options.get_consistency())) {
         if (key_ranges.size() != 1 || !query::is_single_partition(key_ranges.front())) {
              throw exceptions::invalid_request_exception(
                      "SERIAL/LOCAL_SERIAL consistency may only be requested for one partition at a time");
         }
-        unsigned shard = dht::shard_of(*_schema, key_ranges[0].start()->value().as_decorated_key().token());
+        unsigned shard = table.shard_for_reads(key_ranges[0].start()->value().as_decorated_key().token());
         if (this_shard_id() != shard) {
             return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(
                     qp.bounce_to_shard(shard, std::move(const_cast<cql3::query_options&>(options).take_cached_pk_function_calls()))
@@ -395,40 +463,64 @@ select_statement::do_execute(query_processor& qp,
         }
     }
 
+    auto f = make_ready_future<shared_ptr<cql_transport::messages::result_message>>();
+
     if (!aggregate && !_restrictions_need_filtering && (page_size <= 0
-            || !service::pager::query_pagers::may_need_paging(*_schema, page_size,
+            || !service::pager::query_pagers::may_need_paging(*_query_schema, page_size,
                     *command, key_ranges))) {
-        return execute_without_checking_exception_message(qp, command, std::move(key_ranges), state, options, now);
+        f = execute_without_checking_exception_message_non_aggregate_unpaged(qp, command, std::move(key_ranges), state, options, now);
+    } else {
+        f = execute_without_checking_exception_message_aggregate_or_paged(qp, command,
+            std::move(key_ranges), state, options, now, page_size, aggregate,
+            nonpaged_filtering, parsed_limit.has_value() ? parsed_limit.value() : query::max_rows);
     }
 
+    if (!tablet_info.has_value()) {
+        return f;
+    }
+
+    return f.then([tablet_replicas = std::move(tablet_info->tablet_replicas), token_range = tablet_info->token_range] (auto res) mutable {
+        res->add_tablet_info(std::move(tablet_replicas), token_range);
+        return res;
+    });
+}
+
+future<::shared_ptr<cql_transport::messages::result_message>>
+select_statement::execute_without_checking_exception_message_aggregate_or_paged(query_processor& qp,
+        lw_shared_ptr<query::read_command> command, dht::partition_range_vector&& key_ranges, service::query_state& state,
+        const query_options& options, gc_clock::time_point now, int32_t page_size, bool aggregate, bool nonpaged_filtering,
+        uint64_t limit) const {
     command->slice.options.set<query::partition_slice::option::allow_short_read>();
     auto timeout_duration = get_timeout(state.get_client_state(), options);
     auto timeout = db::timeout_clock::now() + timeout_duration;
-    auto p = service::pager::query_pagers::pager(qp.proxy(), _schema, _selection,
+    auto p = service::pager::query_pagers::pager(qp.proxy(), _query_schema, _selection,
             state, options, command, std::move(key_ranges), _restrictions_need_filtering ? _restrictions : nullptr);
 
+    auto per_partition_limit = get_limit(options, _per_partition_limit, true);
+
     if (aggregate || nonpaged_filtering) {
-        return do_with(
-                cql3::selection::result_set_builder(*_selection, now,
-                        *_group_by_cell_indices), std::move(p),
-                [this, page_size, now, timeout](auto& builder, std::unique_ptr<service::pager::query_pager>& p) {
-                    return utils::result_do_until([&p] {return p->is_exhausted();},
-                            [&p, &builder, page_size, now, timeout] {
-                                return p->fetch_page_result(builder, page_size, now, timeout);
-                            }
-                    ).then(wrap_result_to_error_message([this, &p, &builder] {
-                        return builder.with_thread_if_needed([this, &p, &builder] {
-                            auto rs = builder.build();
-                            if (_restrictions_need_filtering) {
-                                _stats.filtered_rows_read_total += p->stats().rows_read_total;
-                                _stats.filtered_rows_matched_total += rs->size();
-                            }
-                            update_stats_rows_read(rs->size());
-                            auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
-                            return shared_ptr<cql_transport::messages::result_message>(std::move(msg));
-                        });
-                    }));
-                });
+        auto builder = cql3::selection::result_set_builder(*_selection, now, &options, *_group_by_cell_indices, limit, per_partition_limit.value());
+        coordinator_result<void> result_void = co_await utils::result_do_until(
+                [&p, &builder, limit] {
+                    return p->is_exhausted() || (limit < builder.result_set_size());
+                },
+                [&p, &builder, page_size, now, timeout] {
+                    return p->fetch_page_result(builder, page_size, now, timeout);
+                }
+        );
+        if (result_void.has_error()) {
+            co_return failed_result_to_result_message(std::move(result_void));
+        }
+        co_return co_await builder.with_thread_if_needed([this, &p, &builder] {
+            auto rs = builder.build();
+            if (_restrictions_need_filtering) {
+                _stats.filtered_rows_read_total += p->stats().rows_read_total;
+                _stats.filtered_rows_matched_total += rs->size();
+            }
+            update_stats_rows_read(rs->size());
+            auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
+            return shared_ptr<cql_transport::messages::result_message>(std::move(msg));
+        });
     }
 
     if (needs_post_query_ordering()) {
@@ -438,37 +530,42 @@ select_statement::do_execute(query_processor& qp,
     }
 
     if (_selection->is_trivial() && !_restrictions_need_filtering && !_per_partition_limit) {
-        return p->fetch_page_generator_result(page_size, now, timeout, _stats).then(wrap_result_to_error_message([this, p = std::move(p)] (result_generator&& generator) {
-            auto meta = [&] () -> shared_ptr<const cql3::metadata> {
-                if (!p->is_exhausted()) {
-                    auto meta = make_shared<metadata>(*_selection->get_result_metadata());
-                    meta->set_paging_state(p->state());
-                    return meta;
-                } else {
-                    return _selection->get_result_metadata();
-                }
-            }();
+        coordinator_result<result_generator> result_gen = co_await p->fetch_page_generator_result(page_size, now, timeout, _stats);
+        if (result_gen.has_error()) {
+            co_return failed_result_to_result_message(std::move(result_gen));
+        }
+        result_generator&& generator = std::move(result_gen).assume_value();
+        auto meta = [&] () -> shared_ptr<const cql3::metadata> {
+            if (!p->is_exhausted()) {
+                auto meta = make_shared<metadata>(*_selection->get_result_metadata());
+                meta->set_paging_state(p->state());
+                return meta;
+            } else {
+                return _selection->get_result_metadata();
+            }
+        }();
 
-            return shared_ptr<cql_transport::messages::result_message>(
-                make_shared<cql_transport::messages::result_message::rows>(result(std::move(generator), std::move(meta)))
-            );
-        }));
+        co_return shared_ptr<cql_transport::messages::result_message>(
+            ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(generator), std::move(meta)))
+        );
     }
 
-    return p->fetch_page_result(page_size, now, timeout).then(wrap_result_to_error_message(
-            [this, p = std::move(p)](std::unique_ptr<cql3::result_set>&& rs) {
-                if (!p->is_exhausted()) {
-                    rs->get_metadata().set_paging_state(p->state());
-                }
+    coordinator_result<std::unique_ptr<cql3::result_set>> result_rs = co_await p->fetch_page_result(page_size, now, timeout);
+    if (result_rs.has_error()) {
+        co_return failed_result_to_result_message(std::move(result_rs));
+    }
+    std::unique_ptr<cql3::result_set>&& rs = std::move(result_rs).assume_value();
+    if (!p->is_exhausted()) {
+        rs->get_metadata().set_paging_state(p->state());
+    }
 
-                if (_restrictions_need_filtering) {
-                    _stats.filtered_rows_read_total += p->stats().rows_read_total;
-                    _stats.filtered_rows_matched_total += rs->size();
-                }
-                update_stats_rows_read(rs->size());
-                auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
-                return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(std::move(msg));
-            }));
+    if (_restrictions_need_filtering) {
+        _stats.filtered_rows_read_total += p->stats().rows_read_total;
+        _stats.filtered_rows_matched_total += rs->size();
+    }
+    update_stats_rows_read(rs->size());
+    auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
+    co_return msg;
 }
 
 template<typename KeyType>
@@ -529,7 +626,7 @@ indexed_table_select_statement::prepare_command_for_base_query(query_processor& 
             std::move(slice),
             qp.proxy().get_max_result_size(slice),
             query::tombstone_limit(qp.proxy().get_tombstone_limit()),
-            query::row_limit(get_limit(options)),
+            query::row_limit(get_inner_loop_limit(get_limit(options, _limit), _selection->is_aggregate())),
             query::partition_limit(query::max_partitions),
             now,
             tracing::make_trace_info(state.get_trace_state()),
@@ -552,7 +649,9 @@ indexed_table_select_statement::do_execute_base_query(
     auto cmd = prepare_command_for_base_query(qp, options, state, now, bool(paging_state));
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
     uint32_t queried_ranges_count = partition_ranges.size();
-    query_ranges_to_vnodes_generator ranges_to_vnodes(qp.proxy().get_token_metadata_ptr(), _schema, std::move(partition_ranges));
+    auto&& table = qp.proxy().local_db().find_column_family(_schema);
+    auto erm = table.get_effective_replication_map();
+    query_ranges_to_vnodes_generator ranges_to_vnodes(erm->make_splitter(), _schema, std::move(partition_ranges));
 
     struct base_query_state {
         query::result_merger merger;
@@ -595,7 +694,7 @@ indexed_table_select_statement::do_execute_base_query(
                     auto base_ck = generate_base_key_from_index_pk<clustering_key>(old_paging_state->get_partition_key(),
                             old_paging_state->get_clustering_key(), *_schema, *_view_schema);
 
-                    query::trim_clustering_row_ranges_to(*_schema, row_ranges, base_ck, false);
+                    query::trim_clustering_row_ranges_to(*_schema, row_ranges, base_ck);
                     command->slice.set_range(*_schema, base_pk, row_ranges);
                 } else {
                     // There is no clustering key in old_paging_state and/or no clustering key in 
@@ -609,9 +708,9 @@ indexed_table_select_statement::do_execute_base_query(
                     //
                     // This means that we should not set a open_ended_both_sides
                     // clustering range on base_pk, instead intersect it with
-                    // _row_ranges (which contains the restrictions neccessary for the
+                    // _row_ranges (which contains the restrictions necessary for the
                     // case described above). The result of such intersection is just
-                    // _row_ranges, which we explicity set on base_pk.
+                    // _row_ranges, which we explicitly set on base_pk.
                     command->slice.set_range(*_schema, base_pk, row_ranges);
                 }
             }
@@ -730,19 +829,19 @@ indexed_table_select_statement::execute_base_query(
 }
 
 future<shared_ptr<cql_transport::messages::result_message>>
-select_statement::execute(query_processor& qp,
+select_statement::execute_non_aggregate_unpaged(query_processor& qp,
                           lw_shared_ptr<query::read_command> cmd,
                           dht::partition_range_vector&& partition_ranges,
                           service::query_state& state,
                           const query_options& options,
                           gc_clock::time_point now) const
 {
-    return execute_without_checking_exception_message(qp, std::move(cmd), std::move(partition_ranges), state, options, now)
+    return execute_without_checking_exception_message_non_aggregate_unpaged(qp, std::move(cmd), std::move(partition_ranges), state, options, now)
             .then(cql_transport::messages::propagate_exception_as_future<shared_ptr<cql_transport::messages::result_message>>);
 }
 
 future<shared_ptr<cql_transport::messages::result_message>>
-select_statement::execute_without_checking_exception_message(query_processor& qp,
+select_statement::execute_without_checking_exception_message_non_aggregate_unpaged(query_processor& qp,
                           lw_shared_ptr<query::read_command> cmd,
                           dht::partition_range_vector&& partition_ranges,
                           service::query_state& state,
@@ -756,12 +855,12 @@ select_statement::execute_without_checking_exception_message(query_processor& qp
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
     if (needs_post_query_ordering() && _limit) {
         return do_with(std::forward<dht::partition_range_vector>(partition_ranges), [this, &qp, &state, &options, cmd, timeout](auto& prs) {
-            assert(cmd->partition_limit == query::max_partitions);
+            SCYLLA_ASSERT(cmd->partition_limit == query::max_partitions);
             query::result_merger merger(cmd->get_row_limit() * prs.size(), query::max_partitions);
             return utils::result_map_reduce(prs.begin(), prs.end(), [this, &qp, &state, &options, cmd, timeout] (auto& pr) {
                 dht::partition_range_vector prange { pr };
                 auto command = ::make_lw_shared<query::read_command>(*cmd);
-                return qp.proxy().query_result(_schema,
+                return qp.proxy().query_result(_query_schema,
                         command,
                         std::move(prange),
                         options.get_consistency(),
@@ -773,7 +872,7 @@ select_statement::execute_without_checking_exception_message(query_processor& qp
             return this->process_results(std::move(result), cmd, options, now);
         }));
     } else {
-        return qp.proxy().query_result(_schema, cmd, std::move(partition_ranges), options.get_consistency(), {timeout, state.get_permit(), state.get_client_state(), state.get_trace_state()})
+        return qp.proxy().query_result(_query_schema, cmd, std::move(partition_ranges), options.get_consistency(), {timeout, state.get_permit(), state.get_client_state(), state.get_trace_state()})
             .then(wrap_result_to_error_message([this, &options, now, cmd] (service::storage_proxy::coordinator_query_result qr) {
                 return this->process_results(std::move(qr.query_result), cmd, options, now);
             }));
@@ -805,8 +904,8 @@ select_statement::process_results(foreign_ptr<lw_shared_ptr<query::result>> resu
     const bool fast_path = !needs_post_query_ordering() && _selection->is_trivial() && !_restrictions_need_filtering;
     if (fast_path) {
         return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(make_shared<cql_transport::messages::result_message::rows>(result(
-            result_generator(_schema, std::move(results), std::move(cmd), _selection, _stats),
-            ::make_shared<metadata>(*_selection->get_result_metadata()))
+            result_generator(_query_schema, std::move(results), std::move(cmd), _selection, _stats),
+            _selection->get_result_metadata())
         ));
     }
     return process_results_complex(std::move(results), std::move(cmd), options, now);
@@ -817,17 +916,17 @@ select_statement::process_results_complex(foreign_ptr<lw_shared_ptr<query::resul
                                   lw_shared_ptr<query::read_command> cmd,
                                   const query_options& options,
                                   gc_clock::time_point now) const {
-    cql3::selection::result_set_builder builder(*_selection, now);
+    cql3::selection::result_set_builder builder(*_selection, now, &options);
     co_return co_await builder.with_thread_if_needed([&] {
         if (_restrictions_need_filtering) {
             results->ensure_counts();
             _stats.filtered_rows_read_total += *results->row_count();
             query::result_view::consume(*results, cmd->slice,
-                    cql3::selection::result_set_builder::visitor(builder, *_schema,
-                            *_selection, cql3::selection::result_set_builder::restrictions_filter(_restrictions, options, cmd->get_row_limit(), _schema, cmd->slice.partition_row_limit())));
+                    cql3::selection::result_set_builder::visitor(builder, *_query_schema,
+                            *_selection, cql3::selection::result_set_builder::restrictions_filter(_restrictions, options, cmd->get_row_limit(), _query_schema, cmd->slice.partition_row_limit())));
         } else {
             query::result_view::consume(*results, cmd->slice,
-                    cql3::selection::result_set_builder::visitor(builder, *_schema,
+                    cql3::selection::result_set_builder::visitor(builder, *_query_schema,
                             *_selection));
         }
         auto rs = builder.build();
@@ -865,7 +964,7 @@ primary_key_select_statement::primary_key_select_statement(schema_ptr schema, ui
     if (_ks_sel == ks_selector::NONSYSTEM) {
         if (_restrictions->need_filtering() ||
                 _restrictions->partition_key_restrictions_is_empty() ||
-                (has_token(_restrictions->get_partition_key_restrictions()) &&
+                (_restrictions->has_token_restrictions() &&
                  !find(_restrictions->get_partition_key_restrictions(), expr::oper_t::EQ))) {
             _range_scan = true;
             if (!_parameters->bypass_cache())
@@ -889,21 +988,14 @@ indexed_table_select_statement::prepare(data_dictionary::database db,
                                          cql_stats &stats,
                                          std::unique_ptr<attributes> attrs)
 {
-    auto& sim = db.find_column_family(schema).get_index_manager();
+    auto cf = db.find_column_family(schema);
+    auto& sim = cf.get_index_manager();
     auto [index_opt, used_index_restrictions] = restrictions->find_idx(sim);
     if (!index_opt) {
         throw std::runtime_error("No index found.");
     }
 
-    const auto& im = index_opt->metadata();
-    sstring index_table_name = im.name() + "_index";
-    schema_ptr view_schema = db.find_schema(schema->ks_name(), index_table_name);
-
-    if (im.local()) {
-        restrictions->prepare_indexed_local(*view_schema);
-    } else {
-        restrictions->prepare_indexed_global(*view_schema);
-    }
+    schema_ptr view_schema = restrictions->get_view_schema();
 
     return ::make_shared<cql3::statements::indexed_table_select_statement>(
             schema,
@@ -968,16 +1060,12 @@ static void append_base_key_to_index_ck(std::vector<managed_bytes_view>& explode
 
 bytes indexed_table_select_statement::compute_idx_token(const partition_key& key) const {
     const column_definition& cdef = *_view_schema->clustering_key_columns().begin();
-    clustering_row empty_row(clustering_key_prefix::make_empty());
-    bytes computed_value;
     if (!cdef.is_computed()) {
-        // FIXME(pgrabowski): this legacy code is here for backward compatibility and should be removed
-        // once "computed_columns feature" is supported by every node
-        computed_value = legacy_token_column_computation().compute_value(*_schema, key);
-    } else {
-        computed_value = cdef.get_computation().compute_value(*_schema, key);
+        throw std::logic_error{format(
+            "Detected legacy non-computed token column {} in table {}.{}",
+            cdef.name_as_text(), _schema->ks_name(), _schema->cf_name())};
     }
-    return computed_value;
+    return cdef.get_computation().compute_value(*_schema, key);
 }
 
 lw_shared_ptr<const service::pager::paging_state> indexed_table_select_statement::generate_view_paging_state_from_base_query_results(lw_shared_ptr<const service::pager::paging_state> paging_state,
@@ -996,7 +1084,7 @@ lw_shared_ptr<const service::pager::paging_state> indexed_table_select_statement
     auto& last_base_pk = last_pos.partition;
     auto* last_base_ck = last_pos.position.has_key() ? &last_pos.position.key() : nullptr;
 
-    bytes_opt indexed_column_value = expr::value_for(*cdef, _used_index_restrictions, options);
+    bytes_opt indexed_column_value = restrictions::value_for(*cdef, _used_index_restrictions, options);
 
     auto index_pk = [&]() {
         if (_index.metadata().local()) {
@@ -1054,7 +1142,7 @@ indexed_table_select_statement::do_execute(query_processor& qp,
             ? source_selector::INTERNAL : source_selector::USER;
     ++_stats.query_cnt(src_sel, _ks_sel, cond_selector::NO_CONDITIONS, statement_type::SELECT);
 
-    assert(_restrictions->uses_secondary_indexing());
+    SCYLLA_ASSERT(_restrictions->uses_secondary_indexing());
 
     _stats.unpaged_select_queries(_ks_sel) += options.get_page_size() <= 0;
 
@@ -1104,72 +1192,88 @@ indexed_table_select_statement::do_execute(query_processor& qp,
     // the paging state between requesting data from replicas.
     const bool aggregate = _selection->is_aggregate() || has_group_by();
     if (aggregate) {
-        return do_with(cql3::selection::result_set_builder(*_selection, now, *_group_by_cell_indices), std::make_unique<cql3::query_options>(cql3::query_options(options)),
-                [this, &options, &qp, &state, now, whole_partitions, partition_slices] (cql3::selection::result_set_builder& builder, std::unique_ptr<cql3::query_options>& internal_options) {
-            // page size is set to the internal count page size, regardless of the user-provided value
-            internal_options.reset(new cql3::query_options(std::move(internal_options), options.get_paging_state(), internal_paging_size));
-            return utils::result_repeat([this, &builder, &options, &internal_options, &qp, &state, now, whole_partitions, partition_slices] () {
-                auto consume_results = [this, &builder, &options, &internal_options, &state] (foreign_ptr<lw_shared_ptr<query::result>> results, lw_shared_ptr<query::read_command> cmd, lw_shared_ptr<const service::pager::paging_state> paging_state) -> coordinator_result<stop_iteration> {
-                    if (paging_state) {
-                        paging_state = generate_view_paging_state_from_base_query_results(paging_state, results, state, options);
-                    }
-                    internal_options.reset(new cql3::query_options(std::move(internal_options), paging_state ? make_lw_shared<service::pager::paging_state>(*paging_state) : nullptr));
-                    if (_restrictions_need_filtering) {
-                        _stats.filtered_rows_read_total += *results->row_count();
-                        query::result_view::consume(*results, cmd->slice, cql3::selection::result_set_builder::visitor(builder, *_schema, *_selection,
-                                cql3::selection::result_set_builder::restrictions_filter(_restrictions, options, cmd->get_row_limit(), _schema, cmd->slice.partition_row_limit())));
-                    } else {
-                        query::result_view::consume(*results, cmd->slice, cql3::selection::result_set_builder::visitor(builder, *_schema, *_selection));
-                    }
-                    bool has_more_pages = paging_state && paging_state->get_remaining() > 0;
-                    return stop_iteration(!has_more_pages);
-                };
-
-                if (whole_partitions || partition_slices) {
-                    tracing::trace(state.get_trace_state(), "Consulting index {} for a single slice of keys, aggregation query", _index.metadata().name());
-                    return find_index_partition_ranges(qp, state, *internal_options).then(utils::result_wrap_unpack(
-                            [this, now, &state, &internal_options, &qp, consume_results = std::move(consume_results)] (dht::partition_range_vector partition_ranges, lw_shared_ptr<const service::pager::paging_state> paging_state) {
-                        return do_execute_base_query(qp, std::move(partition_ranges), state, *internal_options, now, paging_state)
-                        .then(utils::result_wrap_unpack([paging_state, consume_results = std::move(consume_results)](foreign_ptr<lw_shared_ptr<query::result>> results, lw_shared_ptr<query::read_command> cmd) {
-                            return consume_results(std::move(results), std::move(cmd), std::move(paging_state));
-                        }));
-                    }));
-                } else {
-                    tracing::trace(state.get_trace_state(), "Consulting index {} for a list of rows containing keys, aggregation query", _index.metadata().name());
-                    return find_index_clustering_rows(qp, state, *internal_options).then(utils::result_wrap_unpack(
-                            [this, now, &state, &internal_options, &qp, consume_results = std::move(consume_results)] (std::vector<primary_key> primary_keys, lw_shared_ptr<const service::pager::paging_state> paging_state) {
-                        return this->do_execute_base_query(qp, std::move(primary_keys), state, *internal_options, now, paging_state)
-                        .then(utils::result_wrap_unpack([paging_state, consume_results = std::move(consume_results)](foreign_ptr<lw_shared_ptr<query::result>> results, lw_shared_ptr<query::read_command> cmd) {
-                            return consume_results(std::move(results), std::move(cmd), std::move(paging_state));
-                        }));
-                    }));
+        cql3::selection::result_set_builder builder(*_selection, now, &options, *_group_by_cell_indices);
+        std::unique_ptr<cql3::query_options> internal_options = std::make_unique<cql3::query_options>(cql3::query_options(options));
+        stop_iteration stop;
+        // page size is set to the internal count page size, regardless of the user-provided value
+        internal_options.reset(new cql3::query_options(std::move(internal_options), options.get_paging_state(), internal_paging_size));
+        do {
+            auto consume_results = [this, &builder, &options, &internal_options, &state] (foreign_ptr<lw_shared_ptr<query::result>> results, lw_shared_ptr<query::read_command> cmd, lw_shared_ptr<const service::pager::paging_state> paging_state) -> stop_iteration {
+                if (paging_state) {
+                    paging_state = generate_view_paging_state_from_base_query_results(paging_state, results, state, options);
                 }
-            }).then(wrap_result_to_error_message([this, &builder] () {
-                auto rs = builder.build();
-                update_stats_rows_read(rs->size());
-                _stats.filtered_rows_matched_total += _restrictions_need_filtering ? rs->size() : 0;
-                auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
-                return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(std::move(msg));
-            }));
-        });
+                internal_options.reset(new cql3::query_options(std::move(internal_options), paging_state ? make_lw_shared<service::pager::paging_state>(*paging_state) : nullptr));
+                if (_restrictions_need_filtering) {
+                    _stats.filtered_rows_read_total += *results->row_count();
+                    query::result_view::consume(*results, cmd->slice, cql3::selection::result_set_builder::visitor(builder, *_schema, *_selection,
+                            cql3::selection::result_set_builder::restrictions_filter(_restrictions, options, cmd->get_row_limit(), _schema, cmd->slice.partition_row_limit())));
+                } else {
+                    query::result_view::consume(*results, cmd->slice, cql3::selection::result_set_builder::visitor(builder, *_schema, *_selection));
+                }
+                bool has_more_pages = paging_state && paging_state->get_remaining() > 0;
+                return stop_iteration(!has_more_pages);
+            };
+
+            if (whole_partitions || partition_slices) {
+                tracing::trace(state.get_trace_state(), "Consulting index {} for a single slice of keys, aggregation query", _index.metadata().name());
+                auto result_partition_ranges_and_paging_state = co_await find_index_partition_ranges(qp, state, *internal_options);
+                if (result_partition_ranges_and_paging_state.has_error()) {
+                    co_return failed_result_to_result_message(std::move(result_partition_ranges_and_paging_state));
+                }
+                auto&& [partition_ranges, paging_state] = result_partition_ranges_and_paging_state.assume_value();
+                auto result_results_and_cmd = co_await do_execute_base_query(qp, std::move(partition_ranges), state, *internal_options, now, paging_state);
+                if (result_results_and_cmd.has_error()) {
+                    co_return failed_result_to_result_message(std::move(result_results_and_cmd));
+                }
+                auto&& [results, cmd] = result_results_and_cmd.assume_value();
+                stop = consume_results(std::move(results), std::move(cmd), std::move(paging_state));
+            } else {
+                tracing::trace(state.get_trace_state(), "Consulting index {} for a list of rows containing keys, aggregation query", _index.metadata().name());
+                auto result_primary_keys_paging_state = co_await find_index_clustering_rows(qp, state, *internal_options);
+                if (result_primary_keys_paging_state.has_error()) {
+                    co_return failed_result_to_result_message(std::move(result_primary_keys_paging_state));
+                }
+                auto&& [primary_keys, paging_state] = result_primary_keys_paging_state.assume_value();
+                auto result_results_cmd = co_await this->do_execute_base_query(qp, std::move(primary_keys), state, *internal_options, now, paging_state);
+                if (result_results_cmd.has_error()) {
+                    co_return failed_result_to_result_message(std::move(result_results_cmd));
+                }
+                auto&& [results, cmd] = result_results_cmd.assume_value();
+                stop = consume_results(std::move(results), std::move(cmd), std::move(paging_state));
+            }
+        } while (!stop);
+
+        auto rs = builder.build();
+        update_stats_rows_read(rs->size());
+        _stats.filtered_rows_matched_total += _restrictions_need_filtering ? rs->size() : 0;
+        auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
+        co_return shared_ptr<cql_transport::messages::result_message>(std::move(msg));
     }
 
     if (whole_partitions || partition_slices) {
         tracing::trace(state.get_trace_state(), "Consulting index {} for a single slice of keys", _index.metadata().name());
         // In this case, can use our normal query machinery, which retrieves
         // entire partitions or the same slice for many partitions.
-        return find_index_partition_ranges(qp, state, options).then(wrap_result_to_error_message([now, &state, &options, &qp, this] (std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>> result) {
-            auto&& [partition_ranges, paging_state] = result;
-            return this->execute_base_query(qp, std::move(partition_ranges), state, options, now, std::move(paging_state));
-        }));
+        coordinator_result<std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>> result = co_await find_index_partition_ranges(qp, state, options);
+        if (result.has_error()) {
+            co_return failed_result_to_result_message(std::move(result));
+        }
+        {
+            auto&& [partition_ranges, paging_state] = result.assume_value();
+            co_return co_await this->execute_base_query(qp, std::move(partition_ranges), state, options, now, std::move(paging_state));
+        }
     } else {
         tracing::trace(state.get_trace_state(), "Consulting index {} for a list of rows containing keys", _index.metadata().name());
         // In this case, we need to retrieve a list of rows (not entire
         // partitions) and then retrieve those specific rows.
-        return find_index_clustering_rows(qp, state, options).then(wrap_result_to_error_message([now, &state, &options, &qp, this] (std::tuple<std::vector<primary_key>, lw_shared_ptr<const service::pager::paging_state>> result) {
-            auto&& [primary_keys, paging_state] = result;
-            return this->execute_base_query(qp, std::move(primary_keys), state, options, now, std::move(paging_state));
-        }));
+        coordinator_result<std::tuple<std::vector<primary_key>, lw_shared_ptr<const service::pager::paging_state>>> result = co_await find_index_clustering_rows(qp, state, options);
+        if (result.has_error()) {
+            co_return failed_result_to_result_message(std::move(result));
+        }
+        {
+            auto&& [primary_keys, paging_state] = result.assume_value();
+            co_return co_await this->execute_base_query(qp, std::move(primary_keys), state, options, now, std::move(paging_state));
+        }
     }
 }
 
@@ -1185,7 +1289,7 @@ dht::partition_range_vector indexed_table_select_statement::get_partition_ranges
         throw exceptions::invalid_request_exception("Indexed column not found in schema");
     }
 
-    bytes_opt value = expr::value_for(*cdef, _used_index_restrictions, options);
+    bytes_opt value = restrictions::value_for(*cdef, _used_index_restrictions, options);
     if (value) {
         auto pk = partition_key::from_single_value(*_view_schema, *value);
         auto dk = dht::decorate_key(*_view_schema, pk);
@@ -1200,7 +1304,7 @@ query::partition_slice indexed_table_select_statement::get_partition_slice_for_g
     partition_slice_builder partition_slice_builder{*_view_schema};
 
     if (!_restrictions->has_partition_key_unrestricted_components()) {
-        bool pk_restrictions_is_single = !has_token(_restrictions->get_partition_key_restrictions());
+        bool pk_restrictions_is_single = !_restrictions->has_token_restrictions();
         // Only EQ restrictions on base partition key can be used in an index view query
         if (pk_restrictions_is_single && _restrictions->partition_key_restrictions_is_all_eq()) {
             partition_slice_builder.with_ranges(
@@ -1267,9 +1371,9 @@ indexed_table_select_statement::read_posting_list(query_processor& qp,
     int32_t page_size = options.get_page_size();
     if (page_size <= 0 || !service::pager::query_pagers::may_need_paging(*_view_schema, page_size, *cmd, partition_ranges)) {
         return qp.proxy().query_result(_view_schema, cmd, std::move(partition_ranges), options.get_consistency(), {timeout, state.get_permit(), state.get_client_state(), state.get_trace_state()})
-        .then(utils::result_wrap([this, now, selection = std::move(selection), partition_slice = std::move(partition_slice)] (service::storage_proxy::coordinator_query_result qr)
+        .then(utils::result_wrap([this, now, &options, selection = std::move(selection), partition_slice = std::move(partition_slice)] (service::storage_proxy::coordinator_query_result qr)
                 -> coordinator_result<::shared_ptr<cql_transport::messages::result_message::rows>> {
-            cql3::selection::result_set_builder builder(*selection, now);
+            cql3::selection::result_set_builder builder(*selection, now, &options);
             query::result_view::consume(*qr.query_result,
                                         std::move(partition_slice),
                                         cql3::selection::result_set_builder::visitor(builder, *_view_schema, *selection));
@@ -1296,8 +1400,9 @@ indexed_table_select_statement::find_index_partition_ranges(query_processor& qp,
     using value_type = std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>;
     auto now = gc_clock::now();
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
-    return read_posting_list(qp, options, get_limit(options), state, now, timeout, false).then(utils::result_wrap(
-            [this, now, &options] (::shared_ptr<cql_transport::messages::result_message::rows> rows) {
+    const uint64_t limit = get_inner_loop_limit(get_limit(options, _limit), _selection->is_aggregate());
+    return read_posting_list(qp, options, limit, state, now, timeout, false).then(utils::result_wrap(
+            [this, &options] (::shared_ptr<cql_transport::messages::result_message::rows> rows) {
         auto rs = cql3::untyped_result_set(rows);
         dht::partition_range_vector partition_ranges;
         partition_ranges.reserve(rs.size());
@@ -1316,7 +1421,9 @@ indexed_table_select_statement::find_index_partition_ranges(query_processor& qp,
         for (size_t i = 0; i < rs.size(); i++) {
             const auto& row = rs.at(i);
             std::vector<bytes> pk_columns;
-            for (const auto& column : row.get_columns()) {
+            const auto& columns = row.get_columns();
+            pk_columns.reserve(columns.size());
+            for (const auto& column : columns) {
                 pk_columns.push_back(row.get_blob(column->name->to_string()));
             }
             auto pk = partition_key::from_exploded(*_schema, pk_columns);
@@ -1343,8 +1450,9 @@ indexed_table_select_statement::find_index_clustering_rows(query_processor& qp, 
     using value_type = std::tuple<std::vector<indexed_table_select_statement::primary_key>, lw_shared_ptr<const service::pager::paging_state>>;
     auto now = gc_clock::now();
     auto timeout = db::timeout_clock::now() + get_timeout(state.get_client_state(), options);
-    return read_posting_list(qp, options, get_limit(options), state, now, timeout, true).then(utils::result_wrap(
-            [this, now, &options] (::shared_ptr<cql_transport::messages::result_message::rows> rows) {
+    const uint64_t limit = get_inner_loop_limit(get_limit(options, _limit), _selection->is_aggregate());
+    return read_posting_list(qp, options, limit, state, now, timeout, true).then(utils::result_wrap(
+            [this, &options] (::shared_ptr<cql_transport::messages::result_message::rows> rows) {
 
         auto rs = cql3::untyped_result_set(rows);
         std::vector<primary_key> primary_keys;
@@ -1369,12 +1477,12 @@ indexed_table_select_statement::find_index_clustering_rows(query_processor& qp, 
         }
         for (size_t i = 0; i < rs.size(); i++) {
             const auto& row = rs.at(i);
-            auto pk_columns = _schema->partition_key_columns() | boost::adaptors::transformed([&] (auto& cdef) {
+            auto pk_columns = _schema->partition_key_columns() | std::views::transform([&] (auto& cdef) {
                 return row.get_blob(cdef.name_as_text());
             });
             auto pk = partition_key::from_range(pk_columns);
             auto dk = dht::decorate_key(*_schema, pk);
-            auto ck_columns = _schema->clustering_key_columns() | boost::adaptors::transformed([&] (auto& cdef) {
+            auto ck_columns = _schema->clustering_key_columns() | std::views::transform([&] (auto& cdef) {
                 return row.get_blob(cdef.name_as_text());
             });
             auto ck = clustering_key::from_range(ck_columns);
@@ -1552,7 +1660,7 @@ parallelized_select_statement::do_execute(
     auto timeout = lowres_system_clock::now() + timeout_duration;
     auto reductions = _selection->get_reductions();
 
-    query::forward_request req = {
+    query::mapreduce_request req = {
         .reduction_types = reductions.types,
         .cmd = *command,
         .pr = std::move(key_ranges),
@@ -1562,8 +1670,8 @@ parallelized_select_statement::do_execute(
     };
 
     // dispatch execution of this statement to other nodes
-    return qp.forwarder().dispatch(req, state.get_trace_state()).then([this] (query::forward_result res) {
-        auto meta = make_shared<metadata>(*_selection->get_result_metadata());
+    return qp.mapreduce(req, state.get_trace_state()).then([this] (query::mapreduce_result res) {
+        auto meta = _selection->get_result_metadata();
         auto rs = std::make_unique<result_set>(std::move(meta));
         rs->add_row(res.query_results);
         update_stats_rows_read(rs->size());
@@ -1573,11 +1681,208 @@ parallelized_select_statement::do_execute(
     });
 }
 
+mutation_fragments_select_statement::mutation_fragments_select_statement(
+            schema_ptr output_schema,
+            schema_ptr underlying_schema,
+            uint32_t bound_terms,
+            lw_shared_ptr<const parameters> parameters,
+            ::shared_ptr<selection::selection> selection,
+            ::shared_ptr<const restrictions::statement_restrictions> restrictions,
+            ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
+            bool is_reversed,
+            ordering_comparator_type ordering_comparator,
+            std::optional<expr::expression> limit,
+            std::optional<expr::expression> per_partition_limit,
+            cql_stats &stats,
+            std::unique_ptr<cql3::attributes> attrs)
+    : select_statement(
+            std::move(output_schema),
+            bound_terms,
+            std::move(parameters),
+            std::move(selection),
+            std::move(restrictions),
+            std::move(group_by_cell_indices),
+            is_reversed,
+            std::move(ordering_comparator),
+            std::move(limit),
+            std::move(per_partition_limit),
+            stats,
+            std::move(attrs))
+    , _underlying_schema(std::move(underlying_schema))
+{ }
+
+schema_ptr mutation_fragments_select_statement::generate_output_schema(schema_ptr underlying_schema) {
+    return replica::mutation_dump::generate_output_schema_from_underlying_schema(std::move(underlying_schema));
+}
+
+future<exceptions::coordinator_result<service::storage_proxy_coordinator_query_result>>
+mutation_fragments_select_statement::do_query(
+        locator::effective_replication_map_ptr erm_keepalive,
+        locator::host_id this_node,
+        service::storage_proxy& sp,
+        schema_ptr schema,
+        lw_shared_ptr<query::read_command> cmd,
+        dht::partition_range_vector partition_ranges,
+        db::consistency_level cl,
+        service::storage_proxy_coordinator_query_options optional_params) const {
+    auto res = co_await replica::mutation_dump::dump_mutations(sp.get_db(), std::move(erm_keepalive), schema, _underlying_schema, partition_ranges, *cmd, optional_params.timeout(sp));
+    service::replicas_per_token_range last_replicas;
+    if (this_node) {
+        last_replicas.emplace(dht::token_range::make_open_ended_both_sides(), std::vector<locator::host_id>{this_node});
+    }
+    co_return service::storage_proxy_coordinator_query_result{std::move(res), std::move(last_replicas), {}};
+}
+
+future<::shared_ptr<cql_transport::messages::result_message>>
+mutation_fragments_select_statement::do_execute(query_processor& qp, service::query_state& state, const query_options& options) const {
+    tracing::add_table_name(state.get_trace_state(), keyspace(), column_family());
+
+    auto cl = options.get_consistency();
+
+    const uint64_t limit = get_inner_loop_limit(get_limit(options, _limit), _selection->is_aggregate());
+    auto now = gc_clock::now();
+
+    _stats.filtered_reads += _restrictions_need_filtering;
+
+    const source_selector src_sel = state.get_client_state().is_internal()
+            ? source_selector::INTERNAL : source_selector::USER;
+    ++_stats.query_cnt(src_sel, _ks_sel, cond_selector::NO_CONDITIONS, statement_type::SELECT);
+
+    _stats.select_bypass_caches += _parameters->bypass_cache();
+    _stats.select_allow_filtering += _parameters->allow_filtering();
+    _stats.select_partition_range_scan += _range_scan;
+    _stats.select_partition_range_scan_no_bypass_cache += _range_scan_no_bypass_cache;
+
+    auto slice = make_partition_slice(options);
+    auto max_result_size = qp.proxy().get_max_result_size(slice);
+    auto command = ::make_lw_shared<query::read_command>(
+            _schema->id(),
+            _schema->version(),
+            std::move(slice),
+            max_result_size,
+            query::tombstone_limit(qp.proxy().get_tombstone_limit()),
+            query::row_limit(limit),
+            query::partition_limit(query::max_partitions),
+            now,
+            tracing::make_trace_info(state.get_trace_state()),
+            query_id::create_null_id(),
+            query::is_first_page::no,
+            options.get_timestamp(state));
+    command->allow_limit = db::allow_per_partition_rate_limit::yes;
+
+    int32_t page_size = options.get_page_size();
+
+    _stats.unpaged_select_queries(_ks_sel) += page_size <= 0;
+
+    // An aggregation query will never be paged for the user, but we always page it internally to avoid OOM.
+    // If we user provided a page_size we'll use that to page internally (because why not), otherwise we use our default
+    // Note that if there are some nodes in the cluster with a version less than 2.0, we can't use paging (CASSANDRA-6707).
+    // Also note: all GROUP BY queries are considered aggregation.
+    const bool aggregate = _selection->is_aggregate() || has_group_by();
+    const bool nonpaged_filtering = _restrictions_need_filtering && page_size <= 0;
+    if (aggregate || nonpaged_filtering) {
+        page_size = internal_paging_size;
+    }
+
+    auto key_ranges = _restrictions->get_partition_key_ranges(options);
+
+    auto timeout_duration = get_timeout(state.get_client_state(), options);
+    auto timeout = db::timeout_clock::now() + timeout_duration;
+
+    auto& tbl = qp.proxy().local_db().find_column_family(_underlying_schema);
+
+    // Since this query doesn't go through storage-proxy, we have to take care of pinning erm here.
+    auto erm_keepalive = tbl.get_effective_replication_map();
+
+    if (!aggregate && !_restrictions_need_filtering && (page_size <= 0
+            || !service::pager::query_pagers::may_need_paging(*_schema, page_size,
+                    *command, key_ranges))) {
+        return do_query(erm_keepalive, {}, qp.proxy(), _schema, command, std::move(key_ranges), cl,
+                {timeout, state.get_permit(), state.get_client_state(), state.get_trace_state(), {}, {}})
+        .then(wrap_result_to_error_message([this, erm_keepalive, now, &options, slice = command->slice] (service::storage_proxy_coordinator_query_result&& qr) mutable {
+            cql3::selection::result_set_builder builder(*_selection, now, &options);
+            query::result_view::consume(*qr.query_result, std::move(slice),
+                    cql3::selection::result_set_builder::visitor(builder, *_schema, *_selection));
+            auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(builder.build()));
+            return ::shared_ptr<cql_transport::messages::result_message>(std::move(msg));
+        }));
+    }
+
+    locator::host_id this_node;
+    {
+        auto& topo = erm_keepalive->get_topology();
+        this_node = topo.this_node()->host_id();
+        auto state = options.get_paging_state();
+        if (state && !state->get_last_replicas().empty()) {
+            auto last_host = state->get_last_replicas().begin()->second.front();
+            if (last_host != this_node) {
+                const auto last_node = topo.find_node(last_host);
+                throw exceptions::invalid_request_exception(seastar::format(
+                            "Moving between coordinators is not allowed in SELECT FROM MUTATION_FRAGMENTS() statements, last page's coordinator was {}{}",
+                            last_host,
+                            last_node ? fmt::format("({})", last_node->host_id()) : ""));
+            }
+        }
+    }
+
+    command->slice.options.set<query::partition_slice::option::allow_short_read>();
+    auto p = service::pager::query_pagers::pager(
+            qp.proxy(),
+            _schema,
+            _selection,
+            state,
+            options,
+            command,
+            std::move(key_ranges),
+            _restrictions_need_filtering ? _restrictions : nullptr,
+            [this, erm_keepalive, this_node] (service::storage_proxy& sp, schema_ptr schema, lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector partition_ranges,
+                    db::consistency_level cl, service::storage_proxy_coordinator_query_options optional_params) mutable {
+                return do_query(std::move(erm_keepalive), this_node, sp, std::move(schema), std::move(cmd), std::move(partition_ranges), cl, std::move(optional_params));
+            });
+
+    if (_selection->is_trivial() && !_restrictions_need_filtering && !_per_partition_limit) {
+        return p->fetch_page_generator_result(page_size, now, timeout, _stats).then(wrap_result_to_error_message([this, p = std::move(p)] (result_generator&& generator) {
+            auto meta = [&] () -> shared_ptr<const cql3::metadata> {
+                if (!p->is_exhausted()) {
+                    auto meta = make_shared<metadata>(*_selection->get_result_metadata());
+                    meta->set_paging_state(p->state());
+                    return meta;
+                } else {
+                    return _selection->get_result_metadata();
+                }
+            }();
+
+            return shared_ptr<cql_transport::messages::result_message>(
+                make_shared<cql_transport::messages::result_message::rows>(result(std::move(generator), std::move(meta)))
+            );
+        }));
+    }
+
+    return p->fetch_page_result(page_size, now, timeout).then(wrap_result_to_error_message(
+            [this, p = std::move(p)](std::unique_ptr<cql3::result_set>&& rs) {
+                if (!p->is_exhausted()) {
+                    rs->get_metadata().set_paging_state(p->state());
+                }
+
+                if (_restrictions_need_filtering) {
+                    _stats.filtered_rows_read_total += p->stats().rows_read_total;
+                    _stats.filtered_rows_matched_total += rs->size();
+                }
+                update_stats_rows_read(rs->size());
+                auto msg = ::make_shared<cql_transport::messages::result_message::rows>(result(std::move(rs)));
+                return make_ready_future<shared_ptr<cql_transport::messages::result_message>>(std::move(msg));
+            }));
+}
+
 namespace raw {
 
 static void validate_attrs(const cql3::attributes::raw& attrs) {
-    assert(!attrs.timestamp.has_value());
-    assert(!attrs.time_to_live.has_value());
+    SCYLLA_ASSERT(!attrs.timestamp.has_value());
+    SCYLLA_ASSERT(!attrs.time_to_live.has_value());
+}
+
+audit::statement_category select_statement::category() const {
+    return audit::statement_category::QUERY;
 }
 
 select_statement::select_statement(cf_name cf_name,
@@ -1600,15 +1905,16 @@ select_statement::select_statement(cf_name cf_name,
     validate_attrs(*_attrs);
 }
 
-void select_statement::maybe_jsonize_select_clause(data_dictionary::database db, schema_ptr schema) {
+std::vector<selection::prepared_selector>
+select_statement::maybe_jsonize_select_clause(std::vector<selection::prepared_selector> prepared_selectors, data_dictionary::database db, schema_ptr schema) {
     // Fill wildcard clause with explicit column identifiers for as_json function
     if (_parameters->is_json()) {
-        if (_select_clause.empty()) {
-            _select_clause.reserve(schema->all_columns().size());
+        if (prepared_selectors.empty()) {
+            prepared_selectors.reserve(schema->all_columns().size());
             for (const column_definition& column_def : schema->all_columns_in_select_order()) {
-                _select_clause.push_back(make_shared<selection::raw_selector>(
-                    expr::unresolved_identifier{::make_shared<column_identifier::raw>(column_def.name_as_text(), true)},
-                    nullptr));
+                prepared_selectors.push_back(selection::prepared_selector{
+                    .expr = expr::column_value{&column_def},
+                });
             }
         }
 
@@ -1616,45 +1922,93 @@ void select_statement::maybe_jsonize_select_clause(data_dictionary::database db,
         std::vector<sstring> selector_names;
         std::vector<data_type> selector_types;
         std::vector<const column_definition*> defs;
-        selector_names.reserve(_select_clause.size());
-        selector_types.reserve(_select_clause.size());
-        auto selectables = selection::raw_selector::to_selectables(_select_clause, *schema);
-        selection::selector_factories factories(selection::raw_selector::to_selectables(_select_clause, *schema), db, schema, defs);
-        auto selectors = factories.new_instances();
-        for (size_t i = 0; i < selectors.size(); ++i) {
-            if (_select_clause[i]->alias) {
-                selector_names.push_back(_select_clause[i]->alias->to_string());
+        selector_names.reserve(prepared_selectors.size());
+        selector_types.reserve(prepared_selectors.size());
+        for (auto&& [sel, alias] : prepared_selectors) {
+            if (alias) {
+                selector_names.push_back(alias->to_string());
             } else {
-                selector_names.push_back(selectables[i]->to_string());
+                selector_names.push_back(fmt::format("{:result_set_metadata}", sel));
             }
-            selector_types.push_back(selectors[i]->get_type());
+            selector_types.push_back(expr::type_of(sel));
         }
 
         // Prepare args for as_json_function
-        std::vector<expr::expression> raw_selectables;
-        raw_selectables.reserve(_select_clause.size());
-        for (const auto& raw_selector : _select_clause) {
-            raw_selectables.push_back(raw_selector->selectable_);
+        std::vector<expr::expression> args;
+        args.reserve(prepared_selectors.size());
+        for (const auto& prepared_selector : prepared_selectors) {
+            args.push_back(std::move(prepared_selector.expr));
         }
         auto as_json = ::make_shared<functions::as_json_function>(std::move(selector_names), std::move(selector_types));
-        auto as_json_selector = ::make_shared<selection::raw_selector>(
-                expr::function_call{as_json, std::move(raw_selectables)}, nullptr);
-        _select_clause.clear();
-        _select_clause.push_back(as_json_selector);
+        auto as_json_selector = selection::prepared_selector{.expr = expr::function_call{as_json, std::move(args)}, .alias = nullptr};
+        prepared_selectors.clear();
+        prepared_selectors.push_back(as_json_selector);
     }
+    return prepared_selectors;
+}
+
+static
+bool
+group_by_references_clustering_keys(const selection::selection& sel, const std::vector<size_t>& group_by_cell_indices) {
+    return std::ranges::any_of(group_by_cell_indices, [&] (size_t idx) {
+        return sel.get_columns()[idx]->kind == column_kind::clustering_key;
+    });
 }
 
 std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::database db, cql_stats& stats, bool for_view) {
-    schema_ptr schema = validation::validate_column_family(db, keyspace(), column_family());
+    schema_ptr underlying_schema = validation::validate_column_family(db, keyspace(), column_family());
+    schema_ptr schema = _parameters->is_mutation_fragments() ? mutation_fragments_select_statement::generate_output_schema(underlying_schema) : underlying_schema;
     prepare_context& ctx = get_prepare_context();
 
-    maybe_jsonize_select_clause(db, schema);
+    auto prepared_selectors = selection::raw_selector::to_prepared_selectors(_select_clause, *schema, db, keyspace());
 
-    auto selection = _select_clause.empty()
+    prepared_selectors = maybe_jsonize_select_clause(std::move(prepared_selectors), db, schema);
+
+    auto aggregation_depth = 0u;
+
+    // Force aggregation if GROUP BY is used. This will wrap every column x as first(x).
+    if (!_group_by_columns.empty()) {
+        aggregation_depth = std::max(aggregation_depth, 1u);
+        if (prepared_selectors.empty()) {
+            // We have a "SELECT * GROUP BY". If we leave prepared_selectors
+            // empty, below we choose selection::wildcard() for SELECT *, and
+            // forget to do the "levellize" trick needed for the GROUP BY.
+            // So we need to set prepared_selectors. See #16531.
+            auto all_columns = selection::selection::wildcard_columns(schema);
+            std::vector<::shared_ptr<selection::raw_selector>> select_all;
+            select_all.reserve(all_columns.size());
+            for (const column_definition *cdef : all_columns) {
+                auto name = ::make_shared<cql3::column_identifier::raw>(cdef->name_as_text(), true);
+                select_all.push_back(::make_shared<selection::raw_selector>(
+                    expr::unresolved_identifier(std::move(name)), nullptr));
+            }
+            prepared_selectors = selection::raw_selector::to_prepared_selectors(select_all, *schema, db, keyspace());
+        }
+    }
+
+    for (auto& ps : prepared_selectors) {
+        expr::fill_prepare_context(ps.expr, ctx);
+    }
+
+    for (auto& ps : prepared_selectors) {
+        aggregation_depth = std::max(aggregation_depth, expr::aggregation_depth(ps.expr));
+    }
+    if (aggregation_depth > 1) {
+        throw exceptions::invalid_request_exception("SELECT clause contains aggeregation of an aggregation");
+    }
+
+    auto levellized_prepared_selectors = prepared_selectors;
+
+    for (auto& ps : levellized_prepared_selectors) {
+        ps.expr = levellize_aggregation_depth(ps.expr, aggregation_depth);
+    }
+
+    auto selection = prepared_selectors.empty()
                      ? selection::selection::wildcard(schema)
-                     : selection::selection::from_selectors(db, schema, _select_clause);
+                     : selection::selection::from_selectors(db, schema, keyspace(), levellized_prepared_selectors);
 
-    auto restrictions = prepare_restrictions(db, schema, ctx, selection, for_view, _parameters->allow_filtering());
+    auto restrictions = prepare_restrictions(db, schema, ctx, selection, for_view, _parameters->allow_filtering(),
+            restrictions::check_indexes(!_parameters->is_mutation_fragments()));
 
     if (_parameters->is_distinct()) {
         validate_distinct_selection(*schema, *selection, *restrictions);
@@ -1664,8 +2018,8 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     bool is_reversed_ = false;
 
     if (!_parameters->orderings().empty()) {
-        assert(!for_view);
-        verify_ordering_is_allowed(*restrictions);
+        SCYLLA_ASSERT(!for_view);
+        verify_ordering_is_allowed(*_parameters, *restrictions);
         prepared_orderings_type prepared_orderings = prepare_orderings(*schema);
         verify_ordering_is_valid(prepared_orderings, *schema, *restrictions);
 
@@ -1678,27 +2032,73 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
     ensure_filtering_columns_retrieval(db, *selection, *restrictions);
     auto group_by_cell_indices = ::make_shared<std::vector<size_t>>(prepare_group_by(*schema, *selection));
 
+    if (_parameters->is_distinct() && group_by_references_clustering_keys(*selection, *group_by_cell_indices)) {
+        throw exceptions::invalid_request_exception(
+                "Grouping on clustering columns is not allowed for SELECT DISTINCT queries");
+    }
+
     ::shared_ptr<cql3::statements::select_statement> stmt;
     auto prepared_attrs = _attrs->prepare(db, keyspace(), column_family());
     prepared_attrs->fill_prepare_context(ctx);
 
+    auto all_aggregates = [] (const std::vector<selection::prepared_selector>& prepared_selectors) {
+        return std::ranges::all_of(
+            prepared_selectors | std::views::transform(std::mem_fn(&selection::prepared_selector::expr)),
+            [] (const expr::expression& e) {
+                auto fn_expr = expr::as_if<expr::function_call>(&e);
+                if (!fn_expr) {
+                    return false;
+                }
+                auto func = std::get_if<shared_ptr<functions::function>>(&fn_expr->func);
+                if (!func) {
+                    return false;
+                }
+                return (*func)->is_aggregate();
+            }
+        );
+    };
+
+    auto is_local_table = [&] {
+        return underlying_schema->table().get_effective_replication_map()->get_replication_strategy().get_type()
+                == locator::replication_strategy_type::local;
+    };
+
     // Used to determine if an execution of this statement can be parallelized
-    // using `forward_service`.
-    auto can_be_forwarded = [&] {
-        return selection->is_aggregate()        // Aggregation only
+    // using `mapreduce_service`.
+    auto can_be_mapreduced = [&] {
+        return all_aggregates(prepared_selectors)   // Note: before we levellized aggregation depth
             && ( // SUPPORTED PARALLELIZATION
-                 // All potential intermediate coordinators must support forwarding
+                 // All potential intermediate coordinators must support mapreduceing
                 (db.features().parallelized_aggregation && selection->is_count())
                 || (db.features().uda_native_parallelized_aggregation && selection->is_reducible())
             )
             && !restrictions->need_filtering()  // No filtering
             && group_by_cell_indices->empty()   // No GROUP BY
-            && db.get_config().enable_parallelized_aggregation();
+            && db.get_config().enable_parallelized_aggregation()
+            && !is_local_table()
+            && !( // Do not parallelize the request if it's single partition read
+                restrictions->partition_key_restrictions_is_all_eq() 
+                && restrictions->partition_key_restrictions_size() == schema->partition_key_size());
     };
 
     if (_parameters->is_prune_materialized_view()) {
         stmt = ::make_shared<cql3::statements::prune_materialized_view_statement>(
                 schema,
+                ctx.bound_variables_size(),
+                _parameters,
+                std::move(selection),
+                std::move(restrictions),
+                std::move(group_by_cell_indices),
+                is_reversed_,
+                std::move(ordering_comparator),
+                prepare_limit(db, ctx, _limit),
+                prepare_limit(db, ctx, _per_partition_limit),
+                stats,
+                std::move(prepared_attrs));
+    } else if (_parameters->is_mutation_fragments()) {
+        stmt = ::make_shared<cql3::statements::mutation_fragments_select_statement>(
+                schema,
+                underlying_schema,
                 ctx.bound_variables_size(),
                 _parameters,
                 std::move(selection),
@@ -1725,7 +2125,7 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
                 prepare_limit(db, ctx, _per_partition_limit),
                 stats,
                 std::move(prepared_attrs));
-    } else if (can_be_forwarded()) {
+    } else if (can_be_mapreduced()) {
         stmt = parallelized_select_statement::prepare(
             schema,
             ctx.bound_variables_size(),
@@ -1772,7 +2172,8 @@ std::unique_ptr<prepared_statement> select_statement::prepare(data_dictionary::d
 
     auto partition_key_bind_indices = ctx.get_partition_key_bind_indexes(*schema);
 
-    return make_unique<prepared_statement>(std::move(stmt), ctx, std::move(partition_key_bind_indices), std::move(warnings));
+    stmt->_may_use_token_aware_routing = partition_key_bind_indices.size() != 0;
+    return make_unique<prepared_statement>(audit_info(), std::move(stmt), ctx, std::move(partition_key_bind_indices), std::move(warnings));
 }
 
 ::shared_ptr<restrictions::statement_restrictions>
@@ -1781,14 +2182,15 @@ select_statement::prepare_restrictions(data_dictionary::database db,
                                        prepare_context& ctx,
                                        ::shared_ptr<selection::selection> selection,
                                        bool for_view,
-                                       bool allow_filtering)
+                                       bool allow_filtering,
+                                       restrictions::check_indexes do_check_indexes)
 {
     try {
-        return ::make_shared<restrictions::statement_restrictions>(db, schema, statement_type::SELECT, _where_clause, ctx,
-            selection->contains_only_static_columns(), for_view, allow_filtering);
+        return ::make_shared<restrictions::statement_restrictions>(restrictions::analyze_statement_restrictions(db, schema, statement_type::SELECT, _where_clause, ctx,
+            selection->contains_only_static_columns(), for_view, allow_filtering, do_check_indexes));
     } catch (const exceptions::unrecognized_entity_exception& e) {
         if (contains_alias(e.entity)) {
-            throw exceptions::invalid_request_exception(format("Aliases aren't allowed in the where clause ('{}')", e.relation_str));
+            throw exceptions::invalid_request_exception(format("Aliases aren't allowed in the WHERE clause (name: '{}')", e.entity));
         }
         throw;
     }
@@ -1803,17 +2205,21 @@ select_statement::prepare_limit(data_dictionary::database db, prepare_context& c
     }
 
     expr::expression prep_limit = prepare_expression(*limit, db, keyspace(), nullptr, limit_receiver());
+    expr::verify_no_aggregate_functions(prep_limit, "LIMIT clause");
     expr::fill_prepare_context(prep_limit, ctx);
     return prep_limit;
 }
 
-void select_statement::verify_ordering_is_allowed(const restrictions::statement_restrictions& restrictions)
+void select_statement::verify_ordering_is_allowed(const parameters& params, const restrictions::statement_restrictions& restrictions)
 {
     if (restrictions.uses_secondary_indexing()) {
         throw exceptions::invalid_request_exception("ORDER BY with 2ndary indexes is not supported.");
     }
     if (restrictions.is_key_range()) {
         throw exceptions::invalid_request_exception("ORDER BY is only supported when the partition key is restricted by an EQ or an IN.");
+    }
+    if (params.is_mutation_fragments()) {
+        throw exceptions::invalid_request_exception("ORDER BY is not supported in SELECT FROM MUTATION_FRAGMENTS() statements.");
     }
 }
 
@@ -1844,7 +2250,7 @@ select_statement::prepared_orderings_type select_statement::prepare_orderings(co
         prepared_orderings.emplace_back(def, column_ordering);
     }
 
-    // Uncomment this to allow specifing ORDER BY columns in any order.
+    // Uncomment this to allow specifying ORDER BY columns in any order.
     // Right now specifying ORDER BY (c2 asc, c1 asc) is illegal, it can only be ORDER BY (c1 asc, c2 asc).
     //
     // std::sort(prepared_orderings.begin(), prepared_orderings.end(),
@@ -2016,8 +2422,8 @@ static bool needs_allow_filtering_anyway(
     const auto& pk_restrictions = restrictions.get_partition_key_restrictions();
     // Even if no filtering happens on the coordinator, we still warn about poor performance when partition
     // slice is defined but in potentially unlimited number of partitions (see #7608).
-    if ((expr::is_empty_restriction(pk_restrictions) || has_token(pk_restrictions)) // Potentially unlimited partitions.
-        && !expr::is_empty_restriction(ck_restrictions) // Slice defined.
+    if ((restrictions::is_empty_restriction(pk_restrictions) || restrictions.has_token_restrictions()) // Potentially unlimited partitions.
+        && !restrictions::is_empty_restriction(ck_restrictions) // Slice defined.
         && !restrictions.uses_secondary_indexing()) { // Base-table is used. (Index-table use always limits partitions.)
         if (strict_allow_filtering == flag_t::WARN) {
             warnings.emplace_back("This query should use ALLOW FILTERING and will be rejected in future versions.");
@@ -2146,8 +2552,12 @@ std::vector<size_t> select_statement::prepare_group_by(const schema& schema, sel
             throw make_order_exception(*col);
         }
         ++expected_index;
-        const auto index = selection.index_of(*def);
-        indices.push_back(index != -1 ? index : selection.add_column_for_post_processing(*def));
+        auto index = selection.index_of(*def);
+        if (index == -1) {
+            selection.add_column_for_post_processing(*def);
+            index = selection.index_of(*def);
+        }
+        indices.push_back(index);
     }
 
     if (expected_index < schema.partition_key_size()) {
@@ -2174,8 +2584,8 @@ future<> reset_internal_paging_size() {
 namespace util {
 
 std::unique_ptr<cql3::statements::raw::select_statement> build_select_statement(
-            const sstring_view& cf_name,
-            const sstring_view& where_clause,
+            const std::string_view& cf_name,
+            const std::string_view& where_clause,
             bool select_all_columns,
             const std::vector<column_definition>& selected_columns) {
     std::ostringstream out;
@@ -2186,16 +2596,19 @@ std::unique_ptr<cql3::statements::raw::select_statement> build_select_statement(
         // If the column name is not entirely lowercase (or digits or _),
         // when output to CQL it must be quoted to preserve case as well
         // as non alphanumeric characters.
-        auto cols = boost::copy_range<std::vector<sstring>>(selected_columns
-                | boost::adaptors::transformed(std::mem_fn(&column_definition::name_as_cql_string)));
-        out << join(", ", cols);
+        auto cols = selected_columns
+                | std::views::transform(std::mem_fn(&column_definition::name_as_cql_string))
+                | std::ranges::to<std::vector>();
+        fmt::print(out, "{}", fmt::join(cols, ", "));
     }
     // Note that cf_name may need to be quoted, just like column names above.
     out << " FROM " << util::maybe_quote(sstring(cf_name));
     if (!where_clause.empty()) {
         out << " WHERE " << where_clause << " ALLOW FILTERING";
     }
-    return do_with_parser(out.str(), std::mem_fn(&cql3_parser::CqlParser::selectStatement));
+    // In general it's not a good idea to use the default dialect, but here the database is talking to
+    // itself, so we can hope the dialects are mutually compatible here.
+    return do_with_parser(out.str(), dialect{}, std::mem_fn(&cql3_parser::CqlParser::selectStatement));
 }
 
 }

@@ -3,10 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "gms/inet_address_serializer.hh"
+#include "gms/version_generator.hh"
+#include "gms/generation-number.hh"
+
+#include "idl/utils.idl.hh"
 
 namespace gms {
 enum class application_state:int {
@@ -28,30 +32,31 @@ enum class application_state:int {
 };
 
 class versioned_value {
-    sstring value;
-    int version;
+    sstring value();
+    gms::version_type version();
 };
 
 class heart_beat_state {
-    int32_t get_generation();
-    int32_t get_heart_beat_version();
+    gms::generation_type get_generation();
+    gms::version_type get_heart_beat_version();
 };
 
 class endpoint_state {
     gms::heart_beat_state get_heart_beat_state();
-    std::map<gms::application_state, gms::versioned_value> get_application_state_map();
+    std::unordered_map<gms::application_state, gms::versioned_value> get_application_state_map();
 };
 
 class gossip_digest {
     gms::inet_address get_endpoint();
-    int32_t get_generation();
-    int32_t get_max_version();
+    gms::generation_type get_generation();
+    gms::version_type get_max_version();
 };
 
 class gossip_digest_syn {
     sstring get_cluster_id();
     sstring get_partioner();
     utils::chunked_vector<gms::gossip_digest> get_gossip_digests();
+    utils::UUID get_group0_id()[[version 5.4]];
 };
 
 class gossip_digest_ack {

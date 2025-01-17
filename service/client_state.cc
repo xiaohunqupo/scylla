@@ -5,22 +5,19 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #include "client_state.hh"
-#include "auth/authorizer.hh"
 #include "auth/authenticator.hh"
 #include "auth/common.hh"
 #include "auth/resource.hh"
 #include "exceptions/exceptions.hh"
-#include "validation.hh"
 #include "db/system_keyspace.hh"
 #include "db/schema_tables.hh"
 #include "tracing/trace_keyspace_helper.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "replica/database.hh"
-#include "cdc/log.hh"
 #include "utils/overloaded_functor.hh"
 #include <seastar/core/coroutine.hh>
 
@@ -74,35 +71,43 @@ future<> service::client_state::has_all_keyspaces_access(
     co_return co_await ensure_has_permission({p, r});
 }
 
-future<> service::client_state::has_keyspace_access(data_dictionary::database db, const sstring& ks,
-                auth::permission p) const {
+future<> service::client_state::has_keyspace_access(const sstring& ks, auth::permission p) const {
     auth::resource r = auth::make_data_resource(ks);
-    co_return co_await has_access(db, ks, {p, r});
+    co_return co_await has_access(ks, {p, r});
 }
 
-future<> service::client_state::has_column_family_access(data_dictionary::database db, const sstring& ks,
+future<> service::client_state::has_functions_access(auth::permission p) const {
+    auth::resource r = auth::make_functions_resource();
+    co_return co_await ensure_has_permission({p, r});
+}
+
+future<> service::client_state::has_functions_access(const sstring& ks, auth::permission p) const {
+    auth::resource r = auth::make_functions_resource(ks);
+    co_return co_await has_access(ks, {p, r});
+}
+
+future<> service::client_state::has_function_access(const sstring& ks, const sstring& function_signature, auth::permission p) const {
+    auth::resource r = auth::make_functions_resource(ks, function_signature);
+    co_return co_await has_access(ks, {p, r});
+}
+
+future<> service::client_state::has_column_family_access(const sstring& ks,
                 const sstring& cf, auth::permission p, auth::command_desc::type t) const {
-    // NOTICE: callers of this function tend to assume that this error will be thrown
-    // synchronously and will be intercepted in a try-catch block. Thus, this function can only
-    // be translated to a coroutine after all such callers are inspected and amended first.
-    validation::validate_column_family(db, ks, cf);
-
-    return do_with(ks, auth::make_data_resource(ks, cf), [this, p, t, db](const auto& ks, const auto& r) {
-        return has_access(db, ks, {p, r, t});
-    });
+    auto r = auth::make_data_resource(ks, cf);
+    co_return co_await has_access(ks, {p, r, t});
 }
 
-future<> service::client_state::has_schema_access(data_dictionary::database db, const schema& s, auth::permission p) const {
+future<> service::client_state::has_schema_access(const schema& s, auth::permission p) const {
     auth::resource r = auth::make_data_resource(s.ks_name(), s.cf_name());
-    co_return co_await has_access(db, s.ks_name(), {p, r});
+    co_return co_await has_access(s.ks_name(), {p, r});
 }
 
-future<> service::client_state::has_schema_access(data_dictionary::database db, const sstring& ks_name, const sstring& cf_name, auth::permission p) const {
+future<> service::client_state::has_schema_access(const sstring& ks_name, const sstring& cf_name, auth::permission p) const {
     auth::resource r = auth::make_data_resource(ks_name, cf_name);
-    co_return co_await has_access(db, ks_name, {p, r});
+    co_return co_await has_access(ks_name, {p, r});
 }
 
-future<> service::client_state::has_access(data_dictionary::database db, const sstring& ks, auth::command_desc cmd) const {
+future<> service::client_state::has_access(const sstring& ks, auth::command_desc cmd) const {
     if (ks.empty()) {
         return make_exception_future<>(exceptions::invalid_request_exception("You have not set a keyspace for this session"));
     }
@@ -125,14 +130,14 @@ future<> service::client_state::has_access(data_dictionary::database db, const s
         }
 
         //
-        // we want to disallow dropping any contents of TRACING_KS and disallow dropping the `auth::meta::AUTH_KS`
+        // we want to disallow dropping any contents of TRACING_KS and disallow dropping the `auth::meta::legacy::AUTH_KS`
         // keyspace.
         //
 
         const bool dropping_anything_in_tracing = (name == tracing::trace_keyspace_helper::KEYSPACE_NAME)
                 && (cmd.permission == auth::permission::DROP);
 
-        const bool dropping_auth_keyspace = (cmd.resource == auth::make_data_resource(auth::meta::AUTH_KS))
+        const bool dropping_auth_keyspace = (cmd.resource == auth::make_data_resource(auth::meta::legacy::AUTH_KS))
                 && (cmd.permission == auth::permission::DROP);
 
         if (dropping_anything_in_tracing || dropping_auth_keyspace) {
@@ -146,7 +151,7 @@ future<> service::client_state::has_access(data_dictionary::database db, const s
         for (auto cf : { db::system_keyspace::LOCAL, db::system_keyspace::PEERS }) {
             tmp.insert(auth::make_data_resource(db::system_keyspace::NAME, cf));
         }
-        for (auto cf : db::schema_tables::all_table_names(db::schema_features::full())) {
+        for (const auto& cf : db::schema_tables::all_table_names(db::schema_features::full())) {
             tmp.insert(auth::make_data_resource(db::schema_tables::NAME, cf));
         }
         return tmp;
@@ -164,13 +169,6 @@ future<> service::client_state::has_access(data_dictionary::database db, const s
     if (cmd.resource.kind() == auth::resource_kind::data) {
         const auto resource_view = auth::data_resource_view(cmd.resource);
         if (resource_view.table()) {
-            if (cmd.permission == auth::permission::DROP) {
-                if (cdc::is_log_for_some_table(db.real_database(), ks, *resource_view.table())) {
-                    return make_exception_future<>(exceptions::unauthorized_exception(
-                            format("Cannot {} cdc log table {}", auth::permissions::to_string(cmd.permission), cmd.resource)));
-                }
-            }
-
             static constexpr auto cdc_topology_description_forbidden_permissions = auth::permission_set::of<
                     auth::permission::ALTER, auth::permission::DROP>();
 
@@ -224,7 +222,7 @@ void service::client_state::set_keyspace(replica::database& db, std::string_view
     // Skip keyspace validation for non-authenticated users. Apparently, some client libraries
     // call set_keyspace() before calling login(), and we have to handle that.
     if (_user && !db.has_keyspace(keyspace)) {
-        throw exceptions::invalid_request_exception(format("Keyspace '{}' does not exist", keyspace));
+        throw exceptions::invalid_request_exception(seastar::format("Keyspace '{}' does not exist", keyspace));
     }
     _keyspace = sstring(keyspace);
 }
@@ -241,33 +239,37 @@ future<> service::client_state::ensure_exists(const auth::resource& r) const {
 
 future<> service::client_state::maybe_update_per_service_level_params() {
     if (_sl_controller && _user && _user->name) {
-        auto& role_manager = _auth_service->underlying_role_manager();
-        auto role_set = co_await role_manager.query_granted(_user->name.value(), auth::recursive_role_query::yes);
-        auto slo_opt = co_await _sl_controller->find_service_level(role_set);
+        auto slo_opt = co_await _sl_controller->find_effective_service_level(_user->name.value());
         if (!slo_opt) {
             co_return;
         }
-        auto slo_timeout_or = [&] (const lowres_clock::duration& default_timeout) {
-            return std::visit(overloaded_functor{
-                [&] (const qos::service_level_options::unset_marker&) -> lowres_clock::duration {
-                    return default_timeout;
-                },
-                [&] (const qos::service_level_options::delete_marker&) -> lowres_clock::duration {
-                    return default_timeout;
-                },
-                [&] (const lowres_clock::duration& d) -> lowres_clock::duration {
-                    return d;
-                },
-            }, slo_opt->timeout);
-        };
-        _timeout_config.read_timeout = slo_timeout_or(_default_timeout_config.read_timeout);
-        _timeout_config.write_timeout = slo_timeout_or(_default_timeout_config.write_timeout);
-        _timeout_config.range_read_timeout = slo_timeout_or(_default_timeout_config.range_read_timeout);
-        _timeout_config.counter_write_timeout = slo_timeout_or(_default_timeout_config.counter_write_timeout);
-        _timeout_config.truncate_timeout = slo_timeout_or(_default_timeout_config.truncate_timeout);
-        _timeout_config.cas_timeout = slo_timeout_or(_default_timeout_config.cas_timeout);
-        _timeout_config.other_timeout = slo_timeout_or(_default_timeout_config.other_timeout);
-
-        _workload_type = slo_opt->workload;
+        
+        update_per_service_level_params(*slo_opt);
     }
+}
+
+void service::client_state::update_per_service_level_params(qos::service_level_options& slo) {
+    auto slo_timeout_or = [&] (const lowres_clock::duration& default_timeout) {
+        return std::visit(overloaded_functor{
+            [&] (const qos::service_level_options::unset_marker&) -> lowres_clock::duration {
+                return default_timeout;
+            },
+            [&] (const qos::service_level_options::delete_marker&) -> lowres_clock::duration {
+                return default_timeout;
+            },
+            [&] (const lowres_clock::duration& d) -> lowres_clock::duration {
+                return d;
+            },
+        }, slo.timeout);
+    };
+
+    _timeout_config.read_timeout = slo_timeout_or(_default_timeout_config.read_timeout);
+    _timeout_config.write_timeout = slo_timeout_or(_default_timeout_config.write_timeout);
+    _timeout_config.range_read_timeout = slo_timeout_or(_default_timeout_config.range_read_timeout);
+    _timeout_config.counter_write_timeout = slo_timeout_or(_default_timeout_config.counter_write_timeout);
+    _timeout_config.truncate_timeout = slo_timeout_or(_default_timeout_config.truncate_timeout);
+    _timeout_config.cas_timeout = slo_timeout_or(_default_timeout_config.cas_timeout);
+    _timeout_config.other_timeout = slo_timeout_or(_default_timeout_config.other_timeout);
+
+    _workload_type = slo.workload;
 }

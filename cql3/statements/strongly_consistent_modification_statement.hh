@@ -5,14 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/cql_statement.hh"
 #include "cql3/statements/modification_statement.hh"
-#include "service/broadcast_tables/experimental/lang.hh"
 
 namespace cql3 {
 
@@ -37,17 +36,14 @@ public:
     strongly_consistent_modification_statement(uint32_t bound_terms, schema_ptr schema, broadcast_tables::prepared_update query);
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(query_processor& qp, service::query_state& qs, const query_options& options) const override;
+    execute(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>>
-    execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options) const override;
+    execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
     virtual uint32_t get_bound_terms() const override;
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
-
-    // Validate before execute, using client state and current schema
-    void validate(query_processor&, const service::client_state& state) const override;
 
     virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
 };

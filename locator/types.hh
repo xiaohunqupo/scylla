@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -25,8 +25,12 @@ using inet_address = gms::inet_address;
 struct endpoint_dc_rack {
     sstring dc;
     sstring rack;
+
+    static thread_local const endpoint_dc_rack default_location;
+
+    bool operator==(const endpoint_dc_rack&) const = default;
 };
 
-using dc_rack_fn = seastar::noncopyable_function<endpoint_dc_rack(inet_address)>;
+using dc_rack_fn = seastar::noncopyable_function<std::optional<endpoint_dc_rack>(host_id)>;
 
 } // namespace locator

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <utility>
@@ -24,7 +24,6 @@
 #include "bytes.hh"
 #include "replica/database.hh"
 #include "db/schema_tables.hh"
-#include "partition_slice_builder.hh"
 #include "schema/schema.hh"
 #include "schema/schema_builder.hh"
 #include "service/migration_listener.hh"
@@ -33,16 +32,15 @@
 #include "cql3/statements/select_statement.hh"
 #include "cql3/untyped_result_set.hh"
 #include "log.hh"
+#include "utils/assert.hh"
 #include "utils/rjson.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/managed_bytes.hh"
-#include "utils/fragment_range.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "concrete_types.hh"
 #include "types/listlike_partial_deserializing_iterator.hh"
 #include "tracing/trace_state.hh"
 #include "stats.hh"
-#include "compaction/compaction_strategy.hh"
 
 namespace std {
 
@@ -68,8 +66,8 @@ void cdc::stats::parts_touched_stats::register_metrics(seastar::metrics::metric_
     namespace sm = seastar::metrics;
     auto register_part = [&] (part_type part, sstring part_name) {
         metrics.add_group(cdc_group_name, {
-                sm::make_total_operations(format("operations_on_{}_performed_{}", part_name, suffix), count[(size_t)part],
-                        sm::description(format("number of {} CDC operations that processed a {}", suffix, part_name)),
+                sm::make_total_operations(seastar::format("operations_on_{}_performed_{}", part_name, suffix), count[(size_t)part],
+                        sm::description(seastar::format("number of {} CDC operations that processed a {}", suffix, part_name)),
                         {})
             });
     };
@@ -151,7 +149,7 @@ public:
         _ctxt._migration_notifier.register_listener(this);
     }
     ~impl() {
-        assert(_stopped);
+        SCYLLA_ASSERT(_stopped);
     }
 
     future<> stop() {
@@ -160,12 +158,13 @@ public:
         });
     }
 
-    void on_before_create_column_family(const schema& schema, std::vector<mutation>& mutations, api::timestamp_type timestamp) override {
+    void on_before_create_column_family(const keyspace_metadata& ksm, const schema& schema, std::vector<mutation>& mutations, api::timestamp_type timestamp) override {
         if (schema.cdc_options().enabled()) {
             auto& db = _ctxt._proxy.get_db().local();
             auto logname = log_name(schema.cf_name());
             check_that_cdc_log_table_does_not_exist(db, schema, logname);
             ensure_that_table_has_no_counter_columns(schema);
+            ensure_that_table_uses_vnodes(ksm, schema);
 
             // in seastar thread
             auto log_schema = create_log_schema(schema);
@@ -183,7 +182,7 @@ public:
         // if we are turning off cdc we can skip this, since even if columns change etc,
         // any writer should see cdc -> off together with any actual schema changes to
         // base table, so should never try to write to non-existent log column etc.
-        // note that if user has set ttl=0 in cdc options, he is still reponsible
+        // note that if user has set ttl=0 in cdc options, he is still responsible
         // for emptying the log. 
         if (is_cdc) {
             auto& db = _ctxt._proxy.get_db().local();
@@ -204,11 +203,12 @@ public:
 
             check_for_attempt_to_create_nested_cdc_log(db, new_schema);
             ensure_that_table_has_no_counter_columns(new_schema);
+            ensure_that_table_uses_vnodes(*keyspace.metadata(), new_schema);
 
             auto new_log_schema = create_log_schema(new_schema, log_schema ? std::make_optional(log_schema->id()) : std::nullopt, log_schema);
 
             auto log_mut = log_schema 
-                ? db::schema_tables::make_update_table_mutations(db, keyspace.metadata(), log_schema, new_log_schema, timestamp, false)
+                ? db::schema_tables::make_update_table_mutations(db, keyspace.metadata(), log_schema, new_log_schema, timestamp)
                 : db::schema_tables::make_create_table_mutations(new_log_schema, timestamp)
                 ;
 
@@ -265,6 +265,18 @@ private:
                     schema.ks_name(), schema.cf_name()));
         }
     }
+
+    // Until we support CDC with tablets (issue #16317), we can't allow this
+    // to be attempted - in particular the log table we try to create will not
+    // have tablets, and will cause a failure.
+    static void ensure_that_table_uses_vnodes(const keyspace_metadata& ksm, const schema& schema) {
+        locator::replication_strategy_params params(ksm.strategy_options(), ksm.initial_tablets());
+        auto rs = locator::abstract_replication_strategy::create_replication_strategy(ksm.strategy_name(), params);
+        if (rs->uses_tablets()) {
+            throw exceptions::invalid_request_exception(format("Cannot create CDC log for a table {}.{}, because keyspace uses tablets. See issue #16317.",
+                schema.ks_name(), schema.cf_name()));
+        }
+    }
 };
 
 cdc::cdc_service::cdc_service(service::storage_proxy& proxy, cdc::metadata& cdc_metadata, service::migration_notifier& notifier)
@@ -285,36 +297,38 @@ future<> cdc::cdc_service::stop() {
 cdc::cdc_service::~cdc_service() = default;
 
 namespace {
-static const sstring delta_mode_string_keys = "keys";
-static const sstring delta_mode_string_full = "full";
+static constexpr std::string_view delta_mode_string_keys = "keys";
+static constexpr std::string_view delta_mode_string_full = "full";
 
-static const std::string_view image_mode_string_full = delta_mode_string_full;
+static constexpr std::string_view image_mode_string_full = delta_mode_string_full;
 
-sstring to_string(cdc::delta_mode dm) {
-    switch (dm) {
-        case cdc::delta_mode::keys : return delta_mode_string_keys;
-        case cdc::delta_mode::full : return delta_mode_string_full;
+} // anon. namespace
+
+auto fmt::formatter<cdc::delta_mode>::format(cdc::delta_mode m, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    using enum cdc::delta_mode;
+    switch (m) {
+        case keys:
+            return fmt::format_to(ctx.out(), delta_mode_string_keys);
+        case full:
+            return fmt::format_to(ctx.out(), delta_mode_string_full);
     }
     throw std::logic_error("Impossible value of cdc::delta_mode");
 }
 
-sstring to_string(cdc::image_mode m) {
+auto fmt::formatter<cdc::image_mode>::format(cdc::image_mode m, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    using enum cdc::image_mode;
     switch (m) {
-        case cdc::image_mode::off : return "false";
-        case cdc::image_mode::on : return "true";
-        case cdc::image_mode::full : return sstring(image_mode_string_full);
+        case off:
+            return fmt::format_to(ctx.out(), "false");
+        case on:
+            return fmt::format_to(ctx.out(), "true");
+            break;
+        case full:
+            return fmt::format_to(ctx.out(), image_mode_string_full);
     }
     throw std::logic_error("Impossible value of cdc::image_mode");
-}
-
-} // anon. namespace
-
-std::ostream& cdc::operator<<(std::ostream& os, delta_mode m) {
-    return os << to_string(m);
-}
-
-std::ostream& cdc::operator<<(std::ostream& os, image_mode m) {
-    return os << to_string(m);
 }
 
 cdc::options::options(const std::map<sstring, sstring>& map) {
@@ -380,9 +394,9 @@ std::map<sstring, sstring> cdc::options::to_map() const {
 
     return {
         { "enabled", enabled() ? "true" : "false" },
-        { "preimage", to_string(_preimage) },
+        { "preimage", fmt::format("{}", _preimage) },
         { "postimage", _postimage ? "true" : "false" },
-        { "delta", to_string(_delta_mode) },
+        { "delta", fmt::format("{}", _delta_mode) },
         { "ttl", std::to_string(_ttl) },
     };
 }
@@ -394,9 +408,6 @@ sstring cdc::options::to_sstring() const {
 bool cdc::options::operator==(const options& o) const {
     return enabled() == o.enabled() && _preimage == o._preimage && _postimage == o._postimage && _ttl == o._ttl
             && _delta_mode == o._delta_mode;
-}
-bool cdc::options::operator!=(const options& o) const {
-    return !(*this == o);
 }
 
 namespace cdc {
@@ -428,7 +439,7 @@ schema_ptr get_base_table(const replica::database& db, const schema& s) {
     return get_base_table(db, s.ks_name(), s.cf_name());
 }
 
-schema_ptr get_base_table(const replica::database& db, sstring_view ks_name,std::string_view table_name) {
+schema_ptr get_base_table(const replica::database& db, std::string_view ks_name, std::string_view table_name) {
     if (!is_log_name(table_name)) {
         return nullptr;
     }
@@ -445,7 +456,7 @@ schema_ptr get_base_table(const replica::database& db, sstring_view ks_name,std:
 }
 
 seastar::sstring base_name(std::string_view log_name) {
-    assert(is_log_name(log_name));
+    SCYLLA_ASSERT(is_log_name(log_name));
     return sstring(log_name.data(), log_name.size() - cdc_log_suffix.size());
 }
 
@@ -635,9 +646,6 @@ public:
     bool operator==(const collection_iterator& x) const {
         return _v == x._v;
     }
-    bool operator!=(const collection_iterator& x) const {
-        return !(*this == x);
-    }
 private:
     void next() {
         --_rem;
@@ -648,7 +656,7 @@ private:
 
 template<>
 void collection_iterator<std::pair<managed_bytes_view, managed_bytes_view>>::parse() {
-    assert(_rem > 0);
+    SCYLLA_ASSERT(_rem > 0);
     _next = _v;
     auto k = read_collection_key(_next);
     auto v = read_collection_value_nonnull(_next);
@@ -657,7 +665,7 @@ void collection_iterator<std::pair<managed_bytes_view, managed_bytes_view>>::par
 
 template<>
 void collection_iterator<managed_bytes_view>::parse() {
-    assert(_rem > 0);
+    SCYLLA_ASSERT(_rem > 0);
     _next = _v;
     auto k = read_collection_key(_next);
     _current = k;
@@ -665,7 +673,7 @@ void collection_iterator<managed_bytes_view>::parse() {
 
 template<>
 void collection_iterator<managed_bytes_view_opt>::parse() {
-    assert(_rem > 0);
+    SCYLLA_ASSERT(_rem > 0);
     _next = _v;
     auto k = read_collection_value_nonnull(_next);
     _current = k;
@@ -1058,7 +1066,7 @@ struct process_row_visitor {
     void update_row_state(const column_definition& cdef, managed_bytes_opt value) {
         if (!_row_state) {
             // static row always has a valid state, so this must be a clustering row missing
-            assert(_base_ck);
+            SCYLLA_ASSERT(_base_ck);
             auto [it, _] = _clustering_row_states.try_emplace(*_base_ck);
             _row_state = &it->second;
         }
@@ -1489,12 +1497,12 @@ public:
     }
 
     void generate_image(operation op, const clustering_key* ck, const one_kind_column_set* affected_columns) {
-        assert(op == operation::pre_image || op == operation::post_image);
+        SCYLLA_ASSERT(op == operation::pre_image || op == operation::post_image);
 
-        // assert that post_image is always full
-        assert(!(op == operation::post_image && affected_columns));
+        // SCYLLA_ASSERT that post_image is always full
+        SCYLLA_ASSERT(!(op == operation::post_image && affected_columns));
 
-        assert(_builder);
+        SCYLLA_ASSERT(_builder);
 
         const auto kind = ck ? column_kind::regular_column : column_kind::static_column;
 
@@ -1564,7 +1572,7 @@ public:
     // TODO: is pre-image data based on query enough. We only have actual column data. Do we need
     // more details like tombstones/ttl? Probably not but keep in mind.
     void process_change(const mutation& m) override {
-        assert(_builder);
+        SCYLLA_ASSERT(_builder);
         process_change_visitor v {
             ._touched_parts = _touched_parts,
             ._builder = *_builder,
@@ -1577,7 +1585,7 @@ public:
     }
 
     void end_record() override {
-        assert(_builder);
+        SCYLLA_ASSERT(_builder);
         _builder->end_record();
     }
 

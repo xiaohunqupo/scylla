@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <type_traits>
@@ -23,7 +23,7 @@
 //   T val{};
 //   using traits = noexcept_movable<T>;
 //   auto f = make_ready_future<typename traits::type>(traits::wrap(std::move(val)));
-//   T val2 = traits::unwrap(f.get0());
+//   T val2 = traits::unwrap(f.get());
 //
 
 template<typename T>

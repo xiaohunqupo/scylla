@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 
 #pragma once
@@ -13,7 +13,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include "cql3/column_identifier.hh"
 #include <variant>
-#include <regex>
+#include <boost/regex_fwd.hpp>
 
 namespace cql3 {
 
@@ -22,7 +22,7 @@ namespace statements {
 struct index_target {
     static const sstring target_option_name;
     static const sstring custom_index_option_name;
-    static const std::regex target_regex;
+    static const boost::regex target_regex;
 
     enum class target_type {
         regular_values, collection_values, keys, keys_and_values, full

@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "lang/wasm.hh"
 #include "lang/wasm_instance_cache.hh"
 #include "rust/wasmtime_bindings.hh"
-#include "seastar/core/reactor.hh"
+#include <seastar/core/reactor.hh>
+#include <seastar/core/signal.hh>
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/core/coroutine.hh>
 
@@ -56,16 +57,17 @@ SEASTAR_TEST_CASE(test_allocation_failures) {
     // to do this in the test case and not in the main Scylla code.
     // Other signals that may need to be unblocked in future test cases
     // are SIGFPE and SIGBUS.
-    engine().handle_signal(SIGILL, [] {});
+    handle_signal(SIGILL, [] {});
     int errors_during_compilation = 0;
     int errors_during_execution = 0;
+    wasm::alien_thread_runner alien_runner;
     for (size_t fail_after = 0;;fail_after++) {
         auto wasm_engine = wasmtime::create_test_engine(1024 * 1024, fail_after);
         auto wasm_cache = std::make_unique<wasm::instance_cache>(100 * 1024 * 1024, 1024 * 1024, std::chrono::seconds(1));
-        auto wasm_ctx = wasm::context(*wasm_engine, "grow_return", wasm_cache.get(), 1000, 1000000000);
+        auto wasm_ctx = wasm::context(*wasm_engine, "grow_return", *wasm_cache, 1000, 1000000000);
         try {
             // Function that ignores the input, grows its memory by 1 page, and returns 10
-            wasm::precompile(wasm_ctx, {}, grow_return);
+            co_await wasm::precompile(alien_runner, wasm_ctx, {}, grow_return);
             wasm_ctx.module.value()->compile(*wasm_engine);
         } catch (const wasm::exception& e) {
             errors_during_compilation++;

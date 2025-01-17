@@ -5,16 +5,16 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 import argparse
-import io
 import os
 import subprocess
 import tarfile
 import pathlib
-import shutil
+import sys
+import tempfile
 
 
 RELOC_PREFIX='scylla'
@@ -67,16 +67,22 @@ def reloc_add(ar, name, arcname=None):
 ap = argparse.ArgumentParser(description='Create a relocatable scylla package.')
 ap.add_argument('dest',
                 help='Destination file (tar format)')
-ap.add_argument('--mode', dest='mode', default='release',
-                help='Build mode (debug/release) to use')
+ap.add_argument('--build-dir', default='build/release',
+                help='Build dir ("build/debug" or "build/release") to use')
+ap.add_argument('--node-exporter-dir', default='build/node_exporter',
+                help='the directory where node_exporter is located')
+ap.add_argument('--debian-dir', default='build/debian/debian',
+                help='the directory where debian packaging is located')
 ap.add_argument('--stripped', action='store_true',
                 help='use stripped binaries')
+ap.add_argument('--print-libexec', action='store_true',
+                help='print libexec executables and exit script')
 
 args = ap.parse_args()
 
 executables_scylla = [
-                'build/{}/scylla'.format(args.mode),
-                'build/{}/iotune'.format(args.mode)]
+                '{}/scylla'.format(args.build_dir),
+                '{}/iotune'.format(args.build_dir)]
 executables_distrocmd = [
                 '/usr/bin/patchelf',
                 '/usr/bin/lscpu',
@@ -91,6 +97,11 @@ executables_distrocmd = [
 
 executables = executables_scylla + executables_distrocmd
 
+if args.print_libexec:
+    for exec in executables:
+        print(f'libexec/{os.path.basename(exec)}')
+    sys.exit(0)
+
 output = args.dest
 
 libs = {}
@@ -99,6 +110,8 @@ for exe in executables:
 
 # manually add libthread_db for debugging thread
 libs.update({'libthread_db.so.1': os.path.realpath('/lib64/libthread_db.so')})
+# manually add p11-kit-trust.so since it will dynamically load
+libs.update({'pkcs11/p11-kit-trust.so': '/lib64/pkcs11/p11-kit-trust.so'})
 
 ld_so = libs['ld.so']
 
@@ -115,11 +128,14 @@ gzip_process = subprocess.Popen("pigz > "+output, shell=True, stdin=subprocess.P
 
 ar = tarfile.open(fileobj=gzip_process.stdin, mode='w|')
 # relocatable package format version = 3.0
-shutil.rmtree(f'build/{SCYLLA_DIR}', ignore_errors=True)
-os.makedirs(f'build/{SCYLLA_DIR}')
-with open(f'build/{SCYLLA_DIR}/.relocatable_package_version', 'w') as f:
-    f.write('3.0\n')
-ar.add(f'build/{SCYLLA_DIR}/.relocatable_package_version', arcname='.relocatable_package_version')
+with tempfile.NamedTemporaryFile('w+t') as version_file:
+    version_file.write('3.0\n')
+    version_file.flush()
+    ar.add(version_file.name, arcname='.relocatable_package_version')
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    os.symlink('./pkcs11/p11-kit-trust.so', f'{tmpdir}/libnssckbi.so')
+    ar.reloc_add(f'{tmpdir}/libnssckbi.so', arcname='libreloc/libnssckbi.so')
 
 for exe in executables_scylla:
     basename = os.path.basename(exe)
@@ -138,11 +154,14 @@ if have_gnutls:
     ar.reloc_add(gnutls_config_nolink, arcname='libreloc/gnutls.config')
     ar.reloc_add('conf')
 ar.reloc_add('dist', filter=filter_dist)
-pathlib.Path('build/SCYLLA-RELOCATABLE-FILE').touch()
-ar.reloc_add('build/SCYLLA-RELOCATABLE-FILE', arcname='SCYLLA-RELOCATABLE-FILE')
-ar.reloc_add('build/SCYLLA-RELEASE-FILE', arcname='SCYLLA-RELEASE-FILE')
-ar.reloc_add('build/SCYLLA-VERSION-FILE', arcname='SCYLLA-VERSION-FILE')
-ar.reloc_add('build/SCYLLA-PRODUCT-FILE', arcname='SCYLLA-PRODUCT-FILE')
+with tempfile.NamedTemporaryFile('w') as relocatable_file:
+    ar.reloc_add(relocatable_file.name, arcname='SCYLLA-RELOCATABLE-FILE')
+version_dir = pathlib.Path(args.build_dir)
+if not (version_dir / 'SCYLLA-RELEASE-FILE').exists():
+    version_dir = version_dir.parent
+ar.reloc_add(version_dir / 'SCYLLA-RELEASE-FILE', arcname='SCYLLA-RELEASE-FILE')
+ar.reloc_add(version_dir / 'SCYLLA-VERSION-FILE', arcname='SCYLLA-VERSION-FILE')
+ar.reloc_add(version_dir / 'SCYLLA-PRODUCT-FILE', arcname='SCYLLA-PRODUCT-FILE')
 ar.reloc_add('seastar/scripts')
 ar.reloc_add('seastar/dpdk/usertools')
 ar.reloc_add('install.sh')
@@ -156,25 +175,24 @@ ar.reloc_add('ORIGIN')
 ar.reloc_add('licenses')
 ar.reloc_add('swagger-ui')
 ar.reloc_add('api')
-def exclude_submodules(tarinfo):
-    if tarinfo.name in ('scylla/tools/jmx',
-                        'scylla/tools/java',
-                        'scylla/tools/python3'):
-        return None
-    return tarinfo
-ar.reloc_add('tools', filter=exclude_submodules)
+ar.reloc_add('tools/scyllatop')
 ar.reloc_add('scylla-gdb.py')
-ar.reloc_add('build/debian/debian', arcname='debian')
-ar.reloc_add('build/node_exporter', arcname='node_exporter')
-if not args.stripped:
-    ar.reloc_add('build/node_exporter/node_exporter', arcname='node_exporter/node_exporter')
+ar.reloc_add('bin/nodetool')
+ar.reloc_add(args.debian_dir, arcname='debian')
+node_exporter_dir = args.node_exporter_dir
+if args.stripped:
+    ar.reloc_add(f'{node_exporter_dir}', arcname='node_exporter')
+    ar.reloc_add(f'{node_exporter_dir}/node_exporter.stripped', arcname='node_exporter/node_exporter')
 else:
-    ar.reloc_add('build/node_exporter/node_exporter.stripped', arcname='node_exporter/node_exporter')
-ar.reloc_add('build/node_exporter/LICENSE', arcname='node_exporter/LICENSE')
-ar.reloc_add('build/node_exporter/NOTICE', arcname='node_exporter/NOTICE')
+    ar.reloc_add(f'{node_exporter_dir}/node_exporter', arcname='node_exporter/node_exporter')
+ar.reloc_add(f'{node_exporter_dir}/LICENSE', arcname='node_exporter/LICENSE')
+ar.reloc_add(f'{node_exporter_dir}/NOTICE', arcname='node_exporter/NOTICE')
 ar.reloc_add('ubsan-suppressions.supp')
 ar.reloc_add('fix_system_distributed_tables.py')
 
 # Complete the tar output, and wait for the gzip process to complete
 ar.close()
 gzip_process.communicate()
+if gzip_process.returncode != 0:
+    print(f'pigz returned {gzip_process.returncode}!', file=sys.stderr)
+    sys.exit(1)

@@ -1,3 +1,10 @@
+> CREATE KEYSPACE ks
+>     WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND
+>     tablets = {'enabled': false};
+OK
+> USE ks;
+OK
+> 
 > create table lwt (a int, b int, primary key (a,b));
 OK
 > -- basic batch: ok
@@ -384,8 +391,8 @@ OK
 OK
 > --
 > --
-> -- condtitions on different list columns and different rows of the same
-> -- partition, these columns are retreived fine and the appropriate row
+> -- conditions on different list columns and different rows of the same
+> -- partition, these columns are retrieved fine and the appropriate row
 > -- is found when checking the conds
 > --
 > -- correct read command: statement 1 condition is on column a and list update
@@ -527,3 +534,9 @@ OK
 | True        |      0 |     9 | null          |
 | True        |      0 |     0 | null          |
 +-------------+--------+-------+---------------+
+> DROP TABLE gh7113;
+OK
+> 
+> -- cleanup
+> DROP KEYSPACE ks;
+OK

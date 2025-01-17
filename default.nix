@@ -2,7 +2,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
 #
 
 #
@@ -45,9 +45,7 @@ let
   # all later Boost versions are problematic one way or another
   boost = pkgs.boost175;
 
-  # no Clang newer than 12 and older than 15 can compile Scylla with
-  # sanitizers, and 15 is not in Nixpkgs yet
-  llvm = pkgs.llvmPackages_12;
+  llvm = pkgs.llvmPackages_15;
 
   stdenvUnwrapped = llvm.stdenv;
 
@@ -152,12 +150,11 @@ in derive ({
     rapidjson
     snappy
     systemd
-    thrift
     valgrind
     xorg.libpciaccess
     xxHash
     zlib
-    zstdStatic
+    zstd
   ];
 
   JAVA8_HOME = "${pkgs.openjdk8_headless}/lib/openjdk";

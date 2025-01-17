@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
@@ -16,11 +16,14 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/timer.hh>
 #include <unordered_map>
-#include "lang/wasm.hh"
 #include "rust/cxx.h"
 #include "rust/wasmtime_bindings.hh"
+#include "types/types.hh"
 
 namespace wasm {
+
+class instance_cache;
+struct context;
 
 class module_handle {
     wasmtime::Module& _module;

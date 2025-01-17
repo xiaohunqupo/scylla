@@ -5,11 +5,10 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #pragma once
 
-#include <tuple>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics_registration.hh>
 #include "tracing/tracing.hh"
@@ -36,6 +35,8 @@ private:
     service::query_state _dummy_query_state;
 
     cql3::query_processor* _qp_anchor;
+    service::migration_manager* _mm_anchor;
+
     table_helper _sessions;
     table_helper _sessions_time_idx;
     table_helper _events;
@@ -58,16 +59,22 @@ public:
     //
     // TODO: Create a stub_tracing_session object to discard the traces
     // requested during the initialization phase.
-    virtual future<> start(cql3::query_processor& qp) override;
+    virtual future<> start(cql3::query_processor& qp, service::migration_manager& mm) override;
 
-    virtual future<> stop() override {
-        return _pending_writes.close().then([this] { _qp_anchor = nullptr; });
+    virtual future<> shutdown() override {
+        return _pending_writes.close().then([this] {
+            _qp_anchor = nullptr;
+            _mm_anchor = nullptr;
+        });
     };
 
     virtual void write_records_bulk(records_bulk& bulk) override;
     virtual std::unique_ptr<backend_session_state_base> allocate_session_state() const override;
 
 private:
+    // Valid only after start() sets _qp_anchor
+    gms::inet_address my_address() const noexcept;
+
     /**
      * Write records of a single tracing session
      *
@@ -101,7 +108,7 @@ private:
      * @note A caller must ensure that @param events_records is alive till the
      * returned future resolves.
      */
-    future<> apply_events_mutation(cql3::query_processor& qp, lw_shared_ptr<one_session_records> records, std::deque<event_record>& events_records);
+    future<> apply_events_mutation(cql3::query_processor& qp, service::migration_manager& mm, lw_shared_ptr<one_session_records> records, std::deque<event_record>& events_records);
 
     /**
      * Create a mutation data for a new session record
@@ -110,7 +117,7 @@ private:
      *
      * @return the relevant cql3::query_options object with the mutation data
      */
-    static cql3::query_options make_session_mutation_data(const one_session_records& all_records_handle);
+    static cql3::query_options make_session_mutation_data(gms::inet_address my_address, const one_session_records& all_records_handle);
 
     /**
      * Create a mutation data for a new session_idx record
@@ -119,7 +126,7 @@ private:
      *
      * @return the relevant cql3::query_options object with the mutation data
      */
-    static cql3::query_options make_session_time_idx_mutation_data(const one_session_records& all_records_handle);
+    static cql3::query_options make_session_time_idx_mutation_data(gms::inet_address my_address, const one_session_records& all_records_handle);
 
     /**
      * Create mutation for a new slow_query_log record
@@ -129,7 +136,7 @@ private:
      *
      * @return the relevant mutation
      */
-    static cql3::query_options make_slow_query_mutation_data(const one_session_records& all_records_handle, const utils::UUID& start_time_id);
+    static cql3::query_options make_slow_query_mutation_data(gms::inet_address my_address, const one_session_records& all_records_handle, const utils::UUID& start_time_id);
 
     /**
      * Create mutation for a new slow_query_log_time_idx record
@@ -139,7 +146,7 @@ private:
      *
      * @return the relevant mutation
      */
-    static cql3::query_options make_slow_query_time_idx_mutation_data(const one_session_records& all_records_handle, const utils::UUID& start_time_id);
+    static cql3::query_options make_slow_query_time_idx_mutation_data(gms::inet_address my_address, const one_session_records& all_records_handle, const utils::UUID& start_time_id);
 
     /**
      * Create a mutation data for a new trace point record
@@ -151,7 +158,7 @@ private:
      *
      * @return a vector with the mutation data
      */
-    std::vector<cql3::raw_value> make_event_mutation_data(one_session_records& session_records, const event_record& record);
+    std::vector<cql3::raw_value> make_event_mutation_data(gms::inet_address my_address, one_session_records& session_records, const event_record& record);
 
     /**
      * Converts a @param elapsed to an int32_t value of microseconds.

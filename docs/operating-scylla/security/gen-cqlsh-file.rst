@@ -2,7 +2,7 @@
 Generate a cqlshrc File 
 =======================
 
-Making connections to a Scylla cluster that uses SSL can be a tricky process, but it doesn't diminish the importance of properly securing your client connections with SSL. This is especially needed when you are connecting to your cluster via the Internet or an untrusted network.
+Making connections to a ScyllaDB cluster that uses SSL can be a tricky process, but it doesn't diminish the importance of properly securing your client connections with SSL. This is especially needed when you are connecting to your cluster via the Internet or an untrusted network.
 
 Prerequisites
 --------------
@@ -69,7 +69,7 @@ Procedure
         - CQL version that the cluster you are connecting to is using
         - If you are not sure run ``nodetool version``
       * - certfile
-        - Root certificate that was used to sign file specified with the ``usercert`` patameter
+        - Root certificate that was used to sign file specified with the ``usercert`` parameter
         - Applies to CA signed certificates
       * - userkey
         - Key certificate used for ``cqlsh``

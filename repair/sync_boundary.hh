@@ -3,11 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
-#include "dht/i_partitioner.hh"
+#include "dht/decorated_key.hh"
 #include "mutation/position_in_partition.hh"
 
 // Represent a position of a mutation_fragment read from a flat mutation
@@ -29,9 +29,11 @@ struct repair_sync_boundary {
             return ret;
         }
     };
-    friend std::ostream& operator<<(std::ostream& os, const repair_sync_boundary& x) {
-        return os << "{ " << x.pk << "," <<  x.position << " }";
-    }
 };
 
-
+template <> struct fmt::formatter<repair_sync_boundary> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const repair_sync_boundary& boundary, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{ {}, {} }}", boundary.pk, boundary.position);
+    }
+};

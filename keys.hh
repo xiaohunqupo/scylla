@@ -3,19 +3,21 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "bytes.hh"
-#include "types.hh"
+#include "types/types.hh"
 #include "compound_compat.hh"
 #include "utils/managed_bytes.hh"
 #include "utils/hashing.hh"
+#include "utils/utf8.hh"
 #include "replica/database_fwd.hh"
 #include "schema/schema_fwd.hh"
 #include <compare>
+#include <span>
 
 //
 // This header defines type system for primary key holders.
@@ -196,10 +198,10 @@ public:
     }
 
     // We don't allow optional values, but provide this method as an efficient adaptor
-    static TopLevel from_optional_exploded(const schema& s, const std::vector<bytes_opt>& v) {
+    static TopLevel from_optional_exploded(const schema& s, std::span<const bytes_opt> v) {
         return TopLevel::from_bytes(get_compound_type(s)->serialize_optionals(v));
     }
-    static TopLevel from_optional_exploded(const schema& s, const std::vector<managed_bytes_opt>& v) {
+    static TopLevel from_optional_exploded(const schema& s, std::span<const managed_bytes_opt> v) {
         return TopLevel::from_bytes(get_compound_type(s)->serialize_optionals(v));
     }
 
@@ -669,8 +671,16 @@ public:
 
     // A trichotomic comparator which orders keys according to their ordering on the ring.
     std::strong_ordering ring_order_tri_compare(const schema& s, partition_key_view o) const;
+};
 
-    friend std::ostream& operator<<(std::ostream& out, const partition_key_view& pk);
+template <>
+struct fmt::formatter<partition_key_view> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const partition_key_view& pk, FormatContext& ctx) const {
+        return with_linearized(pk.representation(), [&] (bytes_view v) {
+            return fmt::format_to(ctx.out(), "pk{{{}}}", fmt_hex(v));
+        });
+    }
 };
 
 class partition_key : public compound_wrapper<partition_key, partition_key_view> {
@@ -697,6 +707,7 @@ public:
     partition_key(std::vector<bytes> v)
         : compound_wrapper(managed_bytes(c_type::serialize_value(std::move(v))))
     { }
+    partition_key(std::initializer_list<bytes> v) : partition_key(std::vector(v)) {}    
 
     partition_key(partition_key&& v) = default;
     partition_key(const partition_key& v) = default;
@@ -744,11 +755,47 @@ public:
     void validate(const schema& s) const {
         return s.partition_key_type()->validate(representation());
     }
-
-    friend std::ostream& operator<<(std::ostream& out, const partition_key& pk);
 };
 
-std::ostream& operator<<(std::ostream& out, const partition_key::with_schema_wrapper& pk);
+template <>
+struct fmt::formatter<partition_key> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const partition_key& pk, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "pk{{{}}}", managed_bytes_view(pk.representation()));
+    }
+};
+
+namespace detail {
+
+template <typename WithSchemaWrapper, typename FormatContext>
+auto format_pk(const WithSchemaWrapper& pk, FormatContext& ctx) {
+    const auto& [schema, key] = pk;
+    auto type_iterator = key.get_compound_type(schema)->types().begin();
+    bool first = true;
+    auto out = ctx.out();
+    for (auto&& component : key.components(schema)) {
+        if (!first) {
+            out = fmt::format_to(out, "{}", ":");
+        }
+        first = false;
+        auto key = (*type_iterator++)->to_string(to_bytes(component));
+        if (utils::utf8::validate((const uint8_t *) key.data(), key.size())) {
+            out = fmt::format_to(out, "{}", key);
+        } else {
+            out = fmt::format_to(out, "{}", "<non-utf8-key>");
+        }
+    }
+    return out;
+}
+} // namespace detail
+
+template <>
+struct fmt::formatter<partition_key::with_schema_wrapper> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const partition_key::with_schema_wrapper& pk, FormatContext& ctx) const {
+        return ::detail::format_pk(pk, ctx);
+    }
+};
 
 class exploded_clustering_prefix {
     std::vector<bytes> _v;
@@ -812,6 +859,7 @@ public:
     clustering_key_prefix(std::vector<managed_bytes> v)
         : prefix_compound_wrapper(compound::element_type::serialize_value(std::move(v)))
     { }
+    clustering_key_prefix(std::initializer_list<bytes> v) : clustering_key_prefix(std::vector(v)) {}
 
     clustering_key_prefix(clustering_key_prefix&& v) = default;
     clustering_key_prefix(const clustering_key_prefix& v) = default;
@@ -857,11 +905,23 @@ public:
         }
         return false;
     }
-
-    friend std::ostream& operator<<(std::ostream& out, const clustering_key_prefix& ckp);
 };
 
-std::ostream& operator<<(std::ostream& out, const clustering_key_prefix::with_schema_wrapper& pk);
+template <>
+struct fmt::formatter<clustering_key_prefix> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const clustering_key_prefix& ckp, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "ckp{{{}}}", managed_bytes_view(ckp.representation()));
+    }
+};
+
+template <>
+struct fmt::formatter<clustering_key_prefix::with_schema_wrapper> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const clustering_key_prefix::with_schema_wrapper& pk, FormatContext& ctx) const {
+        return ::detail::format_pk(pk, ctx);
+    }
+};
 
 template<>
 struct appending_hash<partition_key_view> {

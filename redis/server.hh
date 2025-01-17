@@ -3,26 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #pragma once
 
 #include "redis/options.hh"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 #include "redis/protocol_parser.hh"
+#pragma GCC diagnostic pop
 #include "redis/query_processor.hh"
 #include "redis/reply.hh"
 #include "redis/request.hh"
 #include "redis/stats.hh"
 
-#include "auth/authenticator.hh"
 #include "auth/service.hh"
-#include "cql3/values.hh"
-#include "service/client_state.hh"
 #include "service_permit.hh"
 #include "timeout_config.hh"
-#include "utils/estimated_histogram.hh"
-#include "utils/fragmented_temporary_buffer.hh"
 #include "generic_server.hh"
 
 #include <seastar/core/seastar.hh>
@@ -46,7 +44,7 @@ class storage_proxy;
 namespace redis_transport {
 
 struct redis_server_config {
-    ::timeout_config _timeout_config;
+    ::updateable_timeout_config _timeout_config;
     size_t _max_request_size;
     db::consistency_level _read_consistency_level;
     db::consistency_level _write_consistency_level;
@@ -97,14 +95,11 @@ private:
         void write_reply(const redis_exception&);
         void write_reply(redis_server::result result);
     private:
-        const ::timeout_config& timeout_config() { return _server.timeout_config(); }
         future<result> process_request_one(redis::request&& request, redis::redis_options&, service_permit permit);
         future<result> process_request_internal();
     };
 
     virtual shared_ptr<generic_server::connection> make_connection(socket_address server_addr, connected_socket&& fd, socket_address addr) override;
     future<> unadvertise_connection(shared_ptr<generic_server::connection> conn) override;
-
-    const ::timeout_config& timeout_config() { return _config._timeout_config; }
 };
 }

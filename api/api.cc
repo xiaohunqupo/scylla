@@ -3,14 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include "api.hh"
 #include <seastar/http/file_handler.hh>
 #include <seastar/http/transformers.hh>
 #include <seastar/http/api_docs.hh>
+#include "cql_server_test.hh"
 #include "storage_service.hh"
+#include "token_metadata.hh"
 #include "commitlog.hh"
 #include "gossiper.hh"
 #include "failure_detector.hh"
@@ -31,10 +33,15 @@
 #include "api/config.hh"
 #include "task_manager.hh"
 #include "task_manager_test.hh"
+#include "tasks.hh"
+#include "raft.hh"
+#include "gms/gossip_address_map.hh"
+#include "service_levels.hh"
 
 logging::logger apilog("api");
 
 namespace api {
+using namespace seastar::httpd;
 
 static std::unique_ptr<reply> exception_reply(std::exception_ptr eptr) {
     try {
@@ -59,17 +66,30 @@ future<> set_server_init(http_context& ctx) {
         rb->set_api_doc(r);
         rb02->set_api_doc(r);
         rb02->register_api_file(r, "swagger20_header");
+        rb02->register_api_file(r, "metrics");
         rb->register_function(r, "system",
                 "The system related API");
+        rb02->add_definitions_file(r, "metrics");
         set_system(ctx, r);
+        rb->register_function(r, "error_injection",
+            "The error injection API");
+        set_error_injection(ctx, r);
+        rb->register_function(r, "storage_proxy",
+                "The storage proxy API");
+        rb->register_function(r, "storage_service",
+                "The storage service API");
     });
 }
 
-future<> set_server_config(http_context& ctx, const db::config& cfg) {
+future<> set_server_config(http_context& ctx, db::config& cfg) {
     auto rb02 = std::make_shared < api_registry_builder20 > (ctx.api_doc, "/v2");
     return ctx.http_server.set_routes([&ctx, &cfg, rb02](routes& r) {
-        set_config(rb02, ctx, r, cfg);
+        set_config(rb02, ctx, r, cfg, false);
     });
+}
+
+future<> unset_server_config(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_config(ctx, r); });
 }
 
 static future<> register_api(http_context& ctx, const sstring& api_name,
@@ -91,18 +111,38 @@ future<> unset_transport_controller(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_transport_controller(ctx, r); });
 }
 
-future<> set_rpc_controller(http_context& ctx, thrift_controller& ctl) {
-    return ctx.http_server.set_routes([&ctx, &ctl] (routes& r) { set_rpc_controller(ctx, r, ctl); });
+future<> set_thrift_controller(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { set_thrift_controller(ctx, r); });
 }
 
-future<> unset_rpc_controller(http_context& ctx) {
-    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_rpc_controller(ctx, r); });
+future<> unset_thrift_controller(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_thrift_controller(ctx, r); });
 }
 
-future<> set_server_storage_service(http_context& ctx, sharded<service::storage_service>& ss, sharded<gms::gossiper>& g, sharded<cdc::generation_service>& cdc_gs, sharded<db::system_keyspace>& sys_ks) {
-    return register_api(ctx, "storage_service", "The storage service API", [&ss, &g, &cdc_gs, &sys_ks] (http_context& ctx, routes& r) {
-            set_storage_service(ctx, r, ss, g.local(), cdc_gs, sys_ks);
+future<> set_server_storage_service(http_context& ctx, sharded<service::storage_service>& ss, service::raft_group0_client& group0_client) {
+    return ctx.http_server.set_routes([&ctx, &ss, &group0_client] (routes& r) {
+            set_storage_service(ctx, r, ss, group0_client);
         });
+}
+
+future<> unset_server_storage_service(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_storage_service(ctx, r); });
+}
+
+future<> set_load_meter(http_context& ctx, service::load_meter& lm) {
+    return ctx.http_server.set_routes([&ctx, &lm] (routes& r) { set_load_meter(ctx, r, lm); });
+}
+
+future<> unset_load_meter(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_load_meter(ctx, r); });
+}
+
+future<> set_format_selector(http_context& ctx, db::sstables_format_selector& sel) {
+    return ctx.http_server.set_routes([&ctx, &sel] (routes& r) { set_format_selector(ctx, r, sel); });
+}
+
+future<> unset_format_selector(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_format_selector(ctx, r); });
 }
 
 future<> set_server_sstables_loader(http_context& ctx, sharded<sstables_loader>& sst_loader) {
@@ -113,16 +153,16 @@ future<> unset_server_sstables_loader(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_sstables_loader(ctx, r); });
 }
 
-future<> set_server_view_builder(http_context& ctx, sharded<db::view::view_builder>& vb) {
-    return ctx.http_server.set_routes([&ctx, &vb] (routes& r) { set_view_builder(ctx, r, vb); });
+future<> set_server_view_builder(http_context& ctx, sharded<db::view::view_builder>& vb, sharded<gms::gossiper>& g) {
+    return ctx.http_server.set_routes([&ctx, &vb, &g] (routes& r) { set_view_builder(ctx, r, vb, g); });
 }
 
 future<> unset_server_view_builder(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_view_builder(ctx, r); });
 }
 
-future<> set_server_repair(http_context& ctx, sharded<repair_service>& repair) {
-    return ctx.http_server.set_routes([&ctx, &repair] (routes& r) { set_repair(ctx, r, repair); });
+future<> set_server_repair(http_context& ctx, sharded<repair_service>& repair, sharded<gms::gossip_address_map>& am) {
+    return ctx.http_server.set_routes([&ctx, &repair, &am] (routes& r) { set_repair(ctx, r, repair, am); });
 }
 
 future<> unset_server_repair(http_context& ctx) {
@@ -148,6 +188,14 @@ future<> unset_server_snapshot(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_snapshot(ctx, r); });
 }
 
+future<> set_server_token_metadata(http_context& ctx, sharded<locator::shared_token_metadata>& tm, sharded<gms::gossiper>& g) {
+    return ctx.http_server.set_routes([&ctx, &tm, &g] (routes& r) { set_token_metadata(ctx, r, tm, g); });
+}
+
+future<> unset_server_token_metadata(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_token_metadata(ctx, r); });
+}
+
 future<> set_server_snitch(http_context& ctx, sharded<locator::snitch_ptr>& snitch) {
     return register_api(ctx, "endpoint_snitch_info", "The endpoint snitch info API", [&snitch] (http_context& ctx, routes& r) {
         set_endpoint_snitch(ctx, r, snitch);
@@ -159,20 +207,31 @@ future<> unset_server_snitch(http_context& ctx) {
 }
 
 future<> set_server_gossip(http_context& ctx, sharded<gms::gossiper>& g) {
-    return register_api(ctx, "gossiper",
+    co_await register_api(ctx, "gossiper",
                 "The gossiper API", [&g] (http_context& ctx, routes& r) {
                     set_gossiper(ctx, r, g.local());
                 });
+    co_await register_api(ctx, "failure_detector",
+                "The failure detector API", [&g] (http_context& ctx, routes& r) {
+                    set_failure_detector(ctx, r, g.local());
+                });
 }
 
-future<> set_server_load_sstable(http_context& ctx, sharded<db::system_keyspace>& sys_ks) {
+future<> unset_server_gossip(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) {
+        unset_gossiper(ctx, r);
+        unset_failure_detector(ctx, r);
+    });
+}
+
+future<> set_server_column_family(http_context& ctx, sharded<db::system_keyspace>& sys_ks) {
     return register_api(ctx, "column_family",
                 "The column family API", [&sys_ks] (http_context& ctx, routes& r) {
                     set_column_family(ctx, r, sys_ks);
                 });
 }
 
-future<> unset_server_load_sstable(http_context& ctx) {
+future<> unset_server_column_family(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_column_family(ctx, r); });
 }
 
@@ -186,11 +245,12 @@ future<> unset_server_messaging_service(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_messaging_service(ctx, r); });
 }
 
-future<> set_server_storage_proxy(http_context& ctx, sharded<service::storage_service>& ss) {
-    return register_api(ctx, "storage_proxy",
-                "The storage proxy API", [&ss] (http_context& ctx, routes& r) {
-                    set_storage_proxy(ctx, r, ss);
-                });
+future<> set_server_storage_proxy(http_context& ctx, sharded<service::storage_proxy>& proxy) {
+    return ctx.http_server.set_routes([&ctx, &proxy] (routes& r) { set_storage_proxy(ctx, r, proxy); });
+}
+
+future<> unset_server_storage_proxy(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_storage_proxy(ctx, r); });
 }
 
 future<> set_server_stream_manager(http_context& ctx, sharded<streaming::stream_manager>& sm) {
@@ -209,10 +269,14 @@ future<> set_server_cache(http_context& ctx) {
             "The cache service API", set_cache_service);
 }
 
-future<> set_hinted_handoff(http_context& ctx, sharded<gms::gossiper>& g) {
+future<> unset_server_cache(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_cache_service(ctx, r); });
+}
+
+future<> set_hinted_handoff(http_context& ctx, sharded<service::storage_proxy>& proxy, sharded<gms::gossiper>& g) {
     return register_api(ctx, "hinted_handoff",
-                "The hinted handoff API", [&g] (http_context& ctx, routes& r) {
-                    set_hinted_handoff(ctx, r, g.local());
+                "The hinted handoff API", [&proxy, &g] (http_context& ctx, routes& r) {
+                    set_hinted_handoff(ctx, r, proxy, g);
                 });
 }
 
@@ -220,24 +284,14 @@ future<> unset_hinted_handoff(http_context& ctx) {
     return ctx.http_server.set_routes([&ctx] (routes& r) { unset_hinted_handoff(ctx, r); });
 }
 
-future<> set_server_gossip_settle(http_context& ctx, sharded<gms::gossiper>& g) {
-    auto rb = std::make_shared < api_registry_builder > (ctx.api_doc);
-
-    return ctx.http_server.set_routes([rb, &ctx, &g](routes& r) {
-        rb->register_function(r, "failure_detector",
-                "The failure detector API");
-        set_failure_detector(ctx, r, g.local());
+future<> set_server_compaction_manager(http_context& ctx, sharded<compaction_manager>& cm) {
+    return register_api(ctx, "compaction_manager", "The Compaction manager API", [&cm] (http_context& ctx, routes& r) {
+        set_compaction_manager(ctx, r, cm);
     });
 }
 
-future<> set_server_compaction_manager(http_context& ctx) {
-    auto rb = std::make_shared < api_registry_builder > (ctx.api_doc);
-
-    return ctx.http_server.set_routes([rb, &ctx](routes& r) {
-        rb->register_function(r, "compaction_manager",
-                "The Compaction manager API");
-        set_compaction_manager(ctx, r);
-    });
+future<> unset_server_compaction_manager(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_compaction_manager(ctx, r); });
 }
 
 future<> set_server_done(http_context& ctx) {
@@ -247,41 +301,95 @@ future<> set_server_done(http_context& ctx) {
         rb->register_function(r, "lsa", "Log-structured allocator API");
         set_lsa(ctx, r);
 
-        rb->register_function(r, "commitlog",
-                "The commit log API");
-        set_commitlog(ctx,r);
         rb->register_function(r, "collectd",
                 "The collectd API");
         set_collectd(ctx, r);
-        rb->register_function(r, "error_injection",
-                "The error injection API");
-        set_error_injection(ctx, r);
     });
 }
 
-future<> set_server_task_manager(http_context& ctx) {
+future<> set_server_commitlog(http_context& ctx, sharded<replica::database>& db) {
+    return register_api(ctx, "commitlog", "The commit log API", [&db] (http_context& ctx, routes& r) {
+        set_commitlog(ctx, r, db);
+    });
+}
+
+future<> unset_server_commitlog(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_commitlog(ctx, r); });
+}
+
+future<> set_server_task_manager(http_context& ctx, sharded<tasks::task_manager>& tm, lw_shared_ptr<db::config> cfg) {
     auto rb = std::make_shared < api_registry_builder > (ctx.api_doc);
 
-    return ctx.http_server.set_routes([rb, &ctx](routes& r) {
+    return ctx.http_server.set_routes([rb, &ctx, &tm, &cfg = *cfg](routes& r) {
         rb->register_function(r, "task_manager",
                 "The task manager API");
-        set_task_manager(ctx, r);
+        set_task_manager(ctx, r, tm, cfg);
     });
+}
+
+future<> unset_server_task_manager(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_task_manager(ctx, r); });
 }
 
 #ifndef SCYLLA_BUILD_MODE_RELEASE
 
-future<> set_server_task_manager_test(http_context& ctx, lw_shared_ptr<db::config> cfg) {
+future<> set_server_task_manager_test(http_context& ctx, sharded<tasks::task_manager>& tm) {
     auto rb = std::make_shared < api_registry_builder > (ctx.api_doc);
 
-    return ctx.http_server.set_routes([rb, &ctx, &cfg = *cfg](routes& r) mutable {
+    return ctx.http_server.set_routes([rb, &ctx, &tm](routes& r) mutable {
         rb->register_function(r, "task_manager_test",
                 "The task manager test API");
-        set_task_manager_test(ctx, r, cfg);
+        set_task_manager_test(ctx, r, tm);
     });
 }
 
+future<> unset_server_task_manager_test(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_task_manager_test(ctx, r); });
+}
+
+future<> set_server_cql_server_test(http_context& ctx, cql_transport::controller& ctl) {
+    return register_api(ctx, "cql_server_test", "The CQL server test API", [&ctl] (http_context& ctx, routes& r) {
+        set_cql_server_test(ctx, r, ctl);
+    });
+}
+
+future<> unset_server_cql_server_test(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_cql_server_test(ctx, r); });
+}
+
 #endif
+
+future<> set_server_service_levels(http_context &ctx, cql_transport::controller& ctl, sharded<cql3::query_processor>& qp) {
+    return register_api(ctx, "service_levels", "The service levels API", [&ctl, &qp] (http_context& ctx, routes& r) {
+        set_service_levels(ctx, r, ctl, qp);
+    });
+}
+
+future<> set_server_tasks_compaction_module(http_context& ctx, sharded<service::storage_service>& ss, sharded<db::snapshot_ctl>& snap_ctl) {
+    auto rb = std::make_shared < api_registry_builder > (ctx.api_doc);
+
+    return ctx.http_server.set_routes([rb, &ctx, &ss, &snap_ctl](routes& r) {
+        rb->register_function(r, "tasks",
+                "The tasks API");
+        set_tasks_compaction_module(ctx, r, ss, snap_ctl);
+    });
+}
+
+future<> unset_server_tasks_compaction_module(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_tasks_compaction_module(ctx, r); });
+}
+
+future<> set_server_raft(http_context& ctx, sharded<service::raft_group_registry>& raft_gr) {
+    auto rb = std::make_shared<api_registry_builder>(ctx.api_doc);
+    return ctx.http_server.set_routes([rb, &ctx, &raft_gr] (routes& r) {
+        rb->register_function(r, "raft", "The Raft API");
+        set_raft(ctx, r, raft_gr);
+    });
+}
+
+future<> unset_server_raft(http_context& ctx) {
+    return ctx.http_server.set_routes([&ctx] (routes& r) { unset_raft(ctx, r); });
+}
 
 void req_params::process(const request& req) {
     // Process mandatory parameters
@@ -290,7 +398,7 @@ void req_params::process(const request& req) {
             continue;
         }
         try {
-            ent.value = req.param[name];
+            ent.value = req.get_path_param(name);
         } catch (std::out_of_range&) {
             throw httpd::bad_param_exception(fmt::format("Mandatory parameter '{}' was not provided", name));
         }

@@ -17,7 +17,9 @@ Conflicts: %{product}-server (<< 1.1)
 
 Package: %{product}-server
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, %{product}-conf (= ${binary:Version}), %{product}-python3 (= ${binary:Version})
+Depends: ${misc:Depends}, %{product}-conf (= ${binary:Version}), %{product}-python3 (= ${binary:Version})
+Replaces: %{product}-tools (<<5.5)
+Breaks: %{product}-tools (<<5.5)
 Description: Scylla database server binaries 
  Scylla is a highly scalable, eventually consistent, distributed,
  partitioned row DB.
@@ -26,7 +28,7 @@ Package: %{product}-server-dbg
 Section: debug
 Priority: extra
 Architecture: any
-Depends: %{product}-server (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Depends: %{product}-server (= ${binary:Version}), ${misc:Depends}
 Description: debugging symbols for %{product}-server
  Scylla is a highly scalable, eventually consistent, distributed,
  partitioned row DB.
@@ -49,11 +51,9 @@ Package: %{product}
 Section: metapackages
 Architecture: any
 Depends: %{product}-server (= ${binary:Version})
- , %{product}-jmx (= ${binary:Version})
- , %{product}-tools (= ${binary:Version})
- , %{product}-tools-core (= ${binary:Version})
  , %{product}-kernel-conf (= ${binary:Version})
  , %{product}-node-exporter (= ${binary:Version})
+ , %{product}-cqlsh (= ${binary:Version})
 Description: Scylla database metapackage
  Scylla is a highly scalable, eventually consistent, distributed,
  partitioned row DB.

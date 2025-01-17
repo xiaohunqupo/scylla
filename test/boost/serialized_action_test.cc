@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
 #include <boost/test/unit_test.hpp>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/semaphore.hh>
 #include "utils/serialized_action.hh"
@@ -14,6 +15,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include "utils/phased_barrier.hh"
 #include <seastar/core/timer.hh>
+#include <seastar/core/sleep.hh>
 
 using namespace std::chrono_literals;
 
@@ -132,6 +134,38 @@ SEASTAR_THREAD_TEST_CASE(test_serialized_action_exception) {
     BOOST_REQUIRE_EQUAL(count, 2);          // verify that `triggered_action` was called only once for t2 and t3.
 }
 
+SEASTAR_THREAD_TEST_CASE(test_serialized_action_abort) {
+    uint8_t c = 0;
+    promise<> p, pp;
+    future<> f = p.get_future();
+    serialized_action simple_action([&] {
+        BOOST_TEST_MESSAGE("action is running");
+        if (c++ == 0) {
+            p.set_value();
+            return pp.get_future();
+        }
+        return make_ready_future();
+    });
+
+    abort_source as;
+    auto f1 = simple_action.trigger(as);
+    f.get(); // wait for serialized action to trigger
+    auto f2 = simple_action.trigger(as);
+    auto f3 = simple_action.trigger(as);
+    auto f4 = simple_action.trigger();
+
+    as.request_abort();
+    pp.set_value(); // release first invocation
+    BOOST_TEST_MESSAGE("abort");
+    simple_action.join().get();
+
+    BOOST_REQUIRE_THROW(f1.get(), abort_requested_exception);
+    BOOST_REQUIRE_THROW(f2.get(), abort_requested_exception);
+    BOOST_REQUIRE_THROW(f3.get(), abort_requested_exception);
+    BOOST_REQUIRE_NO_THROW(f4.get());
+    BOOST_REQUIRE(c == 2);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_phased_barrier_reassignment) {
     utils::phased_barrier bar1;
     utils::phased_barrier bar2;
@@ -149,4 +183,57 @@ SEASTAR_THREAD_TEST_CASE(test_phased_barrier_reassignment) {
     bar1.advance_and_await().get();
     bar2.advance_and_await().get();
     completion_timer.cancel();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_phased_barrier_stop) {
+    utils::phased_barrier bar;
+    semaphore sem(0);
+    auto task = [&] () -> future<> {
+        auto op = bar.start();
+        co_await get_units(sem, 1);
+    };
+    auto task_fut = task();
+    BOOST_REQUIRE(!task_fut.available());
+
+    auto close_fut = bar.close();
+    BOOST_REQUIRE(!close_fut.available());
+    BOOST_REQUIRE(bar.is_closed());
+
+    BOOST_REQUIRE_THROW(task().get(), seastar::gate_closed_exception);
+
+    sem.signal();
+    BOOST_REQUIRE_NO_THROW(task_fut.get());
+    BOOST_REQUIRE_NO_THROW(close_fut.get());
+
+    BOOST_REQUIRE(bar.is_closed());
+    BOOST_REQUIRE_THROW(task().get(), seastar::gate_closed_exception);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_phased_barrier_stop_while_awaiting) {
+    utils::phased_barrier bar;
+    semaphore sem(0);
+    auto task = [&] () -> future<> {
+        auto op = bar.start();
+        co_await get_units(sem, 1);
+    };
+    auto task_fut = task();
+    BOOST_REQUIRE(!task_fut.available());
+
+    auto wait_fut = bar.advance_and_await();
+    BOOST_REQUIRE(!wait_fut.available());
+    BOOST_REQUIRE(!bar.is_closed());
+
+    auto close_fut = bar.close();
+    BOOST_REQUIRE(!close_fut.available());
+    BOOST_REQUIRE(bar.is_closed());
+
+    BOOST_REQUIRE_THROW(task().get(), seastar::gate_closed_exception);
+
+    sem.signal();
+    BOOST_REQUIRE_NO_THROW(task_fut.get());
+    BOOST_REQUIRE_NO_THROW(wait_fut.get());
+    BOOST_REQUIRE_NO_THROW(close_fut.get());
+
+    BOOST_REQUIRE(bar.is_closed());
+    BOOST_REQUIRE_THROW(task().get(), seastar::gate_closed_exception);
 }

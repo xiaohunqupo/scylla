@@ -5,12 +5,14 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.0 and Apache-2.0)
  */
 #include <seastar/core/metrics.hh>
+#include <seastar/core/coroutine.hh>
 #include "tracing/tracing.hh"
 #include "tracing/trace_state.hh"
 #include "utils/class_registrator.hh"
+#include "utils/UUID_gen.hh"
 
 namespace tracing {
 
@@ -63,23 +65,6 @@ tracing::tracing(sstring tracing_backend_helper_class_name)
         sm::make_gauge("flushing_records", _flushing_records,
                         sm::description(seastar::format("Holds a number of tracing records that currently being written to the I/O backend. "
                                                         "If sum of this metric, cached_records and pending_for_write_records is close to {} we are likely to start dropping tracing records.", max_pending_trace_records + write_event_records_threshold))),
-    });
-}
-
-future<> tracing::create_tracing(sstring tracing_backend_class_name) {
-    return tracing_instance().start(std::move(tracing_backend_class_name));
-}
-
-future<> tracing::start_tracing(sharded<cql3::query_processor>& qp) {
-    return tracing_instance().invoke_on_all([&qp] (tracing& local_tracing) {
-        return local_tracing.start(qp.local());
-    });
-}
-
-future<> tracing::stop_tracing() {
-    return tracing_instance().invoke_on_all([] (tracing& local_tracing) {
-        // It might have been shut down while draining
-        return local_tracing._down ? make_ready_future<>() : local_tracing.shutdown();
     });
 }
 
@@ -144,7 +129,7 @@ trace_state_ptr tracing::create_session(const trace_info& secondary_session_info
     }
 }
 
-future<> tracing::start(cql3::query_processor& qp) {
+future<> tracing::start(cql3::query_processor& qp, service::migration_manager& mm) {
     try {
         _tracing_backend_helper_ptr = create_object<i_tracing_backend_helper>(_tracing_backend_helper_class_name, *this);
     } catch (no_such_class& e) {
@@ -154,10 +139,9 @@ future<> tracing::start(cql3::query_processor& qp) {
         throw;
     }
 
-    return _tracing_backend_helper_ptr->start(qp).then([this] {
-        _down = false;
-        _write_timer.arm(write_period);
-    });
+    co_await _tracing_backend_helper_ptr->start(qp, mm);
+    _down = false;
+    _write_timer.arm(write_period);
 }
 
 void tracing::write_timer_callback() {
@@ -171,25 +155,20 @@ void tracing::write_timer_callback() {
 }
 
 future<> tracing::shutdown() {
-    tracing_logger.info("Asked to shut down");
     if (_down) {
-        throw std::logic_error("tracing: shutdown() called for the service that is already down");
+        co_return;
     }
 
+    tracing_logger.info("Asked to shut down");
     write_pending_records();
     _down = true;
     _write_timer.cancel();
-    return _tracing_backend_helper_ptr->stop().then([] {
-        tracing_logger.info("Tracing is down");
-    });
+    co_await _tracing_backend_helper_ptr->shutdown();
+    tracing_logger.info("Tracing is down");
 }
 
 future<> tracing::stop() {
-    if (!_down) {
-        throw std::logic_error("tracing: stop() called before shutdown()");
-    }
-
-    return make_ready_future<>();
+    co_await shutdown();
 }
 
 void tracing::set_trace_probability(double p) {
@@ -203,13 +182,17 @@ void tracing::set_trace_probability(double p) {
     tracing_logger.info("Setting tracing probability to {} (normalized {})", _trace_probability, _normalized_trace_probability);
 }
 
-one_session_records::one_session_records()
+one_session_records::one_session_records(trace_type type, std::chrono::seconds slow_query_ttl, std::chrono::seconds slow_query_rec_ttl,
+            std::optional<utils::UUID> session_id_, span_id parent_id_)
     : _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
+    , session_id(session_id_ ? *session_id_ : utils::UUID_gen::get_time_UUID())
+    , session_rec(type, slow_query_rec_ttl)
+    , ttl(slow_query_ttl)
     , backend_state_ptr(_local_tracing_ptr->allocate_backend_session_state())
-    , budget_ptr(_local_tracing_ptr->get_cached_records_ptr()) {}
-
-std::ostream& operator<<(std::ostream& os, const span_id& id) {
-    return os << id.get_id();
+    , budget_ptr(_local_tracing_ptr->get_cached_records_ptr())
+    , parent_id(parent_id_)
+    , my_span_id(span_id::make_span_id())
+{
 }
-}
 
+}

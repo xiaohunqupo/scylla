@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-#include "dht/i_partitioner.hh"
+#include "dht/i_partitioner_fwd.hh"
 #include "service/pager/paging_state.hh"
 
 #include "idl/range.idl.hh"

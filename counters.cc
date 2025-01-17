@@ -3,27 +3,32 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
+#include "utils/assert.hh"
 #include "counters.hh"
 #include "mutation/mutation.hh"
 #include "combine.hh"
+#include "utils/log.hh"
 
-#include <boost/range/algorithm/sort.hpp>
+logging::logger cell_locker_log("cell_locker");
 
-std::ostream& operator<<(std::ostream& os, counter_shard_view csv) {
-    return os << "{global_shard id: " << csv.id() << " value: " << csv.value()
-              << " clock: " << csv.logical_clock() << "}";
+auto fmt::formatter<counter_shard_view>::format(const counter_shard_view& csv,
+                                                fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{{global_shard id: {} value: {}, clock: {}}}",
+                          csv.id(), csv.value(), csv.logical_clock());
 }
 
-std::ostream& operator<<(std::ostream& os, counter_cell_view ccv) {
-    return os << "{counter_cell timestamp: " << ccv.timestamp() << " shards: {" << ::join(", ", ccv.shards()) << "}}";
+auto fmt::formatter<counter_cell_view>::format(const counter_cell_view& ccv,
+                                               fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{{counter_cell timestamp: {} shards: {{{}}}}}",
+                          ccv.timestamp(), fmt::join(ccv.shards(), ", "));
 }
 
 void counter_cell_builder::do_sort_and_remove_duplicates()
 {
-    boost::range::sort(_shards, [] (auto& a, auto& b) { return a.id() < b.id(); });
+    std::ranges::sort(_shards, std::ranges::less(), std::mem_fn(&counter_shard::id));
 
     std::vector<counter_shard> new_shards;
     new_shards.reserve(_shards.size());
@@ -101,8 +106,8 @@ void counter_cell_view::apply(const column_definition& cdef, atomic_cell_or_coll
         return;
     }
 
-    assert(!dst_ac.is_counter_update());
-    assert(!src_ac.is_counter_update());
+    SCYLLA_ASSERT(!dst_ac.is_counter_update());
+    SCYLLA_ASSERT(!src_ac.is_counter_update());
 
     auto src_ccv = counter_cell_view(src_ac);
     auto dst_ccv = counter_cell_view(dst_ac);
@@ -129,8 +134,8 @@ void counter_cell_view::apply(const column_definition& cdef, atomic_cell_or_coll
 
 std::optional<atomic_cell> counter_cell_view::difference(atomic_cell_view a, atomic_cell_view b)
 {
-    assert(!a.is_counter_update());
-    assert(!b.is_counter_update());
+    SCYLLA_ASSERT(!a.is_counter_update());
+    SCYLLA_ASSERT(!b.is_counter_update());
 
     if (!b.is_live() || !a.is_live()) {
         if (b.is_live() || (!a.is_live() && compare_atomic_cell_for_merge(b, a) < 0)) {

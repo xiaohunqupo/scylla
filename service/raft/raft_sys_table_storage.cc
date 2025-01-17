@@ -3,13 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 #include "service/raft/raft_sys_table_storage.hh"
 
 #include "cql3/untyped_result_set.hh"
+#include "db/config.hh"
 #include "db/system_keyspace.hh"
 #include "utils/UUID.hh"
+#include "utils/error_injection.hh"
 
 #include "serializer.hh"
 #include "idl/raft_storage.dist.hh"
@@ -34,6 +36,8 @@ raft_sys_table_storage::raft_sys_table_storage(cql3::query_processor& qp, raft::
     , _qp(qp)
     , _dummy_query_state(service::client_state::for_internal_calls(), empty_service_permit())
     , _pending_op_fut(make_ready_future<>())
+    // max_mutation_size = 1/2 of commitlog segment size, thus _max_mutation_size is set 1/3 of commitlog segment size to leave space for metadata.
+    , _max_mutation_size(_qp.db().get_config().schema_commitlog_segment_size_in_mb() * 1024 * 1024 / 3)
 {
     static const auto store_cql = format("INSERT INTO system.{} (group_id, term, \"index\", data) VALUES (?, ?, ?, ?)",
         db::system_keyspace::RAFT);
@@ -48,7 +52,7 @@ future<> raft_sys_table_storage::store_term_and_vote(raft::term_t term, raft::se
             db::system_keyspace::RAFT);
         return _qp.execute_internal(
             store_cql,
-            {_group_id.id, int64_t(term), vote.id}, cql3::query_processor::cache_internal::yes).discard_result();
+            {_group_id.id, int64_t(term.value()), vote.id}, cql3::query_processor::cache_internal::yes).discard_result();
     });
 }
 
@@ -59,7 +63,7 @@ future<std::pair<raft::term_t, raft::server_id>> raft_sys_table_storage::load_te
         co_return std::pair(raft::term_t(), raft::server_id());
     }
     const auto& static_row = rs->one();
-    raft::term_t vote_term = raft::term_t(static_row.get_or<int64_t>("vote_term", raft::term_t{}));
+    raft::term_t vote_term = raft::term_t(static_row.get_or<int64_t>("vote_term", raft::term_t{}.value()));
     raft::server_id vote{static_row.get_or<utils::UUID>("vote", raft::server_id{}.id)};
     co_return std::pair(vote_term, vote);
 }
@@ -70,7 +74,7 @@ future<> raft_sys_table_storage::store_commit_idx(raft::index_t idx) {
             db::system_keyspace::RAFT);
         return _qp.execute_internal(
             store_cql,
-            {_group_id.id, int64_t(idx)},
+            {_group_id.id, int64_t(idx.value())},
             cql3::query_processor::cache_internal::yes).discard_result();
     });
 }
@@ -82,7 +86,7 @@ future<raft::index_t> raft_sys_table_storage::load_commit_idx() {
         co_return raft::index_t(0);
     }
     const auto& static_row = rs->one();
-    co_return raft::index_t(static_row.get_or<int64_t>("commit_idx", raft::index_t{}));
+    co_return raft::index_t(static_row.get_or<int64_t>("commit_idx", raft::index_t{}.value()));
 }
 
 
@@ -102,7 +106,7 @@ future<raft::log_entries> raft_sys_table_storage::load_log() {
         auto raw_data = row.get_blob("data");
         auto in = ser::as_input_stream(raw_data);
         using data_variant_type = decltype(raft::log_entry::data);
-        data_variant_type data = ser::deserialize(in, boost::type<data_variant_type>());
+        data_variant_type data = ser::deserialize(in, std::type_identity<data_variant_type>());
 
         log.emplace_back(make_lw_shared<const raft::log_entry>(
             raft::log_entry{.term = term, .idx = idx, .data = std::move(data)}));
@@ -159,7 +163,7 @@ future<> raft_sys_table_storage::store_snapshot_descriptor(const raft::snapshot_
             db::system_keyspace::RAFT_SNAPSHOTS);
         co_await _qp.execute_internal(
             store_snp_cql,
-            {_group_id.id, snap.id.id, int64_t(snap.idx), int64_t(snap.term)},
+            {_group_id.id, snap.id.id, int64_t(snap.idx.value()), int64_t(snap.term.value())},
             cql3::query_processor::cache_internal::yes
         );
         // remove old configs
@@ -178,26 +182,12 @@ future<> raft_sys_table_storage::store_snapshot_descriptor(const raft::snapshot_
                 {_group_id.id, "PREVIOUS", srv.addr.id.id, srv.can_vote},
                     cql3::query_processor::cache_internal::yes);
         }
-        // Also update the latest snapshot id in `system.raft` table
-        static const auto store_latest_id_cql = format("INSERT INTO system.{} (group_id, snapshot_id) VALUES (?, ?)",
-            db::system_keyspace::RAFT);
-        co_await _qp.execute_internal(
-            store_latest_id_cql,
-            {_group_id.id, snap.id.id},
-            cql3::query_processor::cache_internal::yes
-        );
-        if (preserve_log_entries > snap.idx) {
-            co_return;
-        }
-        // TODO: make truncation and snapshot update in `system.raft` atomic
-        co_await truncate_log_tail(raft::index_t(static_cast<uint64_t>(snap.idx) - static_cast<uint64_t>(preserve_log_entries)));
+
+        co_await update_snapshot_and_truncate_log_tail(snap, preserve_log_entries);
     });
 }
 
-future<> raft_sys_table_storage::do_store_log_entries(const std::vector<raft::log_entry_ptr>& entries) {
-    if (entries.empty()) {
-        co_return;
-    }
+future<size_t> raft_sys_table_storage::do_store_log_entries_one_batch(const std::vector<raft::log_entry_ptr>& entries, size_t start_idx) {
     std::vector<cql3::statements::batch_statement::single_statement> batch_stmts;
     // statement values that can be allocated at once (one contiguous allocation)
     std::vector<std::vector<cql3::raw_value>> stmt_values;
@@ -211,20 +201,27 @@ future<> raft_sys_table_storage::do_store_log_entries(const std::vector<raft::lo
     stmt_data_views.reserve(entries_size);
     stmt_value_views.reserve(entries_size);
 
-    for (const raft::log_entry_ptr& eptr : entries) {
-        batch_stmts.emplace_back(cql3::statements::batch_statement::single_statement(_store_entry_stmt, false));
+    size_t size = 0;
+    size_t idx = start_idx;
 
+    for (; idx < entries_size; idx++) {
+        auto& eptr = entries[idx];
         auto data_tmp_buf = fragmented_temporary_buffer::allocate_to_fit(ser::get_sizeof(eptr->data));
         auto data_out_str = data_tmp_buf.get_ostream();
         ser::serialize(data_out_str, eptr->data);
+        if (size && size + data_tmp_buf.size_bytes() > _max_mutation_size) {
+            break;
+        }
+        size += data_tmp_buf.size_bytes();
+        batch_stmts.emplace_back(cql3::statements::batch_statement::single_statement(_store_entry_stmt, false));
 
         // don't include serialized "data" here since it will require to linearize the stream
         std::vector<cql3::raw_value> single_stmt_values;
         // Silly workaround for https://bugs.llvm.org/show_bug.cgi?id=51515
         single_stmt_values.reserve(3);
         single_stmt_values.emplace_back(cql3::raw_value::make_value(timeuuid_type->decompose(_group_id.id)));
-        single_stmt_values.emplace_back(cql3::raw_value::make_value(long_type->decompose(int64_t(eptr->term))));
-        single_stmt_values.emplace_back(cql3::raw_value::make_value(long_type->decompose(int64_t(eptr->idx))));
+        single_stmt_values.emplace_back(cql3::raw_value::make_value(long_type->decompose(int64_t(eptr->term.value()))));
+        single_stmt_values.emplace_back(cql3::raw_value::make_value(long_type->decompose(int64_t(eptr->idx.value()))));
 
         stmt_values.emplace_back(std::move(single_stmt_values));
         stmt_data_views.emplace_back(std::move(data_tmp_buf));
@@ -260,7 +257,24 @@ future<> raft_sys_table_storage::do_store_log_entries(const std::vector<raft::lo
         cql3::attributes::none(),
         _qp.get_cql_stats());
 
-    co_await batch.execute(_qp, _dummy_query_state, batch_options);
+    co_await batch.execute(_qp, _dummy_query_state, batch_options, std::nullopt);
+
+    if (idx != entries_size) {
+        co_return idx;
+    }
+
+    co_return 0;
+}
+
+future<> raft_sys_table_storage::do_store_log_entries(const std::vector<raft::log_entry_ptr>& entries) {
+    if (entries.empty()) {
+        co_return;
+    }
+
+    size_t idx = 0;
+    do {
+        idx = co_await do_store_log_entries_one_batch(entries, idx);
+    } while (idx != 0);
 }
 
 future<> raft_sys_table_storage::store_log_entries(const std::vector<raft::log_entry_ptr>& entries) {
@@ -273,7 +287,7 @@ future<> raft_sys_table_storage::truncate_log(raft::index_t idx) {
     return execute_with_linearization_point([this, idx] {
         static const auto truncate_cql = format("DELETE FROM system.{} WHERE group_id = ? AND \"index\" >= ?",
             db::system_keyspace::RAFT); 
-        return _qp.execute_internal(truncate_cql, {_group_id.id, int64_t(idx)}, cql3::query_processor::cache_internal::yes).discard_result();
+        return _qp.execute_internal(truncate_cql, {_group_id.id, int64_t(idx.value())}, cql3::query_processor::cache_internal::yes).discard_result();
     });
 }
 
@@ -283,9 +297,20 @@ future<> raft_sys_table_storage::abort() {
     return std::move(_pending_op_fut);
 }
 
-future<> raft_sys_table_storage::truncate_log_tail(raft::index_t idx) {
-    static const auto truncate_cql = format("DELETE FROM system.{} WHERE group_id = ? AND \"index\" <= ?", db::system_keyspace::RAFT);
-    return _qp.execute_internal(truncate_cql, {_group_id.id, int64_t(idx)}, cql3::query_processor::cache_internal::yes).discard_result();
+future<> raft_sys_table_storage::update_snapshot_and_truncate_log_tail(const raft::snapshot_descriptor &snap, size_t preserve_log_entries) {
+    // Update snapshot and truncate logs in `system.raft` atomically
+    raft::index_t log_tail_idx(snap.idx.value() - preserve_log_entries);
+    static const auto store_latest_id_and_truncate_log_tail_cql = format(
+        "BEGIN UNLOGGED BATCH"
+        "   INSERT INTO system.{} (group_id, snapshot_id) VALUES (?, ?);"   // store latest id
+        "   DELETE FROM system.{} WHERE group_id = ? AND \"index\" <= ?;"   // truncate log tail
+        "APPLY BATCH",
+        db::system_keyspace::RAFT, db::system_keyspace::RAFT);
+    return _qp.execute_internal(
+        store_latest_id_and_truncate_log_tail_cql,
+        {_group_id.id, snap.id.id, _group_id.id, int64_t(log_tail_idx.value())},
+        cql3::query_processor::cache_internal::yes
+    ).discard_result();
 }
 
 future<> raft_sys_table_storage::execute_with_linearization_point(std::function<future<>()> f) {
@@ -301,8 +326,13 @@ future<> raft_sys_table_storage::execute_with_linearization_point(std::function<
     }
 }
 
-future<> raft_sys_table_storage::bootstrap(raft::configuration initial_configuation) {
-    raft::snapshot_descriptor snapshot;
+future<> raft_sys_table_storage::bootstrap(raft::configuration initial_configuation, bool nontrivial_snapshot) {
+    auto init_index = nontrivial_snapshot ? raft::index_t{1} : raft::index_t{0};
+    utils::get_local_injector().inject("raft_sys_table_storage::bootstrap/init_index_0", [&init_index] {
+        init_index = raft::index_t{0};
+    });
+    raft::snapshot_descriptor snapshot{.idx{init_index}};
+    snapshot.id = raft::snapshot_id::create_random_id();
     snapshot.config = std::move(initial_configuation);
     co_await store_snapshot_descriptor(snapshot, 0);
 }
